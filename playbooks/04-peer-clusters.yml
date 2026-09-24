@@ -1,0 +1,103 @@
+---
+- name: Peer tenant and worker via Liqo
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  environment:
+    PATH: "{{ local_bin }}:{{ lookup('env', 'PATH') }}"
+
+  tasks:
+  - name: Peer tenant (consumer) to worker (provider)
+    command: >
+      liqoctl peer
+      --kubeconfig {{ kubeconfig_dir }}/tenant
+      --remote-kubeconfig {{ kubeconfig_dir }}/worker
+      --in-band
+      --skip-confirm
+      --gw-server-service-type NodePort
+    register: peer_result
+    failed_when: false
+
+  - name: Print peer output
+    debug:
+      msg: "{{ peer_result.stderr_lines | default([]) }}"
+
+  # Workaround: The dummy proxy service causes EnforceAPIServerProxyIPRemapping
+  # to create an IPAM IP mapping, which the identity controller uses to set
+  # proxyURL on ControlPlane identities. The proxy URL is unreachable on
+  # OVN-Kubernetes. Remove it so the VK connects directly to the worker API.
+  - name: Delete api-server-proxy IP resource on tenant
+    command: >
+      oc delete ips.ipam.liqo.io api-server-proxy -n liqo
+      --kubeconfig {{ kubeconfig_dir }}/tenant --ignore-not-found
+    changed_when: false
+
+  - name: Delete api-server-proxy IP resource on worker
+    command: >
+      oc delete ips.ipam.liqo.io api-server-proxy -n liqo
+      --kubeconfig {{ kubeconfig_dir }}/worker --ignore-not-found
+    changed_when: false
+
+  - name: Remove proxyURL from worker ResourceSlice status
+    command: >
+      oc patch resourceslices.authentication.liqo.io worker
+      -n liqo-tenant-tenant --subresource=status
+      --kubeconfig {{ kubeconfig_dir }}/worker
+      --type=json -p '[{"op":"remove","path":"/status/authParams/proxyURL"}]'
+    register: patch_rs
+    failed_when: false
+    changed_when: "'patched' in patch_rs.stdout"
+
+  - name: Remove proxyURL from ControlPlane Identity
+    shell: >
+      oc get identities.authentication.liqo.io -n liqo-tenant-worker
+      --kubeconfig {{ kubeconfig_dir }}/tenant --no-headers -o name
+      | xargs -I{} oc patch {} -n liqo-tenant-worker
+      --kubeconfig {{ kubeconfig_dir }}/tenant
+      --type=json -p '[{"op":"remove","path":"/spec/authParams/proxyURL"}]'
+    register: patch_identity
+    failed_when: false
+    changed_when: "'patched' in patch_identity.stdout"
+
+  - name: Restart controller-manager to pick up proxy-free kubeconfig
+    command: >
+      oc delete pod -n liqo -l app.kubernetes.io/name=controller-manager
+      --kubeconfig {{ kubeconfig_dir }}/tenant
+    changed_when: true
+
+  - name: Wait for controller-manager to be ready
+    shell: >
+      oc wait deploy/liqo-controller-manager -n liqo
+      --for=condition=Available --timeout=120s
+    environment:
+      KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+    retries: 3
+    delay: 10
+    register: cm_wait
+    until: cm_wait.rc == 0
+
+  - name: Wait for virtual node on tenant
+    command: oc get nodes -l liqo.io/type=virtual-node --no-headers
+    environment:
+      KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+    register: vnode
+    retries: 18
+    delay: 10
+    until: vnode.stdout | length > 0
+    changed_when: false
+
+  - name: Show virtual node resources
+    command: >
+      oc get nodes -l liqo.io/type=virtual-node
+      -o custom-columns=NAME:.metadata.name,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory,GPU:.status.allocatable.nvidia\.com/gpu
+    environment:
+      KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+    register: vnode_resources
+    changed_when: false
+
+  - name: Print peering result
+    debug:
+      msg: |
+        Virtual nodes on tenant:
+        {{ vnode_resources.stdout }}

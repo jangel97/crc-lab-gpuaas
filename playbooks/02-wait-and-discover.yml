@@ -1,0 +1,52 @@
+---
+- name: Wait for SNO installs and build in-memory inventory
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  tasks:
+  - name: Ensure VMs are running
+    become: true
+    shell: |
+      state=$(virsh domstate {{ hostvars[item].vm_name }} 2>/dev/null)
+      if [ "$state" != "running" ]; then
+        virsh start {{ hostvars[item].vm_name }}
+        echo "started"
+      else
+        echo "already running"
+      fi
+    loop: "{{ groups['clusters'] }}"
+    register: vm_ensure
+    changed_when: "'started' in vm_ensure.stdout"
+
+  - name: Wait for each cluster install
+    include_tasks: tasks/wait-install.yml
+    loop: "{{ groups['clusters'] }}"
+    loop_control:
+      loop_var: cluster
+    vars:
+      c: "{{ hostvars[cluster] }}"
+
+- name: Configure clusters
+  hosts: clusters
+  connection: local
+  gather_facts: false
+  environment:
+    PATH: "{{ local_bin }}:{{ lookup('env', 'PATH') }}"
+
+  tasks:
+  - name: Verify cluster access
+    command: oc get nodes
+    environment:
+      KUBECONFIG: "{{ kubeconfig }}"
+    register: nodes
+    changed_when: false
+
+  - name: Print cluster info
+    debug:
+      msg: |
+        Cluster: {{ inventory_hostname }}
+        API: {{ api_url | default('unknown') }}
+        Kubeconfig: {{ kubeconfig }}
+        Nodes:
+        {{ nodes.stdout }}

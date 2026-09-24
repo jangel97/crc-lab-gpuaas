@@ -1,0 +1,14 @@
+---
+- name: Tear down lab
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  tasks:
+  - name: Tear down VMs
+    include_tasks: tasks/teardown-vm.yml
+    loop: "{{ groups['clusters'] }}"
+    loop_control:
+      loop_var: cluster
+    vars:
+      c: "{{ hostvars[cluster] }}"

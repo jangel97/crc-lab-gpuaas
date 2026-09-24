@@ -1,0 +1,58 @@
+---
+- name: "{{ cluster }} | Ensure VM stays running during install"
+  become: true
+  shell: |
+    for i in $(seq 1 120); do
+      state=$(virsh domstate {{ c.vm_name }} 2>/dev/null)
+      if [ "$state" != "running" ]; then
+        virsh start {{ c.vm_name }} 2>/dev/null
+      fi
+      sleep 30
+    done
+  async: 3700
+  poll: 0
+  register: vm_watchdog
+
+- name: "{{ cluster }} | Wait for agent-based install"
+  command: >
+    {{ ansible_env.HOME }}/.local/bin/openshift-install agent wait-for install-complete
+    --dir {{ work_dir }}/{{ cluster }}
+    --log-level info
+  async: 3600
+  poll: 30
+
+- name: "{{ cluster }} | Stop VM watchdog"
+  async_status:
+    jid: "{{ vm_watchdog.ansible_job_id }}"
+  register: watchdog_result
+  failed_when: false
+  changed_when: false
+
+- name: "{{ cluster }} | Save kubeconfig"
+  copy:
+    src: "{{ work_dir }}/{{ cluster }}/auth/kubeconfig"
+    dest: "{{ kubeconfig_dir }}/{{ cluster }}"
+    remote_src: true
+    mode: "0600"
+
+- name: "{{ cluster }} | Get VM IP"
+  become: true
+  shell: >
+    virsh domifaddr {{ c.vm_name }} --source agent 2>/dev/null
+    | grep -oP '(\d+\.){3}\d+'
+    | head -1
+  register: vm_ip
+  retries: 10
+  delay: 10
+  until: vm_ip.stdout | length > 0
+  changed_when: false
+
+- name: "{{ cluster }} | Add to in-memory inventory"
+  add_host:
+    name: "{{ cluster }}"
+    groups: clusters
+    ansible_connection: local
+    kubeconfig: "{{ kubeconfig_dir }}/{{ cluster }}"
+    api_url: "https://api.{{ cluster }}.{{ base_domain }}:6443"
+    vm_ip: "{{ vm_ip.stdout }}"
+    components: "{{ c.components }}"

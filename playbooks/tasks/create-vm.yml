@@ -1,0 +1,134 @@
+---
+- name: "{{ cluster }} | Create work directory"
+  file:
+    path: "{{ work_dir }}/{{ cluster }}"
+    state: directory
+
+- name: "{{ cluster }} | Template install-config.yaml"
+  template:
+    src: ../templates/install-config.yaml.j2
+    dest: "{{ work_dir }}/{{ cluster }}/install-config.yaml"
+  vars:
+    cluster_name: "{{ cluster }}"
+    cluster_network_cidr: "{{ c.cluster_network_cidr }}"
+    cluster_network_prefix: "{{ c.cluster_network_prefix }}"
+    service_network_cidr: "{{ c.service_network_cidr }}"
+
+- name: "{{ cluster }} | Template agent-config.yaml"
+  template:
+    src: ../templates/agent-config.yaml.j2
+    dest: "{{ work_dir }}/{{ cluster }}/agent-config.yaml"
+  vars:
+    cluster_name: "{{ cluster }}"
+    vm_name: "{{ c.vm_name }}"
+    vm_mac: "{{ c.vm_mac }}"
+    rendezvous_ip: "{{ c.vm_ip }}"
+
+- name: "{{ cluster }} | Check if ISO already exists"
+  stat:
+    path: "{{ work_dir }}/{{ cluster }}/agent.x86_64.iso"
+  register: iso_stat
+
+- name: "{{ cluster }} | Generate agent ISO"
+  command: >
+    {{ local_bin }}/openshift-install agent create image
+    --dir {{ work_dir }}/{{ cluster }}
+  environment:
+    PATH: "{{ local_bin }}:{{ ansible_env.PATH }}"
+  when: not iso_stat.stat.exists
+
+- name: "{{ cluster }} | Create disk image"
+  become: true
+  command: >
+    qemu-img create -f qcow2
+    {{ libvirt_pool }}/{{ c.vm_name }}.qcow2 {{ c.vm_disk_gb }}G
+  args:
+    creates: "{{ libvirt_pool }}/{{ c.vm_name }}.qcow2"
+
+- name: "{{ cluster }} | Copy ISO to libvirt pool"
+  become: true
+  copy:
+    src: "{{ work_dir }}/{{ cluster }}/agent.x86_64.iso"
+    dest: "{{ libvirt_pool }}/{{ c.vm_name }}.iso"
+    remote_src: true
+    force: false
+
+- name: "{{ cluster }} | Create data disk for LVMS"
+  become: true
+  command: >
+    qemu-img create -f qcow2
+    {{ libvirt_pool }}/{{ c.vm_name }}-data.qcow2 {{ c.data_disk_gb }}G
+  args:
+    creates: "{{ libvirt_pool }}/{{ c.vm_name }}-data.qcow2"
+  when: c.data_disk_gb is defined
+
+- name: "{{ cluster }} | Check if VM exists"
+  become: true
+  command: virsh dominfo {{ c.vm_name }}
+  register: vm_exists
+  failed_when: false
+  changed_when: false
+
+- name: "{{ cluster }} | Create VM"
+  become: true
+  command: >
+    virt-install
+    --name {{ c.vm_name }}
+    --vcpus {{ c.vm_cpus }}
+    --memory {{ c.vm_ram_mb }}
+    --disk path={{ libvirt_pool }}/{{ c.vm_name }}.qcow2,format=qcow2,bus=virtio
+    {{ '--disk path=' + libvirt_pool + '/' + c.vm_name + '-data.qcow2,format=qcow2,bus=virtio' if c.data_disk_gb is defined else '' }}
+    --cdrom {{ libvirt_pool }}/{{ c.vm_name }}.iso
+    --network network={{ libvirt_network }},model=virtio,mac={{ c.vm_mac }}
+    --os-variant rhel9-unknown
+    --boot hd,cdrom
+    --graphics none
+    --console pty,target_type=serial
+    --noautoconsole
+    {{ '--host-device ' + c.gpu_pci_vga + ' --host-device ' + c.gpu_pci_audio + ' --video none' if c.gpu_passthrough | default(false) | bool else '' }}
+  when: vm_exists.rc != 0
+
+- name: "{{ cluster }} | Apply GPU passthrough XML tweaks"
+  become: true
+  shell: |
+    virsh destroy {{ c.vm_name }} 2>/dev/null || true
+    virsh dumpxml --inactive {{ c.vm_name }} > /tmp/{{ c.vm_name }}.xml
+
+    python3 -c "
+    import xml.etree.ElementTree as ET
+    tree = ET.parse('/tmp/{{ c.vm_name }}.xml')
+    cpu = tree.find('cpu')
+    if cpu.find('maxphysaddr') is None:
+        ET.SubElement(cpu, 'maxphysaddr', mode='passthrough', limit='42')
+    for hd in tree.findall('.//hostdev'):
+        if hd.find('rom') is None:
+            ET.SubElement(hd, 'rom', bar='off')
+    tree.write('/tmp/{{ c.vm_name }}.xml', xml_declaration=True)
+    "
+
+    if ! grep -q 'x-no-geforce-quirks' /tmp/{{ c.vm_name }}.xml; then
+      sed -i '/<\/domain>/i\
+      <qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">\
+        <qemu:arg value="-global"/>\
+        <qemu:arg value="vfio-pci.x-no-geforce-quirks=on"/>\
+      </qemu:commandline>' /tmp/{{ c.vm_name }}.xml
+    fi
+
+    virsh define /tmp/{{ c.vm_name }}.xml
+    rm -f /tmp/{{ c.vm_name }}.xml
+    virsh change-media {{ c.vm_name }} sda {{ libvirt_pool }}/{{ c.vm_name }}.iso --config
+    virsh start {{ c.vm_name }}
+  args:
+    executable: /bin/bash
+  when: c.gpu_passthrough | default(false) | bool
+  changed_when: true
+
+- name: "{{ cluster }} | Show VM status"
+  become: true
+  command: virsh domstate {{ c.vm_name }}
+  register: vm_state
+  changed_when: false
+
+- name: "{{ cluster }} | Print result"
+  debug:
+    msg: "{{ c.vm_name }} is {{ vm_state.stdout }}"

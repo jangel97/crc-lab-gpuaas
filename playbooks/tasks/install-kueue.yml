@@ -1,0 +1,33 @@
+---
+- name: Check if Kueue is installed
+  command: oc get deployment -n kueue-system kueue-controller-manager
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: kueue_check
+  failed_when: false
+  changed_when: false
+
+- name: Download Kueue manifest
+  get_url:
+    url: "https://github.com/kubernetes-sigs/kueue/releases/download/v0.10.1/manifests.yaml"
+    dest: "/tmp/kueue-v0.10.1.yaml"
+  when: kueue_check.rc != 0
+
+- name: Install Kueue
+  command: oc apply --server-side -f /tmp/kueue-v0.10.1.yaml
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  when: kueue_check.rc != 0
+
+- name: Wait for Kueue controller
+  command: oc wait deployment -n kueue-system kueue-controller-manager --for=condition=Available --timeout=300s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  retries: 3
+  delay: 15
+  register: kueue_wait
+  until: kueue_wait.rc == 0
+
+- name: Report Kueue status
+  debug:
+    msg: "Kueue installed on {{ inventory_hostname }}"

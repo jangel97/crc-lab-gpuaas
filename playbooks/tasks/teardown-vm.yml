@@ -1,0 +1,39 @@
+---
+- name: "{{ cluster }} | Check if VM exists"
+  become: true
+  command: virsh dominfo {{ c.vm_name }}
+  register: vm_info
+  failed_when: false
+  changed_when: false
+
+- name: "{{ cluster }} | Destroy VM"
+  become: true
+  command: virsh destroy {{ c.vm_name }}
+  when: vm_info.rc == 0
+  failed_when: false
+
+- name: "{{ cluster }} | Undefine VM and remove storage"
+  become: true
+  command: virsh undefine {{ c.vm_name }} --remove-all-storage
+  when: vm_info.rc == 0
+  failed_when: false
+
+- name: "{{ cluster }} | Remove ISO"
+  become: true
+  file:
+    path: "{{ libvirt_pool }}/{{ c.vm_name }}.iso"
+    state: absent
+
+- name: "{{ cluster }} | Remove kubeconfig"
+  file:
+    path: "{{ kubeconfig_dir }}/{{ cluster }}"
+    state: absent
+
+- name: "{{ cluster }} | Remove work directory"
+  file:
+    path: "{{ work_dir }}/{{ cluster }}"
+    state: absent
+
+- name: "{{ cluster }} | Done"
+  debug:
+    msg: "{{ c.vm_name }} removed"

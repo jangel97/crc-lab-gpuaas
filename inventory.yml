@@ -1,0 +1,53 @@
+all:
+  vars:
+    ocp_version: "4.22"
+    base_domain: "local.lab"
+    liqo_version: "v1.2.0"
+
+    pull_secret_path: "{{ playbook_dir }}/../pull-secret.json"
+    work_dir: "{{ playbook_dir }}/../.workdir"
+    kubeconfig_dir: "{{ lookup('env', 'HOME') }}/.kube"
+    local_bin: "{{ lookup('env', 'HOME') }}/.local/bin"
+    libvirt_pool: /var/lib/libvirt/images
+    libvirt_network: default
+    machine_network_cidr: "192.168.122.0/24"
+
+    openshift_install_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ ocp_version }}/openshift-install-linux.tar.gz"
+    oc_client_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ ocp_version }}/openshift-client-linux.tar.gz"
+
+  children:
+    clusters:
+      hosts:
+        tenant:
+          vm_name: sno-tenant
+          vm_cpus: 12
+          vm_ram_mb: 16384
+          vm_disk_gb: 120
+          vm_mac: "52:54:00:aa:bb:01"
+          vm_ip: "192.168.122.10"
+          gpu_passthrough: false
+          data_disk_gb: 50
+          cluster_network_cidr: "10.128.0.0/14"
+          cluster_network_prefix: 23
+          service_network_cidr: "172.30.0.0/16"
+          components:
+            lvms: true
+            rhoai: true
+            liqo: control_plane
+        worker:
+          vm_name: sno-worker
+          vm_cpus: 8
+          vm_ram_mb: 24576
+          vm_disk_gb: 120
+          vm_mac: "52:54:00:aa:bb:02"
+          vm_ip: "192.168.122.11"
+          gpu_passthrough: true
+          gpu_pci_vga: "02:00.0"
+          gpu_pci_audio: "02:00.1"
+          cluster_network_cidr: "10.132.0.0/14"
+          cluster_network_prefix: 23
+          service_network_cidr: "172.31.0.0/16"
+          components:
+            gpu_operator: true
+            kueue: true
+            liqo: agent

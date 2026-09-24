@@ -1,0 +1,92 @@
+---
+# ~2-4 GB RAM saved per cluster
+
+# --- Monitoring: minimal collection profile, reduced retention and resources ---
+# Biggest single win. Prometheus drops from ~2GB to ~500MB.
+- name: "{{ inventory_hostname }} | Minimize monitoring stack"
+  command: >
+    oc apply -f - --kubeconfig {{ kubeconfig }}
+  args:
+    stdin: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: cluster-monitoring-config
+        namespace: openshift-monitoring
+      data:
+        config.yaml: |
+          prometheusK8s:
+            collectionProfile: minimal
+            retention: 1d
+            resources:
+              requests:
+                cpu: 50m
+                memory: 256Mi
+              limits:
+                memory: 512Mi
+          alertmanagerMain:
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                memory: 64Mi
+          enableUserWorkload: false
+          telemeterClient:
+            enabled: false
+  register: monitoring_result
+  changed_when: "'configured' in monitoring_result.stdout"
+
+# --- Console: fully remove via operator API ---
+- name: "{{ inventory_hostname }} | Remove web console"
+  command: >
+    oc patch console.operator cluster --type merge
+    -p '{"spec":{"managementState":"Removed"}}'
+    --kubeconfig {{ kubeconfig }}
+  register: console_result
+  changed_when: "'patched' in console_result.stdout"
+
+# --- Image registry: remove (not building images on-cluster) ---
+- name: "{{ inventory_hostname }} | Remove image registry"
+  command: >
+    oc patch configs.imageregistry.operator.openshift.io cluster
+    --type merge -p '{"spec":{"managementState":"Removed"}}'
+    --kubeconfig {{ kubeconfig }}
+  register: registry_result
+  changed_when: "'patched' in registry_result.stdout"
+
+# --- Samples operator: remove ---
+- name: "{{ inventory_hostname }} | Remove samples operator"
+  command: >
+    oc patch configs.samples.operator.openshift.io cluster
+    --type merge -p '{"spec":{"managementState":"Removed"}}'
+    --kubeconfig {{ kubeconfig }}
+  register: samples_result
+  changed_when: "'patched' in samples_result.stdout"
+
+# --- Insights: unmanage via CVO override, then scale to 0 ---
+- name: "{{ inventory_hostname }} | Unmanage insights operator"
+  command: >
+    oc patch clusterversion version --type json
+    -p '[{"op":"add","path":"/spec/overrides","value":[{"kind":"Deployment","group":"apps","name":"insights-operator","namespace":"openshift-insights","unmanaged":true}]}]'
+    --kubeconfig {{ kubeconfig }}
+  register: insights_override
+  changed_when: "'patched' in insights_override.stdout"
+  failed_when: insights_override.rc != 0 and 'already exists' not in (insights_override.stderr | default(''))
+
+- name: "{{ inventory_hostname }} | Scale down insights operator"
+  command: >
+    oc scale deploy insights-operator -n openshift-insights --replicas=0
+    --kubeconfig {{ kubeconfig }}
+  register: insights_scale
+  changed_when: "'scaled' in insights_scale.stdout"
+
+# --- OLM tuning: disable copied CSVs, reduce sync frequency ---
+- name: "{{ inventory_hostname }} | Tune OLM"
+  command: >
+    oc patch olmconfig cluster --type merge
+    -p '{"spec":{"features":{"disableCopiedCSVs":true,"packageServerSyncInterval":"24h"}}}'
+    --kubeconfig {{ kubeconfig }}
+  register: olm_result
+  changed_when: "'patched' in olm_result.stdout"
+  failed_when: false

@@ -1,0 +1,101 @@
+---
+- name: Create LVMS namespace
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: openshift-storage
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Create LVMS OperatorGroup
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: openshift-storage-operatorgroup
+        namespace: openshift-storage
+      spec:
+        targetNamespaces:
+        - openshift-storage
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Subscribe to LVMS operator
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: lvms-operator
+        namespace: openshift-storage
+      spec:
+        channel: stable-4.22
+        name: lvms-operator
+        source: redhat-operators
+        sourceNamespace: openshift-marketplace
+        installPlanApproval: Automatic
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Wait for LVMS operator to be ready
+  command: >
+    oc get csv -n openshift-storage
+    -l operators.coreos.com/lvms-operator.openshift-storage
+    -o jsonpath='{.items[0].status.phase}'
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: lvms_csv
+  retries: 30
+  delay: 10
+  until: lvms_csv.stdout == 'Succeeded'
+  changed_when: false
+
+- name: Create LVMCluster
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: lvm.topolvm.io/v1alpha1
+      kind: LVMCluster
+      metadata:
+        name: lvmcluster
+        namespace: openshift-storage
+      spec:
+        storage:
+          deviceClasses:
+          - name: vg1
+            default: true
+            thinPoolConfig:
+              name: thin-pool-1
+              sizePercent: 90
+              overprovisionRatio: 10
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Wait for LVMCluster to be ready
+  command: >
+    oc get lvmcluster lvmcluster -n openshift-storage
+    -o jsonpath='{.status.ready}'
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: lvmcluster_status
+  retries: 30
+  delay: 10
+  until: lvmcluster_status.stdout == 'true'
+  changed_when: false
+
+- name: Verify StorageClass exists
+  command: oc get storageclass lvms-vg1
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: sc_check
+  changed_when: false
+
+- name: Print StorageClass info
+  debug:
+    msg: "LVMS StorageClass 'lvms-vg1' is available"

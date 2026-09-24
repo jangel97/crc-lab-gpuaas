@@ -1,0 +1,12 @@
+apiVersion: v1beta1
+metadata:
+  name: {{ cluster_name }}
+rendezvousIP: {{ rendezvous_ip }}
+hosts:
+- hostname: {{ vm_name }}
+  role: master
+  interfaces:
+  - name: enp1s0
+    macAddress: {{ vm_mac }}
+  rootDeviceHints:
+    deviceName: /dev/vda

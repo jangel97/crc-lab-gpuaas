@@ -1,0 +1,91 @@
+---
+- name: Provision SNO VMs
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  pre_tasks:
+  - name: Validate pull secret
+    assert:
+      that: pull_secret_path is file
+      fail_msg: "Pull secret not found at {{ pull_secret_path }}. Download from https://console.redhat.com/openshift/create/local"
+
+  - name: Read pull secret
+    set_fact:
+      pull_secret: "{{ lookup('file', pull_secret_path) | trim }}"
+
+  - name: Read SSH public key
+    set_fact:
+      ssh_public_key: "{{ lookup('file', lookup('first_found', [ansible_env.HOME + '/.ssh/id_ed25519.pub', ansible_env.HOME + '/.ssh/id_rsa.pub'])) | trim }}"
+
+  - name: Install host dependencies
+    become: true
+    apt:
+      name:
+      - qemu-kvm
+      - libvirt-daemon
+      - libvirt-daemon-system
+      - virtinst
+      - python3-libvirt
+      state: present
+      update_cache: true
+
+  - name: Ensure user in libvirt group
+    become: true
+    user:
+      name: "{{ ansible_env.USER }}"
+      groups: libvirt
+      append: true
+
+  - name: Configure static DHCP leases in libvirt
+    become: true
+    command: >
+      virsh net-update default add ip-dhcp-host
+      '<host mac="{{ hostvars[item].vm_mac }}" ip="{{ hostvars[item].vm_ip }}"/>'
+      --live --config
+    loop: "{{ groups['clusters'] }}"
+    register: dhcp_result
+    failed_when: dhcp_result.rc != 0 and 'existing dhcp host entry' not in (dhcp_result.stderr | default(''))
+    changed_when: dhcp_result.rc == 0
+
+  - name: Ensure directories exist
+    file:
+      path: "{{ item }}"
+      state: directory
+    loop:
+    - "{{ local_bin }}"
+    - "{{ work_dir }}"
+    - "{{ kubeconfig_dir }}"
+
+  - name: Download openshift-install
+    get_url:
+      url: "{{ openshift_install_url }}"
+      dest: "/tmp/openshift-install-{{ ocp_version }}.tar.gz"
+
+  - name: Extract openshift-install
+    unarchive:
+      src: "/tmp/openshift-install-{{ ocp_version }}.tar.gz"
+      dest: "{{ local_bin }}/"
+      remote_src: true
+      include: [openshift-install]
+
+  - name: Download oc client
+    get_url:
+      url: "{{ oc_client_url }}"
+      dest: "/tmp/openshift-client-{{ ocp_version }}.tar.gz"
+
+  - name: Extract oc client
+    unarchive:
+      src: "/tmp/openshift-client-{{ ocp_version }}.tar.gz"
+      dest: "{{ local_bin }}/"
+      remote_src: true
+      include: [oc, kubectl]
+
+  tasks:
+  - name: Create VMs from inventory
+    include_tasks: tasks/create-vm.yml
+    loop: "{{ groups['clusters'] }}"
+    loop_control:
+      loop_var: cluster
+    vars:
+      c: "{{ hostvars[cluster] }}"

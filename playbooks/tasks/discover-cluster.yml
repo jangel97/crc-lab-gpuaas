@@ -1,0 +1,20 @@
+---
+- name: "{{ cluster }} | Get VM IP"
+  become: true
+  shell: >
+    virsh domifaddr {{ c.vm_name }} --source agent 2>/dev/null
+    | grep -oP '(\d+\.){3}\d+'
+    | head -1
+  register: vm_ip
+  changed_when: false
+  failed_when: vm_ip.stdout | length == 0
+
+- name: "{{ cluster }} | Add to in-memory inventory"
+  add_host:
+    name: "{{ cluster }}"
+    groups: clusters
+    ansible_connection: local
+    kubeconfig: "{{ kubeconfig_dir }}/{{ cluster }}"
+    api_url: "https://api.{{ cluster }}.{{ base_domain }}:6443"
+    vm_ip: "{{ vm_ip.stdout }}"
+    components: "{{ c.components }}"

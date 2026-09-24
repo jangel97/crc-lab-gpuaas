@@ -1,0 +1,155 @@
+---
+- name: Create nvidia-gpu-operator namespace
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: nvidia-gpu-operator
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Install NFD operator
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: openshift-nfd
+      ---
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: nfd
+        namespace: openshift-nfd
+      spec:
+        targetNamespaces:
+        - openshift-nfd
+      ---
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: nfd
+        namespace: openshift-nfd
+      spec:
+        channel: stable
+        name: nfd
+        source: redhat-operators
+        sourceNamespace: openshift-marketplace
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Wait for NFD operator
+  command: oc wait deployment -n openshift-nfd nfd-controller-manager --for=condition=Available --timeout=300s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  retries: 3
+  delay: 30
+  register: nfd_wait
+  until: nfd_wait.rc == 0
+
+- name: Create NodeFeatureDiscovery instance
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: nfd.openshift.io/v1
+      kind: NodeFeatureDiscovery
+      metadata:
+        name: nfd-instance
+        namespace: openshift-nfd
+      spec:
+        workerConfig:
+          configData: |
+            sources:
+              pci:
+                deviceClassWhitelist:
+                - "0300"
+                - "0302"
+                deviceLabelFields:
+                - vendor
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Wait for NFD worker pod
+  command: oc get pods -n openshift-nfd -l app=nfd-worker --no-headers
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: nfd_worker
+  retries: 20
+  delay: 10
+  until: nfd_worker.stdout is search("Running")
+  changed_when: false
+
+- name: Install GPU operator
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: gpu-operator
+        namespace: nvidia-gpu-operator
+      spec:
+        targetNamespaces:
+        - nvidia-gpu-operator
+      ---
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: gpu-operator-certified
+        namespace: nvidia-gpu-operator
+      spec:
+        channel: v26.7
+        name: gpu-operator-certified
+        source: certified-operators
+        sourceNamespace: openshift-marketplace
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Wait for GPU operator
+  command: oc wait deployment -n nvidia-gpu-operator gpu-operator --for=condition=Available --timeout=300s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  retries: 6
+  delay: 30
+  register: gpu_wait
+  until: gpu_wait.rc == 0
+
+- name: Extract default ClusterPolicy from CSV
+  shell: |
+    csv=$(oc get csv -n nvidia-gpu-operator -l operators.coreos.com/gpu-operator-certified.nvidia-gpu-operator -o name | head -1)
+    oc get "$csv" -n nvidia-gpu-operator -o jsonpath='{.metadata.annotations.alm-examples}' \
+      | python3 -c "import sys,json; examples=json.load(sys.stdin); cp=[e for e in examples if e['kind']=='ClusterPolicy'][0]; json.dump(cp, sys.stdout)"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: cluster_policy_json
+  changed_when: false
+
+- name: Create ClusterPolicy from operator defaults
+  shell: |
+    echo '{{ cluster_policy_json.stdout }}' | oc apply -f -
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Wait for device plugin
+  command: oc get pods -n nvidia-gpu-operator -l app=nvidia-device-plugin-daemonset --no-headers
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: dp_pods
+  retries: 60
+  delay: 15
+  until: dp_pods.stdout is search("Running")
+  changed_when: false
+
+- name: Check GPU allocatable
+  command: oc get node -o jsonpath='{.items[0].status.allocatable.nvidia\.com/gpu}'
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: gpu_count
+  changed_when: false
+
+- name: Report GPU status
+  debug:
+    msg: "GPU allocatable on {{ inventory_hostname }}: {{ gpu_count.stdout }}"
