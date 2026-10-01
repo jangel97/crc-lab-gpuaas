@@ -17,7 +17,7 @@ all:
 
     gaming_pc_host: "192.168.1.139"
 
-    vk_image: "quay.io/jmorenas/vk-gpu-provider:latest"
+    vk_image: "quay.io/jmorenas/gpuaas-virtual-kubelet:latest"
     vk_worker_namespace: "vk-workloads"
     vk_node_name: "gpu-worker"
     vk_test_namespace: "vk-test"

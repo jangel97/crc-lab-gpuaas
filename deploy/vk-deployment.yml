@@ -19,7 +19,7 @@ spec:
       serviceAccountName: vk-gpu-provider
       containers:
       - name: vk
-        image: quay.io/jmorenas/vk-gpu-provider:latest
+        image: quay.io/jmorenas/gpuaas-virtual-kubelet:latest
         args:
         - --nodename=gpu-worker
         - --worker-kubeconfig=/etc/vk/kubeconfig

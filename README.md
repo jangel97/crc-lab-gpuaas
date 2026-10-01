@@ -81,8 +81,8 @@ The VK provider is a Go binary built from `cmd/vk-gpu-provider/`. It uses
 plain `k8s.io/client-go` (no virtual-kubelet library dependency).
 
 ```bash
-podman build -t quay.io/jmorenas/vk-gpu-provider:latest -f cmd/vk-gpu-provider/Dockerfile .
-podman push quay.io/jmorenas/vk-gpu-provider:latest
+podman build -t quay.io/jmorenas/gpuaas-virtual-kubelet:latest -f cmd/vk-gpu-provider/Dockerfile .
+podman push quay.io/jmorenas/gpuaas-virtual-kubelet:latest
 ```
 
 ## Storage
