@@ -21,7 +21,6 @@
     PATH: "{{ local_bin }}:{{ lookup('env', 'PATH') }}"
 
   tasks:
-  # Free up resources by disabling non-essential components
   - name: Slim down cluster
     include_tasks: tasks/slim-down-cluster.yml
 
@@ -30,27 +29,16 @@
     include_tasks: tasks/install-gpu-operator.yml
     when: components.gpu_operator | default(false) | bool
 
-  # Kueue (worker only)
+  # Kueue (both clusters for MultiKueue)
   - name: Install Kueue
     include_tasks: tasks/install-kueue.yml
     when: components.kueue | default(false) | bool
 
-  # LVMS (tenant only, provides StorageClass for PVCs)
+  # LVMS (worker only for MultiKueue spike)
   - name: Install LVMS
     include_tasks: tasks/install-lvms.yml
     when: components.lvms | default(false) | bool
 
-  # Liqo (both, role-aware)
-  - name: Install Liqo
-    include_tasks: tasks/install-liqo.yml
-    when: components.liqo is defined
-
-  # RHOAI (tenant only)
-  - name: Install RHOAI
-    include_tasks: tasks/install-rhoai.yml
-    when: components.rhoai | default(false) | bool
-
-  # Disable default catalog sources after all operators are installed (~300-600MB saved)
   - name: Disable OperatorHub default catalog sources
     command: >
       oc patch operatorhub.config.openshift.io/cluster --type merge

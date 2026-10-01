@@ -2,7 +2,7 @@ all:
   vars:
     ocp_version: "4.22"
     base_domain: "local.lab"
-    liqo_version: "v1.2.0"
+    kueue_version: "v0.10.1"
 
     pull_secret_path: "{{ playbook_dir }}/../pull-secret.json"
     work_dir: "{{ playbook_dir }}/../.workdir"
@@ -14,6 +14,10 @@ all:
 
     openshift_install_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ ocp_version }}/openshift-install-linux.tar.gz"
     oc_client_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ ocp_version }}/openshift-client-linux.tar.gz"
+
+    multikueue_namespace: "kueue-system"
+    multikueue_test_namespace: "multikueue-test"
+    multikueue_sa_name: "multikueue-sa"
 
   children:
     clusters:
@@ -31,9 +35,8 @@ all:
           cluster_network_prefix: 23
           service_network_cidr: "172.30.0.0/16"
           components:
-            lvms: true
-            rhoai: true
-            liqo: control_plane
+            kueue: true
+          multikueue_role: manager
         worker:
           vm_name: sno-worker
           vm_cpus: 8
@@ -44,10 +47,12 @@ all:
           gpu_passthrough: true
           gpu_pci_vga: "02:00.0"
           gpu_pci_audio: "02:00.1"
+          data_disk_gb: 50
           cluster_network_cidr: "10.132.0.0/14"
           cluster_network_prefix: 23
           service_network_cidr: "172.31.0.0/16"
           components:
+            lvms: true
             gpu_operator: true
             kueue: true
-            liqo: agent
+          multikueue_role: worker
