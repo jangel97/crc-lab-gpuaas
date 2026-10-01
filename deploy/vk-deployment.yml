@@ -1,0 +1,36 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vk-gpu-provider
+  namespace: kube-system
+  labels:
+    app: vk-gpu-provider
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vk-gpu-provider
+  template:
+    metadata:
+      labels:
+        app: vk-gpu-provider
+    spec:
+      serviceAccountName: vk-gpu-provider
+      containers:
+      - name: vk
+        image: quay.io/jmorenas/vk-gpu-provider:latest
+        args:
+        - --nodename=gpu-worker
+        - --worker-kubeconfig=/etc/vk/kubeconfig
+        - --worker-namespace=vk-workloads
+        - --gpu-count=1
+        - --v=2
+        volumeMounts:
+        - name: worker-kubeconfig
+          mountPath: /etc/vk
+          readOnly: true
+      volumes:
+      - name: worker-kubeconfig
+        secret:
+          secretName: worker-kubeconfig

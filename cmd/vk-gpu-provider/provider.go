@@ -1,0 +1,518 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
+)
+
+const (
+	labelManagedBy       = "app.kubernetes.io/managed-by"
+	labelManagedByValue  = "vk-gpu-provider"
+	labelSourceNamespace = "vk.gpuaas.io/source-namespace"
+	labelSourceName      = "vk.gpuaas.io/source-name"
+	labelSourcePod       = "vk.gpuaas.io/source-pod"
+
+	kueueQueueLabel = "kueue.x-k8s.io/queue-name"
+	kueueQueueName  = "user-queue"
+)
+
+type GPUProviderConfig struct {
+	NodeName        string
+	WorkerNamespace string
+	GPUCount        int
+	TenantClient    kubernetes.Interface
+	WorkerClient    kubernetes.Interface
+}
+
+type GPUProvider struct {
+	cfg    GPUProviderConfig
+	syncer *ResourceSyncer
+
+	mu          sync.Mutex
+	managedPods map[string]string // tenant "namespace/name" -> worker pod name
+}
+
+func NewGPUProvider(cfg GPUProviderConfig) *GPUProvider {
+	return &GPUProvider{
+		cfg:         cfg,
+		syncer:      NewResourceSyncer(cfg.TenantClient, cfg.WorkerClient, cfg.WorkerNamespace),
+		managedPods: make(map[string]string),
+	}
+}
+
+func (p *GPUProvider) Run(ctx context.Context) error {
+	if err := p.registerNode(ctx); err != nil {
+		return fmt.Errorf("register node: %w", err)
+	}
+	klog.Infof("Virtual node %q registered", p.cfg.NodeName)
+
+	go p.heartbeatLoop(ctx)
+	go p.watchWorkerPods(ctx)
+
+	return p.watchTenantPods(ctx)
+}
+
+func (p *GPUProvider) registerNode(ctx context.Context) error {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: p.cfg.NodeName,
+			Labels: map[string]string{
+				"type":                   "virtual-kubelet",
+				"kubernetes.io/role":     "agent",
+				"kubernetes.io/os":       "linux",
+				"kubernetes.io/arch":     "amd64",
+				"node.kubernetes.io/gpu": "true",
+			},
+		},
+		Spec: corev1.NodeSpec{
+			Taints: []corev1.Taint{
+				{
+					Key:    "virtual-kubelet.io/provider",
+					Value:  "gpu-provider",
+					Effect: corev1.TaintEffectNoSchedule,
+				},
+			},
+		},
+	}
+
+	existing, err := p.cfg.TenantClient.CoreV1().Nodes().Get(ctx, p.cfg.NodeName, metav1.GetOptions{})
+	if err == nil {
+		existing.Labels = node.Labels
+		existing.Spec.Taints = node.Spec.Taints
+		_, err = p.cfg.TenantClient.CoreV1().Nodes().Update(ctx, existing, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("update existing node: %w", err)
+		}
+	} else if errors.IsNotFound(err) {
+		_, err = p.cfg.TenantClient.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("create node: %w", err)
+		}
+	} else {
+		return fmt.Errorf("get node: %w", err)
+	}
+
+	return p.updateNodeStatus(ctx)
+}
+
+func (p *GPUProvider) updateNodeStatus(ctx context.Context) error {
+	node, err := p.cfg.TenantClient.CoreV1().Nodes().Get(ctx, p.cfg.NodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	gpuQty := resource.MustParse(fmt.Sprintf("%d", p.cfg.GPUCount))
+	node.Status = corev1.NodeStatus{
+		Capacity: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("8"),
+			corev1.ResourceMemory: resource.MustParse("24Gi"),
+			corev1.ResourcePods:   resource.MustParse("20"),
+			"nvidia.com/gpu":      gpuQty,
+		},
+		Allocatable: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("8"),
+			corev1.ResourceMemory: resource.MustParse("24Gi"),
+			corev1.ResourcePods:   resource.MustParse("20"),
+			"nvidia.com/gpu":      gpuQty,
+		},
+		Conditions: []corev1.NodeCondition{
+			{
+				Type:               corev1.NodeReady,
+				Status:             corev1.ConditionTrue,
+				LastHeartbeatTime:  metav1.Now(),
+				LastTransitionTime: metav1.Now(),
+				Reason:             "KubeletReady",
+				Message:            "vk-gpu-provider is ready",
+			},
+			{
+				Type:               corev1.NodeMemoryPressure,
+				Status:             corev1.ConditionFalse,
+				LastHeartbeatTime:  metav1.Now(),
+				LastTransitionTime: metav1.Now(),
+			},
+			{
+				Type:               corev1.NodeDiskPressure,
+				Status:             corev1.ConditionFalse,
+				LastHeartbeatTime:  metav1.Now(),
+				LastTransitionTime: metav1.Now(),
+			},
+			{
+				Type:               corev1.NodePIDPressure,
+				Status:             corev1.ConditionFalse,
+				LastHeartbeatTime:  metav1.Now(),
+				LastTransitionTime: metav1.Now(),
+			},
+		},
+		NodeInfo: corev1.NodeSystemInfo{
+			OperatingSystem: "linux",
+			Architecture:    "amd64",
+			KubeletVersion:  "v1.31.0-vk",
+		},
+		Addresses: []corev1.NodeAddress{
+			{
+				Type:    corev1.NodeInternalIP,
+				Address: "127.0.0.1",
+			},
+		},
+	}
+
+	_, err = p.cfg.TenantClient.CoreV1().Nodes().UpdateStatus(ctx, node, metav1.UpdateOptions{})
+	return err
+}
+
+func (p *GPUProvider) heartbeatLoop(ctx context.Context) {
+	leaseName := p.cfg.NodeName
+	leaseNS := "kube-node-lease"
+
+	dur := int32(40)
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      leaseName,
+			Namespace: leaseNS,
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &leaseName,
+			LeaseDurationSeconds: &dur,
+			RenewTime:            &metav1.MicroTime{Time: time.Now()},
+		},
+	}
+
+	_, err := p.cfg.TenantClient.CoordinationV1().Leases(leaseNS).Create(ctx, lease, metav1.CreateOptions{})
+	if err != nil && !errors.IsAlreadyExists(err) {
+		klog.Errorf("Failed to create lease: %v", err)
+	}
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.renewLease(ctx, leaseName, leaseNS)
+			if err := p.updateNodeStatus(ctx); err != nil {
+				klog.Errorf("Failed to update node status: %v", err)
+			}
+		}
+	}
+}
+
+func (p *GPUProvider) renewLease(ctx context.Context, name, ns string) {
+	lease, err := p.cfg.TenantClient.CoordinationV1().Leases(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("Failed to get lease: %v", err)
+		return
+	}
+	lease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
+	_, err = p.cfg.TenantClient.CoordinationV1().Leases(ns).Update(ctx, lease, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Errorf("Failed to renew lease: %v", err)
+	}
+}
+
+func (p *GPUProvider) watchTenantPods(ctx context.Context) error {
+	fieldSelector := fields.OneTermEqualSelector("spec.nodeName", p.cfg.NodeName).String()
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		watcher, err := p.cfg.TenantClient.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{
+			FieldSelector: fieldSelector,
+		})
+		if err != nil {
+			klog.Errorf("Failed to watch tenant pods: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		klog.Info("Watching tenant pods assigned to virtual node")
+
+		for event := range watcher.ResultChan() {
+			pod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				continue
+			}
+
+			switch event.Type {
+			case watch.Added, watch.Modified:
+				p.handleTenantPod(ctx, pod)
+			case watch.Deleted:
+				p.handleTenantPodDeleted(ctx, pod)
+			}
+		}
+
+		klog.Warning("Tenant pod watch ended, restarting...")
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func (p *GPUProvider) handleTenantPod(ctx context.Context, pod *corev1.Pod) {
+	key := pod.Namespace + "/" + pod.Name
+
+	p.mu.Lock()
+	_, exists := p.managedPods[key]
+	p.mu.Unlock()
+
+	if exists {
+		return
+	}
+
+	if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		return
+	}
+
+	if pod.DeletionTimestamp != nil {
+		return
+	}
+
+	klog.Infof("New pod assigned to virtual node: %s", key)
+
+	if err := p.syncer.SyncResources(ctx, pod); err != nil {
+		klog.Errorf("Failed to sync resources for %s: %v", key, err)
+		p.setPodStatus(ctx, pod, corev1.PodFailed, "ResourceSyncFailed", err.Error())
+		return
+	}
+
+	workerPod := p.transformPod(pod)
+	created, err := p.cfg.WorkerClient.CoreV1().Pods(p.cfg.WorkerNamespace).Create(ctx, workerPod, metav1.CreateOptions{})
+	if err != nil {
+		if errors.IsAlreadyExists(err) {
+			klog.Infof("Worker pod already exists for %s", key)
+			p.mu.Lock()
+			p.managedPods[key] = workerPod.Name
+			p.mu.Unlock()
+			return
+		}
+		klog.Errorf("Failed to create worker pod for %s: %v", key, err)
+		p.setPodStatus(ctx, pod, corev1.PodFailed, "WorkerPodCreateFailed", err.Error())
+		return
+	}
+
+	klog.Infof("Created worker pod %s/%s for tenant pod %s", p.cfg.WorkerNamespace, created.Name, key)
+	p.mu.Lock()
+	p.managedPods[key] = created.Name
+	p.mu.Unlock()
+}
+
+func (p *GPUProvider) handleTenantPodDeleted(ctx context.Context, pod *corev1.Pod) {
+	key := pod.Namespace + "/" + pod.Name
+
+	p.mu.Lock()
+	workerPodName, exists := p.managedPods[key]
+	delete(p.managedPods, key)
+	p.mu.Unlock()
+
+	if !exists {
+		return
+	}
+
+	klog.Infof("Tenant pod deleted: %s, cleaning up worker pod %s", key, workerPodName)
+
+	err := p.cfg.WorkerClient.CoreV1().Pods(p.cfg.WorkerNamespace).Delete(ctx, workerPodName, metav1.DeleteOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		klog.Errorf("Failed to delete worker pod %s: %v", workerPodName, err)
+	}
+
+	if err := p.syncer.CleanupResources(ctx, pod.Namespace, pod.Name); err != nil {
+		klog.Errorf("Failed to cleanup synced resources for %s: %v", key, err)
+	}
+}
+
+func (p *GPUProvider) transformPod(pod *corev1.Pod) *corev1.Pod {
+	workerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Name,
+			Namespace: p.cfg.WorkerNamespace,
+			Labels: map[string]string{
+				labelManagedBy:       labelManagedByValue,
+				labelSourceNamespace: pod.Namespace,
+				labelSourceName:      pod.Name,
+				kueueQueueLabel:      kueueQueueName,
+			},
+			Annotations: map[string]string{},
+		},
+		Spec: *pod.Spec.DeepCopy(),
+	}
+
+	for k, v := range pod.Labels {
+		if k == kueueQueueLabel {
+			continue
+		}
+		if strings.HasPrefix(k, "app") || strings.HasPrefix(k, "component") {
+			workerPod.Labels[k] = v
+		}
+	}
+
+	workerPod.Spec.NodeName = ""
+	workerPod.Spec.NodeSelector = nil
+	workerPod.Spec.Affinity = nil
+	workerPod.Spec.Tolerations = nil
+	workerPod.Spec.SchedulerName = ""
+	workerPod.Spec.Priority = nil
+	workerPod.Spec.PriorityClassName = ""
+
+	if workerPod.Spec.ServiceAccountName == "default" || workerPod.Spec.ServiceAccountName == "" {
+		workerPod.Spec.ServiceAccountName = "default"
+	}
+
+	workerPod.Spec.Volumes = filterVolumes(workerPod.Spec.Volumes)
+
+	for i := range workerPod.Spec.Containers {
+		workerPod.Spec.Containers[i].VolumeMounts = filterVolumeMounts(
+			workerPod.Spec.Containers[i].VolumeMounts,
+			workerPod.Spec.Volumes,
+		)
+	}
+	for i := range workerPod.Spec.InitContainers {
+		workerPod.Spec.InitContainers[i].VolumeMounts = filterVolumeMounts(
+			workerPod.Spec.InitContainers[i].VolumeMounts,
+			workerPod.Spec.Volumes,
+		)
+	}
+
+	workerPod.Spec.SecurityContext = &corev1.PodSecurityContext{}
+
+	for i := range workerPod.Spec.Containers {
+		workerPod.Spec.Containers[i].SecurityContext = nil
+	}
+	for i := range workerPod.Spec.InitContainers {
+		workerPod.Spec.InitContainers[i].SecurityContext = nil
+	}
+
+	return workerPod
+}
+
+func filterVolumes(volumes []corev1.Volume) []corev1.Volume {
+	var filtered []corev1.Volume
+	for _, v := range volumes {
+		if v.Projected != nil {
+			isServiceAccountProjected := false
+			for _, src := range v.Projected.Sources {
+				if src.ServiceAccountToken != nil {
+					isServiceAccountProjected = true
+					break
+				}
+			}
+			if isServiceAccountProjected {
+				continue
+			}
+		}
+		if strings.HasPrefix(v.Name, "kube-api-access") {
+			continue
+		}
+		filtered = append(filtered, v)
+	}
+	return filtered
+}
+
+func filterVolumeMounts(mounts []corev1.VolumeMount, volumes []corev1.Volume) []corev1.VolumeMount {
+	volumeNames := make(map[string]bool)
+	for _, v := range volumes {
+		volumeNames[v.Name] = true
+	}
+
+	var filtered []corev1.VolumeMount
+	for _, m := range mounts {
+		if volumeNames[m.Name] {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered
+}
+
+func (p *GPUProvider) setPodStatus(ctx context.Context, pod *corev1.Pod, phase corev1.PodPhase, reason, message string) {
+	pod = pod.DeepCopy()
+	pod.Status.Phase = phase
+	pod.Status.Reason = reason
+	pod.Status.Message = message
+	_, err := p.cfg.TenantClient.CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, pod, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Errorf("Failed to update tenant pod status %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+}
+
+func (p *GPUProvider) watchWorkerPods(ctx context.Context) {
+	labelSelector := labelManagedBy + "=" + labelManagedByValue
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		watcher, err := p.cfg.WorkerClient.CoreV1().Pods(p.cfg.WorkerNamespace).Watch(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+		if err != nil {
+			klog.Errorf("Failed to watch worker pods: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		klog.Info("Watching worker pods for status sync")
+
+		for event := range watcher.ResultChan() {
+			workerPod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				continue
+			}
+
+			if event.Type == watch.Added || event.Type == watch.Modified {
+				p.syncStatusToTenant(ctx, workerPod)
+			}
+		}
+
+		klog.Warning("Worker pod watch ended, restarting...")
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func (p *GPUProvider) syncStatusToTenant(ctx context.Context, workerPod *corev1.Pod) {
+	sourceNS := workerPod.Labels[labelSourceNamespace]
+	sourceName := workerPod.Labels[labelSourceName]
+	if sourceNS == "" || sourceName == "" {
+		return
+	}
+
+	tenantPod, err := p.cfg.TenantClient.CoreV1().Pods(sourceNS).Get(ctx, sourceName, metav1.GetOptions{})
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			klog.Errorf("Failed to get tenant pod %s/%s: %v", sourceNS, sourceName, err)
+		}
+		return
+	}
+
+	if tenantPod.Status.Phase == workerPod.Status.Phase {
+		return
+	}
+
+	tenantPod = tenantPod.DeepCopy()
+	tenantPod.Status.Phase = workerPod.Status.Phase
+	tenantPod.Status.Message = workerPod.Status.Message
+	tenantPod.Status.Reason = workerPod.Status.Reason
+	tenantPod.Status.ContainerStatuses = workerPod.Status.ContainerStatuses
+	tenantPod.Status.InitContainerStatuses = workerPod.Status.InitContainerStatuses
+	tenantPod.Status.StartTime = workerPod.Status.StartTime
+
+	_, err = p.cfg.TenantClient.CoreV1().Pods(sourceNS).UpdateStatus(ctx, tenantPod, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Errorf("Failed to sync status to tenant pod %s/%s: %v", sourceNS, sourceName, err)
+	} else {
+		klog.Infof("Synced status %s -> tenant pod %s/%s", workerPod.Status.Phase, sourceNS, sourceName)
+	}
+}

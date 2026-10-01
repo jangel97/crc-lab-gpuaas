@@ -1,26 +1,40 @@
-# crc-lab-gpuaas (MultiKueue spike)
+# crc-lab-gpuaas (Virtual Kubelet spike)
 
 Local lab for GPUaaS spike testing. Two SNO OpenShift 4.22 clusters on a gaming
-PC, connected via MultiKueue. The tenant acts as the MultiKueue manager and
-submits GPU workloads. The worker has an RTX 5090 and runs them.
+PC. A custom Virtual Kubelet on the tenant presents a virtual node with GPU
+capacity. When pods are scheduled to the virtual node, VK syncs referenced
+resources (secrets, configmaps, service accounts) to the worker and creates the
+pod there. Kueue on the worker manages GPU quota.
 
 ```
 Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 +----- sno-tenant VM --------+    +----- sno-worker VM --------+
 |  12 vCPU, 16 GB RAM        |    |  8 vCPU, 24 GB RAM         |
-|  Kueue (MultiKueue mgr)    |    |  GPU Operator (RTX 5090)   |
-|    AdmissionCheck           |    |  Kueue                     |
-|    MultiKueueConfig         |    |  LVMS (local storage)      |
-|    MultiKueueCluster -------+--->|  ResourceFlavor + CQ + LQ  |
-|    ClusterQueue + AC ref    |    |                             |
-|    LocalQueue               |    |                             |
+|                              |    |  GPU Operator (RTX 5090)   |
+|  VK Deployment              |    |  Kueue (local quota mgmt)  |
+|    registers virtual node   |    |  LVMS (local storage)      |
+|    "gpu-worker" (1 GPU)     |    |                             |
+|                              |    |  vk-workloads namespace    |
+|  scheduler ──> virtual node +--->|    synced secrets/cms/sas   |
+|                              |    |    real pods running here   |
+|  status synced back <────────+<--|                             |
 +-----------------------------+    +-----------------------------+
 ```
 
-Users submit pods on the tenant with a `kueue.x-k8s.io/queue-name` label.
-Kueue's MultiKueue controller dispatches the workload to the worker cluster,
-where the worker's local Kueue admits it and creates the pod. Status syncs
-back to the tenant. No virtual nodes, no ShadowPods, no Liqo.
+## How It Works
+
+1. VK registers a virtual node `gpu-worker` on the tenant with `nvidia.com/gpu: 1`
+   in allocatable resources.
+2. Users submit pods with `nodeName: gpu-worker` (and a toleration for the VK taint).
+3. VK watches for pods assigned to its node, then:
+   - Walks the pod spec to discover referenced secrets, configmaps, and service accounts
+   - Syncs those resources to the `vk-workloads` namespace on the worker
+   - Transforms the pod spec (strips OpenShift SELinux/SCC mutations, adds Kueue
+     queue-name label, clears scheduling fields)
+   - Creates the pod on the worker
+4. VK watches worker pods and syncs status back to the tenant pod.
+5. When a tenant pod is deleted, VK deletes the worker pod and cleans up synced
+   resources (using management labels).
 
 ## Prerequisites
 
@@ -33,7 +47,7 @@ See [00-prerequisites.md](00-prerequisites.md) for hardware-specific setup
 ansible-playbook -i inventory.yml playbooks/01-create-vms.yml
 ansible-playbook -i inventory.yml playbooks/02-wait-and-discover.yml
 ansible-playbook -i inventory.yml playbooks/03-configure-clusters.yml
-ansible-playbook -i inventory.yml playbooks/04-setup-multikueue.yml
+ansible-playbook -i inventory.yml playbooks/04-setup-virtual-kubelet.yml
 ```
 
 After provisioning, kubeconfigs are at `~/.kube/tenant` and `~/.kube/worker`.
@@ -44,40 +58,48 @@ After provisioning, kubeconfigs are at `~/.kube/tenant` and `~/.kube/worker`.
 |----------|-------------|
 | `01-create-vms.yml` | Creates libvirt VMs, generates install-config, starts SNO install |
 | `02-wait-and-discover.yml` | Waits for install to complete, discovers API endpoints |
-| `03-configure-clusters.yml` | Installs operators (GPU Operator, Kueue, LVMS) |
-| `04-setup-multikueue.yml` | Configures Kueue queues, creates MultiKueue SA on worker, sets up MultiKueue federation on tenant |
+| `03-configure-clusters.yml` | Installs operators (GPU Operator, Kueue, LVMS) on worker |
+| `04-setup-virtual-kubelet.yml` | Builds VK image, sets up worker namespace/RBAC/Kueue queues, deploys VK on tenant |
 | `teardown.yml` | Destroys VMs and cleans up |
 
-## MultiKueue Resource Model
+## Resource Sync
 
-**Both clusters** get a ResourceFlavor (`gpu-flavor`), ClusterQueue (`cluster-queue`),
-and LocalQueue (`user-queue` in the test namespace).
+VK discovers resource references by walking the pod spec:
 
-**Worker only:** A `multikueue-sa` ServiceAccount with ClusterRole binding gives the
-tenant's MultiKueue controller permission to create pods and workloads remotely.
+| Reference type | Fields scanned |
+|---------------|---------------|
+| Secrets | `env[].valueFrom.secretKeyRef`, `envFrom[].secretRef`, `volumes[].secret`, `imagePullSecrets` |
+| ConfigMaps | `env[].valueFrom.configMapKeyRef`, `envFrom[].configMapRef`, `volumes[].configMap` |
+| ServiceAccounts | `serviceAccountName` (plus the SA's image pull secrets) |
 
-**Tenant only (manager):**
-- Secret `worker-kubeconfig` in `kueue-system` (SA-based kubeconfig for worker)
-- AdmissionCheck `multikueue` (controller: `kueue.x-k8s.io/multikueue`)
-- MultiKueueConfig `multikueue-config` (references `worker-cluster`)
-- MultiKueueCluster `worker-cluster` (points to the kubeconfig Secret)
-- ClusterQueue patched with `admissionChecks: ["multikueue"]`
+Synced resources get management labels (`app.kubernetes.io/managed-by: vk-gpu-provider`,
+`vk.gpuaas.io/source-pod`, `vk.gpuaas.io/source-namespace`) for cleanup tracking.
+
+## VK Image
+
+The VK provider is a Go binary built from `cmd/vk-gpu-provider/`. It uses
+plain `k8s.io/client-go` (no virtual-kubelet library dependency).
+
+```bash
+podman build -t quay.io/jmorenas/vk-gpu-provider:latest -f cmd/vk-gpu-provider/Dockerfile .
+podman push quay.io/jmorenas/vk-gpu-provider:latest
+```
 
 ## Storage
 
 The worker runs LVMS for local storage (`lvms-vg1` StorageClass). The tenant
-does not need local storage for this spike (plain pods only, no PVCs).
+does not need local storage.
 
 ## Tests
 
 Integration tests validate that GPU pods get dispatched from tenant to worker
-via MultiKueue.
+via the Virtual Kubelet and that resource syncing works.
 
 ```bash
 cd crc-lab-gpuaas
 pip install -e .
 TENANT_KUBECONFIG=~/.kube/tenant WORKER_KUBECONFIG=~/.kube/worker \
-  python -m pytest tests/ -v -s -m multikueue
+  python -m pytest tests/ -v -s -m vk
 ```
 
 ## Teardown

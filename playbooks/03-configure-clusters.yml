@@ -29,12 +29,12 @@
     include_tasks: tasks/install-gpu-operator.yml
     when: components.gpu_operator | default(false) | bool
 
-  # Kueue (both clusters for MultiKueue)
+  # Kueue (worker only — manages GPU quota)
   - name: Install Kueue
     include_tasks: tasks/install-kueue.yml
     when: components.kueue | default(false) | bool
 
-  # LVMS (worker only for MultiKueue spike)
+  # LVMS (worker only)
   - name: Install LVMS
     include_tasks: tasks/install-lvms.yml
     when: components.lvms | default(false) | bool

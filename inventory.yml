@@ -2,7 +2,7 @@ all:
   vars:
     ocp_version: "4.22"
     base_domain: "local.lab"
-    kueue_version: "v0.10.1"
+    kueue_version: "v0.19.7"
 
     pull_secret_path: "{{ playbook_dir }}/../pull-secret.json"
     work_dir: "{{ playbook_dir }}/../.workdir"
@@ -15,9 +15,12 @@ all:
     openshift_install_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ ocp_version }}/openshift-install-linux.tar.gz"
     oc_client_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ ocp_version }}/openshift-client-linux.tar.gz"
 
-    multikueue_namespace: "kueue-system"
-    multikueue_test_namespace: "multikueue-test"
-    multikueue_sa_name: "multikueue-sa"
+    gaming_pc_host: "192.168.1.139"
+
+    vk_image: "quay.io/jmorenas/vk-gpu-provider:latest"
+    vk_worker_namespace: "vk-workloads"
+    vk_node_name: "gpu-worker"
+    vk_test_namespace: "vk-test"
 
   children:
     clusters:
@@ -35,8 +38,7 @@ all:
           cluster_network_prefix: 23
           service_network_cidr: "172.30.0.0/16"
           components:
-            kueue: true
-          multikueue_role: manager
+            kueue: false
         worker:
           vm_name: sno-worker
           vm_cpus: 8
@@ -55,4 +57,3 @@ all:
             lvms: true
             gpu_operator: true
             kueue: true
-          multikueue_role: worker

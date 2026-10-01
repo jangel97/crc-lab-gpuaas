@@ -13,5 +13,5 @@ filterwarnings = [
     "ignore::urllib3.exceptions.InsecureRequestWarning",
 ]
 markers = [
-    "multikueue: MultiKueue cross-cluster GPU dispatch tests",
+    "vk: Virtual Kubelet cross-cluster GPU dispatch tests",
 ]

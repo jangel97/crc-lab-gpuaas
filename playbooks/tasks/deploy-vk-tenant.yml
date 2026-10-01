@@ -1,0 +1,53 @@
+---
+- name: Create worker-kubeconfig Secret on tenant
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: worker-kubeconfig
+        namespace: kube-system
+      type: Opaque
+      stringData:
+        kubeconfig: |
+          {{ worker_vk_kubeconfig | indent(10) }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+
+- name: Apply VK RBAC on tenant
+  command:
+    cmd: oc apply -f -
+    stdin: "{{ lookup('file', playbook_dir + '/../deploy/vk-rbac.yml') }}"
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+
+- name: Apply VK Deployment on tenant
+  command:
+    cmd: oc apply -f -
+    stdin: "{{ lookup('file', playbook_dir + '/../deploy/vk-deployment.yml') }}"
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+
+- name: Wait for VK pod to be Ready
+  command: >
+    oc wait deployment -n kube-system vk-gpu-provider
+    --for=condition=Available --timeout=120s
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+  retries: 3
+  delay: 10
+  register: vk_ready
+  until: vk_ready.rc == 0
+
+- name: Wait for virtual node to appear
+  shell: >
+    oc get node {{ vk_node_name }}
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+  register: vk_node_status
+  retries: 12
+  delay: 10
+  until: vk_node_status.stdout == 'True'
+  changed_when: false

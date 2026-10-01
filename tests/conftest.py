@@ -6,7 +6,8 @@ from kubernetes import client, config
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-MULTIKUEUE_TEST_NAMESPACE = "multikueue-test"
+VK_TEST_NAMESPACE = "vk-test"
+VK_WORKER_NAMESPACE = "vk-workloads"
 
 
 def _load_clients(kubeconfig_path):
@@ -17,7 +18,7 @@ def _load_clients(kubeconfig_path):
 
 @pytest.fixture(scope="session")
 def tenant_clients():
-    """API clients for the tenant (MultiKueue manager) cluster."""
+    """API clients for the tenant cluster."""
     path = os.environ.get("TENANT_KUBECONFIG", os.path.expanduser("~/.kube/tenant"))
     return _load_clients(path)
 
@@ -31,5 +32,11 @@ def worker_clients():
 
 @pytest.fixture(scope="session")
 def test_namespace():
-    """Return the pre-provisioned MultiKueue test namespace."""
-    return MULTIKUEUE_TEST_NAMESPACE
+    """Return the pre-provisioned VK test namespace on the tenant."""
+    return VK_TEST_NAMESPACE
+
+
+@pytest.fixture(scope="session")
+def vk_worker_namespace():
+    """Return the namespace on the worker where VK creates pods."""
+    return VK_WORKER_NAMESPACE

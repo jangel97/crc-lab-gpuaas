@@ -1,0 +1,21 @@
+---
+- name: Check if vk-gpu-provider image exists locally
+  command: podman image exists {{ vk_image }}
+  delegate_to: "{{ gaming_pc_host }}"
+  register: vk_image_check
+  failed_when: false
+  changed_when: false
+
+- name: Build vk-gpu-provider image
+  command: >
+    podman build
+    -t {{ vk_image }}
+    -f cmd/vk-gpu-provider/Dockerfile
+    {{ playbook_dir }}/..
+  delegate_to: "{{ gaming_pc_host }}"
+  when: vk_image_check.rc != 0 or vk_force_build | default(false) | bool
+
+- name: Push vk-gpu-provider image to registry
+  command: podman push {{ vk_image }}
+  delegate_to: "{{ gaming_pc_host }}"
+  when: vk_image_check.rc != 0 or vk_force_build | default(false) | bool

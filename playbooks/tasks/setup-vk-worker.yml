@@ -1,0 +1,103 @@
+---
+- name: Apply worker namespace and RBAC
+  command:
+    cmd: oc apply -f -
+    stdin: "{{ lookup('file', playbook_dir + '/../deploy/worker-namespace.yml') }}"
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+
+- name: Grant privileged SCC to vk-remote-sa
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: vk-remote-sa-privileged-scc
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: system:openshift:scc:privileged
+      subjects:
+      - kind: ServiceAccount
+        name: vk-remote-sa
+        namespace: {{ vk_worker_namespace }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+
+- name: Grant anyuid SCC to default SA in vk-workloads
+  command: >
+    oc adm policy add-scc-to-user anyuid -z default -n {{ vk_worker_namespace }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+
+- name: Apply Kueue queues on worker
+  command:
+    cmd: oc apply -f -
+    stdin: "{{ lookup('file', playbook_dir + '/../deploy/worker-kueue-queues.yml') }}"
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+
+- name: Create long-lived token for vk-remote-sa
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: vk-remote-sa-token
+        namespace: {{ vk_worker_namespace }}
+        annotations:
+          kubernetes.io/service-account.name: vk-remote-sa
+      type: kubernetes.io/service-account-token
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+
+- name: Wait for token to be populated
+  shell: >
+    oc get secret vk-remote-sa-token -n {{ vk_worker_namespace }}
+    -o jsonpath='{.data.token}'
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+  register: vk_sa_token_raw
+  retries: 10
+  delay: 5
+  until: vk_sa_token_raw.stdout | length > 0
+  changed_when: false
+
+- name: Get worker API server URL
+  command: oc whoami --show-server
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+  register: worker_api_url
+  changed_when: false
+
+- name: Get worker CA certificate
+  shell: >
+    oc get secret vk-remote-sa-token -n {{ vk_worker_namespace }}
+    -o jsonpath='{.data.ca\.crt}'
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+  register: worker_ca_b64
+  changed_when: false
+
+- name: Build worker kubeconfig for VK
+  set_fact:
+    worker_vk_kubeconfig: |
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - cluster:
+          certificate-authority-data: {{ worker_ca_b64.stdout }}
+          server: {{ worker_api_url.stdout }}
+        name: worker
+      contexts:
+      - context:
+          cluster: worker
+          user: vk-remote-sa
+        name: worker
+      current-context: worker
+      users:
+      - name: vk-remote-sa
+        user:
+          token: {{ vk_sa_token_raw.stdout | b64decode }}
