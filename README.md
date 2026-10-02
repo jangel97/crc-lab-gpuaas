@@ -90,17 +90,80 @@ podman push quay.io/jmorenas/gpuaas-virtual-kubelet:latest
 The worker runs LVMS for local storage (`lvms-vg1` StorageClass). The tenant
 does not need local storage.
 
+## RHOAI Integration
+
+RHOAI (Red Hat OpenShift AI) is deployed on the tenant cluster only. The worker
+cluster stays bare — just GPU Operator + Kueue. Training workloads (PyTorchJob)
+submitted on the tenant are dispatched to the worker GPU via VK transparently.
+
+The VK preserves RHOAI training operator labels (`training.kubeflow.org/*`) so
+the operator can track pod status. Worker pod names are namespace-prefixed
+(`{namespace}--{name}`) to avoid collisions across tenant namespaces.
+
+### Known Gaps
+
+| Workload | Gap | Impact |
+|----------|-----|--------|
+| Notebooks | Pod on worker, route on tenant points nowhere | No browser access |
+| KServe | Inference endpoint unreachable from tenant | No model serving |
+| Distributed training | Headless services on tenant, pods on worker | DNS fails for multi-node |
+
+These require cross-cluster networking (Submariner or similar) and are out of
+scope for this spike.
+
 ## Tests
 
-Integration tests validate that GPU pods get dispatched from tenant to worker
-via the Virtual Kubelet and that resource syncing works.
+Integration tests run against live clusters and validate the full dispatch
+lifecycle: pod scheduling, resource syncing, GPU execution, status sync,
+and cleanup.
 
 ```bash
-cd crc-lab-gpuaas
-pip install -e .
+# Run all tests
 TENANT_KUBECONFIG=~/.kube/tenant WORKER_KUBECONFIG=~/.kube/worker \
-  python -m pytest tests/ -v -s -m vk
+  python -m pytest tests/ -v
+
+# Run only VK core tests
+python -m pytest tests/ -v -m vk
+
+# Run only RHOAI tests
+python -m pytest tests/ -v -m rhoai
 ```
+
+### Test Results (2026-10-02)
+
+All 6 tests pass. Runtime: ~20 seconds.
+
+```
+tests/test_rhoai_vk.py::test_pytorchjob_via_vk        PASSED
+tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker  PASSED
+tests/test_vk_gpu.py::test_virtual_node_exists         PASSED
+tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk   PASSED
+tests/test_vk_gpu.py::test_resource_sync               PASSED
+tests/test_vk_gpu.py::test_pod_deletion_cleans_up      PASSED
+```
+
+### Test Descriptions
+
+| Test | Marker | What it validates |
+|------|--------|-------------------|
+| `test_virtual_node_exists` | vk | Virtual node `gpu-worker` is registered with `nvidia.com/gpu` in allocatable, Ready condition |
+| `test_gpu_pod_dispatched_via_vk` | vk | GPU pod submitted on tenant → dispatched to worker → `nvidia-smi` runs on RTX 5090 → status synced back as Succeeded |
+| `test_resource_sync` | vk | Pod referencing a Secret + ConfigMap on tenant → both synced to worker namespace with management labels → pod reads them successfully |
+| `test_pod_deletion_cleans_up` | vk | Tenant pod deleted → worker pod and synced secret cleaned up automatically |
+| `test_pytorchjob_via_vk` | rhoai | PyTorchJob CR on tenant → training operator creates master pod → VK dispatches to worker GPU → nvidia-smi succeeds → status synced → PyTorchJob condition Succeeded |
+| `test_no_rhoai_crds_on_worker` | rhoai | Worker cluster has no RHOAI CRDs (pytorchjobs, notebooks, inferenceservices, rayclusters) — confirms it stays a bare GPU node |
+
+### What the Tests Prove
+
+1. **Cross-cluster GPU dispatch works end-to-end**: pods scheduled on a virtual
+   node execute on a real GPU (RTX 5090) in a different cluster.
+2. **Resource isolation**: secrets, configmaps, and service accounts are synced
+   on-demand and cleaned up on pod deletion. No data leaks between tenants.
+3. **Operator compatibility**: RHOAI training operator (PyTorchJob) works
+   transparently — it creates pods, VK dispatches them, status syncs back, and
+   the operator sees the job as Succeeded. No RHOAI modifications needed.
+4. **Worker stays bare**: no RHOAI CRDs or operator workloads on the GPU
+   cluster. It only runs GPU Operator + Kueue for quota management.
 
 ## Teardown
 
