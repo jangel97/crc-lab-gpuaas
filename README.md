@@ -25,7 +25,13 @@ Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 
 1. VK registers a virtual node `gpu-worker` on the tenant with `nvidia.com/gpu: 1`
    in allocatable resources.
-2. Users submit pods with `nodeName: gpu-worker` (and a toleration for the VK taint).
+2. Users submit pods with `nodeName: gpu-worker` and a toleration for the VK
+   taints (NoSchedule + NoExecute):
+   ```yaml
+   tolerations:
+   - key: virtual-kubelet.io/provider
+     operator: Exists
+   ```
 3. VK watches for pods assigned to its node, then:
    - Walks the pod spec to discover referenced secrets, configmaps, and service accounts
    - Syncs those resources to the `vk-workloads` namespace on the worker
@@ -58,7 +64,7 @@ After provisioning, kubeconfigs are at `~/.kube/tenant` and `~/.kube/worker`.
 |----------|-------------|
 | `01-create-vms.yml` | Creates libvirt VMs, generates install-config, starts SNO install |
 | `02-wait-and-discover.yml` | Waits for install to complete, discovers API endpoints |
-| `03-configure-clusters.yml` | Installs operators (GPU Operator, Kueue, LVMS) on worker |
+| `03-configure-clusters.yml` | Installs GPU Operator, Kueue, LVMS on worker; RHOAI on tenant |
 | `04-setup-virtual-kubelet.yml` | Builds VK image, sets up worker namespace/RBAC/Kueue queues, deploys VK on tenant |
 | `teardown.yml` | Destroys VMs and cleans up |
 
