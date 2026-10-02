@@ -10,6 +10,11 @@ VK_TEST_NAMESPACE = "vk-test"
 VK_WORKER_NAMESPACE = "vk-workloads"
 
 
+def worker_pod_name(tenant_namespace, pod_name):
+    """Compute the namespaced worker pod name that VK creates."""
+    return f"{tenant_namespace}--{pod_name}"
+
+
 def _load_clients(kubeconfig_path):
     """Load a kubeconfig and return (CoreV1Api, CustomObjectsApi)."""
     api_client = config.new_client_from_config(config_file=kubeconfig_path)

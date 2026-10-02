@@ -19,7 +19,7 @@ rules:
   resources: [pods, pods/status, pods/log]
   verbs: [get, list, watch, create, update, patch, delete]
 - apiGroups: [""]
-  resources: [secrets, configmaps, serviceaccounts]
+  resources: [secrets, configmaps, serviceaccounts, persistentvolumeclaims]
   verbs: [get, list, watch, create, update, patch, delete]
 - apiGroups: [""]
   resources: [events]

@@ -14,4 +14,5 @@ filterwarnings = [
 ]
 markers = [
     "vk: Virtual Kubelet cross-cluster GPU dispatch tests",
+    "rhoai: RHOAI workload dispatch via Virtual Kubelet",
 ]

@@ -25,6 +25,8 @@ import time
 import pytest
 from kubernetes import client
 
+from conftest import worker_pod_name
+
 
 VK_NODE_NAME = "gpu-worker"
 
@@ -66,11 +68,15 @@ def test_gpu_pod_dispatched_via_vk(
     ns = test_namespace
 
     pod_name = "vk-gpu-test"
+    w_pod_name = worker_pod_name(ns, pod_name)
 
     # Cleanup from previous runs
-    for core, target_ns in [(tenant_core, ns), (worker_core, vk_worker_namespace)]:
+    for core, name, target_ns in [
+        (tenant_core, pod_name, ns),
+        (worker_core, w_pod_name, vk_worker_namespace),
+    ]:
         try:
-            core.delete_namespaced_pod(name=pod_name, namespace=target_ns)
+            core.delete_namespaced_pod(name=name, namespace=target_ns)
             time.sleep(5)
         except client.exceptions.ApiException as e:
             if e.status != 404:
@@ -116,7 +122,7 @@ def test_gpu_pod_dispatched_via_vk(
     while time.time() < deadline:
         try:
             worker_core.read_namespaced_pod(
-                name=pod_name, namespace=vk_worker_namespace
+                name=w_pod_name, namespace=vk_worker_namespace
             )
             worker_pod_found = True
             break
@@ -125,7 +131,7 @@ def test_gpu_pod_dispatched_via_vk(
         time.sleep(3)
 
     assert worker_pod_found, (
-        f"Pod {pod_name} did not appear on worker in {vk_worker_namespace} within 60s"
+        f"Pod {w_pod_name} did not appear on worker in {vk_worker_namespace} within 60s"
     )
 
     # Wait for worker pod to complete
@@ -134,7 +140,7 @@ def test_gpu_pod_dispatched_via_vk(
     while time.time() < deadline:
         try:
             wp = worker_core.read_namespaced_pod(
-                name=pod_name, namespace=vk_worker_namespace
+                name=w_pod_name, namespace=vk_worker_namespace
             )
             worker_phase = wp.status.phase
             if worker_phase in ("Succeeded", "Failed"):
@@ -192,6 +198,7 @@ def test_resource_sync(
     secret_name = "vk-test-secret"
     cm_name = "vk-test-config"
     pod_name = "vk-resource-sync-test"
+    w_pod_name = worker_pod_name(ns, pod_name)
 
     # Create Secret on tenant
     try:
@@ -220,9 +227,12 @@ def test_resource_sync(
     )
 
     # Cleanup pod from previous runs
-    for core, target_ns in [(tenant_core, ns), (worker_core, vk_worker_namespace)]:
+    for core, name, target_ns in [
+        (tenant_core, pod_name, ns),
+        (worker_core, w_pod_name, vk_worker_namespace),
+    ]:
         try:
-            core.delete_namespaced_pod(name=pod_name, namespace=target_ns)
+            core.delete_namespaced_pod(name=name, namespace=target_ns)
             time.sleep(3)
         except client.exceptions.ApiException:
             pass
@@ -317,7 +327,7 @@ def test_resource_sync(
     while time.time() < deadline:
         try:
             wp = worker_core.read_namespaced_pod(
-                name=pod_name, namespace=vk_worker_namespace
+                name=w_pod_name, namespace=vk_worker_namespace
             )
             worker_phase = wp.status.phase
             if worker_phase in ("Succeeded", "Failed"):
@@ -359,6 +369,7 @@ def test_pod_deletion_cleans_up(
     ns = test_namespace
 
     pod_name = "vk-cleanup-test"
+    w_pod_name = worker_pod_name(ns, pod_name)
     secret_name = "vk-cleanup-secret"
 
     # Create a secret that the pod references
@@ -374,13 +385,22 @@ def test_pod_deletion_cleans_up(
         ),
     )
 
-    # Cleanup from previous runs
-    for core, target_ns in [(tenant_core, ns), (worker_core, vk_worker_namespace)]:
+    # Cleanup from previous runs — must wait for full termination
+    for core, name, target_ns in [
+        (tenant_core, pod_name, ns),
+        (worker_core, w_pod_name, vk_worker_namespace),
+    ]:
         try:
-            core.delete_namespaced_pod(name=pod_name, namespace=target_ns)
-            time.sleep(3)
+            core.delete_namespaced_pod(name=name, namespace=target_ns)
         except client.exceptions.ApiException:
-            pass
+            continue
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                core.read_namespaced_pod(name=name, namespace=target_ns)
+            except client.exceptions.ApiException:
+                break
+            time.sleep(2)
 
     pod = client.V1Pod(
         metadata=client.V1ObjectMeta(name=pod_name, namespace=ns),
@@ -420,7 +440,7 @@ def test_pod_deletion_cleans_up(
     while time.time() < deadline:
         try:
             worker_core.read_namespaced_pod(
-                name=pod_name, namespace=vk_worker_namespace
+                name=w_pod_name, namespace=vk_worker_namespace
             )
             break
         except client.exceptions.ApiException:
@@ -436,7 +456,7 @@ def test_pod_deletion_cleans_up(
     while time.time() < deadline:
         try:
             worker_core.read_namespaced_pod(
-                name=pod_name, namespace=vk_worker_namespace
+                name=w_pod_name, namespace=vk_worker_namespace
             )
         except client.exceptions.ApiException as e:
             if e.status == 404:
@@ -445,7 +465,7 @@ def test_pod_deletion_cleans_up(
         time.sleep(3)
 
     assert worker_pod_gone, (
-        f"Worker pod {pod_name} not deleted after tenant pod deletion"
+        f"Worker pod {w_pod_name} not deleted after tenant pod deletion"
     )
 
     # Check synced secret is cleaned up

@@ -17,7 +17,7 @@ rules:
   resources: [nodes, nodes/status]
   verbs: [get, list, watch, create, update, patch]
 - apiGroups: [""]
-  resources: [secrets, configmaps, serviceaccounts]
+  resources: [secrets, configmaps, serviceaccounts, persistentvolumeclaims]
   verbs: [get, list, watch]
 - apiGroups: [""]
   resources: [events]

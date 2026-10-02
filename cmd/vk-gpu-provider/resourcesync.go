@@ -26,7 +26,7 @@ func NewResourceSyncer(tenant, worker kubernetes.Interface, workerNS string) *Re
 }
 
 func (s *ResourceSyncer) SyncResources(ctx context.Context, pod *corev1.Pod) error {
-	secrets, configmaps := discoverReferences(pod)
+	secrets, configmaps, pvcs := discoverReferences(pod)
 
 	for _, name := range secrets {
 		if err := s.syncSecret(ctx, pod.Namespace, pod.Name, name); err != nil {
@@ -40,6 +40,12 @@ func (s *ResourceSyncer) SyncResources(ctx context.Context, pod *corev1.Pod) err
 		}
 	}
 
+	for _, name := range pvcs {
+		if err := s.syncPVC(ctx, pod.Namespace, pod.Name, name); err != nil {
+			return fmt.Errorf("sync pvc %q: %w", name, err)
+		}
+	}
+
 	if pod.Spec.ServiceAccountName != "" && pod.Spec.ServiceAccountName != "default" {
 		if err := s.syncServiceAccount(ctx, pod.Namespace, pod.Name, pod.Spec.ServiceAccountName); err != nil {
 			return fmt.Errorf("sync serviceaccount %q: %w", pod.Spec.ServiceAccountName, err)
@@ -49,9 +55,10 @@ func (s *ResourceSyncer) SyncResources(ctx context.Context, pod *corev1.Pod) err
 	return nil
 }
 
-func discoverReferences(pod *corev1.Pod) (secrets []string, configmaps []string) {
+func discoverReferences(pod *corev1.Pod) (secrets, configmaps, pvcs []string) {
 	secretSet := make(map[string]bool)
 	cmSet := make(map[string]bool)
+	pvcSet := make(map[string]bool)
 
 	allContainers := append(pod.Spec.Containers, pod.Spec.InitContainers...)
 	for _, c := range allContainers {
@@ -82,6 +89,9 @@ func discoverReferences(pod *corev1.Pod) (secrets []string, configmaps []string)
 		if v.ConfigMap != nil {
 			cmSet[v.ConfigMap.Name] = true
 		}
+		if v.PersistentVolumeClaim != nil {
+			pvcSet[v.PersistentVolumeClaim.ClaimName] = true
+		}
 	}
 
 	for _, ips := range pod.Spec.ImagePullSecrets {
@@ -93,6 +103,9 @@ func discoverReferences(pod *corev1.Pod) (secrets []string, configmaps []string)
 	}
 	for name := range cmSet {
 		configmaps = append(configmaps, name)
+	}
+	for name := range pvcSet {
+		pvcs = append(pvcs, name)
 	}
 	return
 }
@@ -229,6 +242,47 @@ func (s *ResourceSyncer) syncServiceAccount(ctx context.Context, sourceNS, podNa
 	return nil
 }
 
+func (s *ResourceSyncer) syncPVC(ctx context.Context, sourceNS, podName, name string) error {
+	pvc, err := s.tenantClient.CoreV1().PersistentVolumeClaims(sourceNS).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			klog.Warningf("PVC %s/%s not found on tenant, skipping", sourceNS, name)
+			return nil
+		}
+		return err
+	}
+
+	workerPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: s.workerNamespace,
+			Labels: map[string]string{
+				labelManagedBy:       labelManagedByValue,
+				labelSourceNamespace: sourceNS,
+				labelSourcePod:       podName,
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: pvc.Spec.AccessModes,
+			Resources:   pvc.Spec.Resources,
+		},
+	}
+
+	_, err = s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		klog.Infof("PVC %s already exists in %s, skipping", name, s.workerNamespace)
+		return nil
+	} else if errors.IsNotFound(err) {
+		_, err = s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).Create(ctx, workerPVC, metav1.CreateOptions{})
+	}
+
+	if err != nil {
+		return err
+	}
+	klog.Infof("Synced PVC %s -> %s/%s", name, s.workerNamespace, name)
+	return nil
+}
+
 func (s *ResourceSyncer) CleanupResources(ctx context.Context, sourceNS, podName string) error {
 	labelSelector := fmt.Sprintf("%s=%s,%s=%s,%s=%s",
 		labelManagedBy, labelManagedByValue,
@@ -265,6 +319,17 @@ func (s *ResourceSyncer) CleanupResources(ctx context.Context, sourceNS, podName
 		for _, sa := range sas.Items {
 			if err := s.workerClient.CoreV1().ServiceAccounts(s.workerNamespace).Delete(ctx, sa.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
 				klog.Errorf("Failed to delete synced serviceaccount %s: %v", sa.Name, err)
+			}
+		}
+	}
+
+	pvcs, err := s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err == nil {
+		for _, pvc := range pvcs.Items {
+			if err := s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).Delete(ctx, pvc.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+				klog.Errorf("Failed to delete synced PVC %s: %v", pvc.Name, err)
 			}
 		}
 	}

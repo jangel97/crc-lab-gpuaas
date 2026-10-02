@@ -84,27 +84,50 @@ func (p *GPUProvider) registerNode(ctx context.Context) error {
 					Value:  "gpu-provider",
 					Effect: corev1.TaintEffectNoSchedule,
 				},
+				{
+					Key:    "virtual-kubelet.io/provider",
+					Value:  "gpu-provider",
+					Effect: corev1.TaintEffectNoExecute,
+				},
 			},
 		},
 	}
 
-	existing, err := p.cfg.TenantClient.CoreV1().Nodes().Get(ctx, p.cfg.NodeName, metav1.GetOptions{})
-	if err == nil {
-		existing.Labels = node.Labels
-		existing.Spec.Taints = node.Spec.Taints
-		_, err = p.cfg.TenantClient.CoreV1().Nodes().Update(ctx, existing, metav1.UpdateOptions{})
-		if err != nil {
-			return fmt.Errorf("update existing node: %w", err)
+	for attempt := 0; attempt < 5; attempt++ {
+		existing, err := p.cfg.TenantClient.CoreV1().Nodes().Get(ctx, p.cfg.NodeName, metav1.GetOptions{})
+		if err == nil {
+			existing.Labels = node.Labels
+			existing.Spec.Taints = node.Spec.Taints
+			_, err = p.cfg.TenantClient.CoreV1().Nodes().Update(ctx, existing, metav1.UpdateOptions{})
+			if errors.IsConflict(err) {
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("update existing node: %w", err)
+			}
+		} else if errors.IsNotFound(err) {
+			_, err = p.cfg.TenantClient.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+			if err != nil && !errors.IsAlreadyExists(err) {
+				return fmt.Errorf("create node: %w", err)
+			}
+		} else {
+			return fmt.Errorf("get node: %w", err)
 		}
-	} else if errors.IsNotFound(err) {
-		_, err = p.cfg.TenantClient.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
-		if err != nil {
-			return fmt.Errorf("create node: %w", err)
-		}
-	} else {
-		return fmt.Errorf("get node: %w", err)
+		break
 	}
 
+	for attempt := 0; attempt < 5; attempt++ {
+		err := p.updateNodeStatus(ctx)
+		if err == nil {
+			return nil
+		}
+		if errors.IsConflict(err) {
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
+		return err
+	}
 	return p.updateNodeStatus(ctx)
 }
 
@@ -263,6 +286,10 @@ func (p *GPUProvider) watchTenantPods(ctx context.Context) error {
 }
 
 func (p *GPUProvider) handleTenantPod(ctx context.Context, pod *corev1.Pod) {
+	if isSystemNamespace(pod.Namespace) {
+		return
+	}
+
 	key := pod.Namespace + "/" + pod.Name
 
 	p.mu.Lock()
@@ -311,6 +338,10 @@ func (p *GPUProvider) handleTenantPod(ctx context.Context, pod *corev1.Pod) {
 }
 
 func (p *GPUProvider) handleTenantPodDeleted(ctx context.Context, pod *corev1.Pod) {
+	if isSystemNamespace(pod.Namespace) {
+		return
+	}
+
 	key := pod.Namespace + "/" + pod.Name
 
 	p.mu.Lock()
@@ -334,10 +365,47 @@ func (p *GPUProvider) handleTenantPodDeleted(ctx context.Context, pod *corev1.Po
 	}
 }
 
+func workerPodName(namespace, name string) string {
+	return fmt.Sprintf("%s--%s", namespace, name)
+}
+
+func isSystemNamespace(ns string) bool {
+	return strings.HasPrefix(ns, "openshift-") ||
+		strings.HasPrefix(ns, "kube-") ||
+		strings.HasPrefix(ns, "redhat-ods-") ||
+		ns == "default" ||
+		ns == "kueue-system"
+}
+
+var labelSkipSet = map[string]bool{
+	kueueQueueLabel: true,
+	labelManagedBy:  true,
+}
+
+var labelSkipPrefixes = []string{
+	"openshift.io/",
+	"pod-security.kubernetes.io/",
+}
+
+var annotationSkipPrefixes = []string{
+	"openshift.io/",
+	"kubernetes.io/",
+	"k8s.ovn.org/",
+}
+
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *GPUProvider) transformPod(pod *corev1.Pod) *corev1.Pod {
 	workerPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      pod.Name,
+			Name:      workerPodName(pod.Namespace, pod.Name),
 			Namespace: p.cfg.WorkerNamespace,
 			Labels: map[string]string{
 				labelManagedBy:       labelManagedByValue,
@@ -351,12 +419,20 @@ func (p *GPUProvider) transformPod(pod *corev1.Pod) *corev1.Pod {
 	}
 
 	for k, v := range pod.Labels {
-		if k == kueueQueueLabel {
+		if labelSkipSet[k] {
 			continue
 		}
-		if strings.HasPrefix(k, "app") || strings.HasPrefix(k, "component") {
-			workerPod.Labels[k] = v
+		if hasAnyPrefix(k, labelSkipPrefixes) {
+			continue
 		}
+		workerPod.Labels[k] = v
+	}
+
+	for k, v := range pod.Annotations {
+		if hasAnyPrefix(k, annotationSkipPrefixes) {
+			continue
+		}
+		workerPod.Annotations[k] = v
 	}
 
 	workerPod.Spec.NodeName = ""
@@ -497,7 +573,7 @@ func (p *GPUProvider) syncStatusToTenant(ctx context.Context, workerPod *corev1.
 		return
 	}
 
-	if tenantPod.Status.Phase == workerPod.Status.Phase {
+	if tenantPod.Status.Phase == workerPod.Status.Phase && !containerStatusChanged(tenantPod, workerPod) {
 		return
 	}
 
@@ -505,6 +581,7 @@ func (p *GPUProvider) syncStatusToTenant(ctx context.Context, workerPod *corev1.
 	tenantPod.Status.Phase = workerPod.Status.Phase
 	tenantPod.Status.Message = workerPod.Status.Message
 	tenantPod.Status.Reason = workerPod.Status.Reason
+	tenantPod.Status.Conditions = workerPod.Status.Conditions
 	tenantPod.Status.ContainerStatuses = workerPod.Status.ContainerStatuses
 	tenantPod.Status.InitContainerStatuses = workerPod.Status.InitContainerStatuses
 	tenantPod.Status.StartTime = workerPod.Status.StartTime
@@ -515,4 +592,22 @@ func (p *GPUProvider) syncStatusToTenant(ctx context.Context, workerPod *corev1.
 	} else {
 		klog.Infof("Synced status %s -> tenant pod %s/%s", workerPod.Status.Phase, sourceNS, sourceName)
 	}
+}
+
+func containerStatusChanged(tenant, worker *corev1.Pod) bool {
+	if len(tenant.Status.ContainerStatuses) != len(worker.Status.ContainerStatuses) {
+		return true
+	}
+	for i := range worker.Status.ContainerStatuses {
+		if i >= len(tenant.Status.ContainerStatuses) {
+			return true
+		}
+		if worker.Status.ContainerStatuses[i].Ready != tenant.Status.ContainerStatuses[i].Ready {
+			return true
+		}
+		if worker.Status.ContainerStatuses[i].RestartCount != tenant.Status.ContainerStatuses[i].RestartCount {
+			return true
+		}
+	}
+	return false
 }

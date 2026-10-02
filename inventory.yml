@@ -39,6 +39,7 @@ all:
           service_network_cidr: "172.30.0.0/16"
           components:
             kueue: false
+            rhoai: true
         worker:
           vm_name: sno-worker
           vm_cpus: 8

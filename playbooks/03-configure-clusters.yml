@@ -39,6 +39,11 @@
     include_tasks: tasks/install-lvms.yml
     when: components.lvms | default(false) | bool
 
+  # RHOAI (tenant only — training operator, dashboard, workbenches, kserve)
+  - name: Install RHOAI
+    include_tasks: tasks/install-rhoai.yml
+    when: components.rhoai | default(false) | bool
+
   - name: Disable OperatorHub default catalog sources
     command: >
       oc patch operatorhub.config.openshift.io/cluster --type merge
