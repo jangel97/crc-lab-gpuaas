@@ -54,7 +54,7 @@ def test_pytorchjob_via_vk(
             plural=PYTORCHJOB_PLURAL,
             name=job_name,
         )
-        time.sleep(5)
+        time.sleep(10)
     except client.exceptions.ApiException as e:
         if e.status != 404:
             raise
@@ -64,10 +64,18 @@ def test_pytorchjob_via_vk(
         (worker_core, w_pod_name, vk_worker_namespace),
     ]:
         try:
-            core.delete_namespaced_pod(name=name, namespace=target_ns)
-            time.sleep(3)
+            core.delete_namespaced_pod(
+                name=name, namespace=target_ns, grace_period_seconds=0,
+            )
         except client.exceptions.ApiException:
-            pass
+            continue
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                core.read_namespaced_pod(name=name, namespace=target_ns)
+            except client.exceptions.ApiException:
+                break
+            time.sleep(2)
 
     pytorchjob = {
         "apiVersion": "kubeflow.org/v1",
@@ -85,7 +93,6 @@ def test_pytorchjob_via_vk(
                                 {
                                     "key": "virtual-kubelet.io/provider",
                                     "operator": "Exists",
-                                    "effect": "NoSchedule",
                                 }
                             ],
                             "containers": [

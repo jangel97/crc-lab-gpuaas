@@ -296,15 +296,18 @@ func (p *GPUProvider) handleTenantPod(ctx context.Context, pod *corev1.Pod) {
 	_, exists := p.managedPods[key]
 	p.mu.Unlock()
 
+	if pod.DeletionTimestamp != nil {
+		if exists {
+			p.handleTenantPodDeleted(ctx, pod)
+		}
+		return
+	}
+
 	if exists {
 		return
 	}
 
 	if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-		return
-	}
-
-	if pod.DeletionTimestamp != nil {
 		return
 	}
 

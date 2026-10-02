@@ -31,6 +31,25 @@ from conftest import worker_pod_name
 VK_NODE_NAME = "gpu-worker"
 
 
+def force_delete_pod(core_api, name, namespace, timeout=60):
+    """Delete a pod with grace_period=0 and wait for it to disappear."""
+    try:
+        core_api.delete_namespaced_pod(
+            name=name,
+            namespace=namespace,
+            grace_period_seconds=0,
+        )
+    except client.exceptions.ApiException:
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            core_api.read_namespaced_pod(name=name, namespace=namespace)
+        except client.exceptions.ApiException:
+            return
+        time.sleep(2)
+
+
 @pytest.mark.vk
 def test_virtual_node_exists(tenant_clients):
     """Verify virtual node gpu-worker exists with GPU capacity."""
@@ -71,16 +90,8 @@ def test_gpu_pod_dispatched_via_vk(
     w_pod_name = worker_pod_name(ns, pod_name)
 
     # Cleanup from previous runs
-    for core, name, target_ns in [
-        (tenant_core, pod_name, ns),
-        (worker_core, w_pod_name, vk_worker_namespace),
-    ]:
-        try:
-            core.delete_namespaced_pod(name=name, namespace=target_ns)
-            time.sleep(5)
-        except client.exceptions.ApiException as e:
-            if e.status != 404:
-                raise
+    force_delete_pod(tenant_core, pod_name, ns)
+    force_delete_pod(worker_core, w_pod_name, vk_worker_namespace)
 
     pod = client.V1Pod(
         metadata=client.V1ObjectMeta(
@@ -94,7 +105,6 @@ def test_gpu_pod_dispatched_via_vk(
                 client.V1Toleration(
                     key="virtual-kubelet.io/provider",
                     operator="Exists",
-                    effect="NoSchedule",
                 ),
             ],
             containers=[
@@ -227,15 +237,8 @@ def test_resource_sync(
     )
 
     # Cleanup pod from previous runs
-    for core, name, target_ns in [
-        (tenant_core, pod_name, ns),
-        (worker_core, w_pod_name, vk_worker_namespace),
-    ]:
-        try:
-            core.delete_namespaced_pod(name=name, namespace=target_ns)
-            time.sleep(3)
-        except client.exceptions.ApiException:
-            pass
+    force_delete_pod(tenant_core, pod_name, ns)
+    force_delete_pod(worker_core, w_pod_name, vk_worker_namespace)
 
     pod = client.V1Pod(
         metadata=client.V1ObjectMeta(name=pod_name, namespace=ns),
@@ -246,7 +249,6 @@ def test_resource_sync(
                 client.V1Toleration(
                     key="virtual-kubelet.io/provider",
                     operator="Exists",
-                    effect="NoSchedule",
                 ),
             ],
             containers=[
@@ -385,22 +387,9 @@ def test_pod_deletion_cleans_up(
         ),
     )
 
-    # Cleanup from previous runs — must wait for full termination
-    for core, name, target_ns in [
-        (tenant_core, pod_name, ns),
-        (worker_core, w_pod_name, vk_worker_namespace),
-    ]:
-        try:
-            core.delete_namespaced_pod(name=name, namespace=target_ns)
-        except client.exceptions.ApiException:
-            continue
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            try:
-                core.read_namespaced_pod(name=name, namespace=target_ns)
-            except client.exceptions.ApiException:
-                break
-            time.sleep(2)
+    # Cleanup from previous runs
+    force_delete_pod(tenant_core, pod_name, ns)
+    force_delete_pod(worker_core, w_pod_name, vk_worker_namespace)
 
     pod = client.V1Pod(
         metadata=client.V1ObjectMeta(name=pod_name, namespace=ns),
@@ -411,7 +400,6 @@ def test_pod_deletion_cleans_up(
                 client.V1Toleration(
                     key="virtual-kubelet.io/provider",
                     operator="Exists",
-                    effect="NoSchedule",
                 ),
             ],
             containers=[
