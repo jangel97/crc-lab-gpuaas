@@ -76,11 +76,37 @@ VK discovers resource references by walking the pod spec:
 |---------------|---------------|
 | Secrets | `env[].valueFrom.secretKeyRef`, `envFrom[].secretRef`, `volumes[].secret`, `imagePullSecrets` |
 | ConfigMaps | `env[].valueFrom.configMapKeyRef`, `envFrom[].configMapRef`, `volumes[].configMap` |
-| PVCs | `volumes[].persistentVolumeClaim` |
 | ServiceAccounts | `serviceAccountName` (plus the SA's image pull secrets) |
 
 Synced resources get management labels (`app.kubernetes.io/managed-by: vk-gpu-provider`,
 `vk.gpuaas.io/source-pod`, `vk.gpuaas.io/source-namespace`) for cleanup tracking.
+
+### PVC handling (Catapult storage)
+
+PVCs are handled separately from other resources. Only PVCs with
+`storageClassName: catapult` are synced. Non-catapult PVCs cause the pod
+to fail with a clear error. See [docs/pvc-architecture.md](docs/pvc-architecture.md)
+for the full design.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: checkpoint
+  annotations:
+    catapult.redhat.com/remote-storage-class: lvms-vg1  # optional override
+spec:
+  storageClassName: catapult
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+The control PVC stays Pending (no local provisioner). Catapult creates a
+namespace-prefixed execution PVC (`{namespace}--{name}`) on the GPU
+cluster using the remote StorageClass. Execution PVCs persist across pod
+restarts and are deleted when the control PVC is deleted.
 
 ## VK Image
 
@@ -138,16 +164,17 @@ python -m pytest tests/ -v -m rhoai
 
 ### Test Results (2026-10-02)
 
-All 7 tests pass. Runtime: ~33 seconds.
+All 8 tests pass. Runtime: ~40 seconds.
 
 ```
-tests/test_rhoai_vk.py::test_pytorchjob_via_vk        PASSED
-tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker  PASSED
-tests/test_vk_gpu.py::test_virtual_node_exists         PASSED
-tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk   PASSED
-tests/test_vk_gpu.py::test_resource_sync               PASSED
-tests/test_vk_gpu.py::test_pod_deletion_cleans_up      PASSED
-tests/test_vk_gpu.py::test_pvc_sync                    PASSED
+tests/test_rhoai_vk.py::test_pytorchjob_via_vk            PASSED
+tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker      PASSED
+tests/test_vk_gpu.py::test_virtual_node_exists             PASSED
+tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk       PASSED
+tests/test_vk_gpu.py::test_resource_sync                   PASSED
+tests/test_vk_gpu.py::test_pod_deletion_cleans_up          PASSED
+tests/test_vk_gpu.py::test_catapult_pvc_sync               PASSED
+tests/test_vk_gpu.py::test_non_catapult_pvc_rejected       PASSED
 ```
 
 ### Test Descriptions
@@ -158,7 +185,8 @@ tests/test_vk_gpu.py::test_pvc_sync                    PASSED
 | `test_gpu_pod_dispatched_via_vk` | vk | GPU pod submitted on tenant → dispatched to worker → `nvidia-smi` runs on RTX 5090 → status synced back as Succeeded |
 | `test_resource_sync` | vk | Pod referencing a Secret + ConfigMap on tenant → both synced to worker namespace with management labels → pod reads them successfully |
 | `test_pod_deletion_cleans_up` | vk | Tenant pod deleted → worker pod and synced secret cleaned up automatically |
-| `test_pvc_sync` | vk | PVC on tenant → synced to worker with management labels → access modes match → cleaned up on pod deletion |
+| `test_catapult_pvc_sync` | vk | Catapult PVC on tenant → execution PVC created on worker with namespace prefix → survives pod deletion → cleaned up when control PVC deleted |
+| `test_non_catapult_pvc_rejected` | vk | Pod referencing non-catapult PVC → rejected with `InvalidPVCStorageClass` → no execution PVC created |
 | `test_pytorchjob_via_vk` | rhoai | PyTorchJob CR on tenant → training operator creates master pod → VK dispatches to worker GPU → nvidia-smi succeeds → status synced → PyTorchJob condition Succeeded |
 | `test_no_rhoai_crds_on_worker` | rhoai | Worker cluster has no RHOAI CRDs (pytorchjobs, notebooks, inferenceservices, rayclusters) — confirms it stays a bare GPU node |
 

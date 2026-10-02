@@ -11,22 +11,34 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const (
+	catapultStorageClass       = "catapult"
+	catapultRemoteSCAnnotation = "catapult.redhat.com/remote-storage-class"
+	labelSourcePVC             = "vk.gpuaas.io/source-pvc"
+)
+
 type ResourceSyncer struct {
-	tenantClient    kubernetes.Interface
-	workerClient    kubernetes.Interface
-	workerNamespace string
+	tenantClient              kubernetes.Interface
+	workerClient              kubernetes.Interface
+	workerNamespace           string
+	defaultRemoteStorageClass string
 }
 
-func NewResourceSyncer(tenant, worker kubernetes.Interface, workerNS string) *ResourceSyncer {
+func NewResourceSyncer(tenant, worker kubernetes.Interface, workerNS, defaultRemoteSC string) *ResourceSyncer {
 	return &ResourceSyncer{
-		tenantClient:    tenant,
-		workerClient:    worker,
-		workerNamespace: workerNS,
+		tenantClient:              tenant,
+		workerClient:              worker,
+		workerNamespace:           workerNS,
+		defaultRemoteStorageClass: defaultRemoteSC,
 	}
 }
 
+func executionPVCName(sourceNS, pvcName string) string {
+	return fmt.Sprintf("%s--%s", sourceNS, pvcName)
+}
+
 func (s *ResourceSyncer) SyncResources(ctx context.Context, pod *corev1.Pod) error {
-	secrets, configmaps, pvcs := discoverReferences(pod)
+	secrets, configmaps := discoverReferences(pod)
 
 	for _, name := range secrets {
 		if err := s.syncSecret(ctx, pod.Namespace, pod.Name, name); err != nil {
@@ -40,12 +52,6 @@ func (s *ResourceSyncer) SyncResources(ctx context.Context, pod *corev1.Pod) err
 		}
 	}
 
-	for _, name := range pvcs {
-		if err := s.syncPVC(ctx, pod.Namespace, pod.Name, name); err != nil {
-			return fmt.Errorf("sync pvc %q: %w", name, err)
-		}
-	}
-
 	if pod.Spec.ServiceAccountName != "" && pod.Spec.ServiceAccountName != "default" {
 		if err := s.syncServiceAccount(ctx, pod.Namespace, pod.Name, pod.Spec.ServiceAccountName); err != nil {
 			return fmt.Errorf("sync serviceaccount %q: %w", pod.Spec.ServiceAccountName, err)
@@ -55,10 +61,9 @@ func (s *ResourceSyncer) SyncResources(ctx context.Context, pod *corev1.Pod) err
 	return nil
 }
 
-func discoverReferences(pod *corev1.Pod) (secrets, configmaps, pvcs []string) {
+func discoverReferences(pod *corev1.Pod) (secrets, configmaps []string) {
 	secretSet := make(map[string]bool)
 	cmSet := make(map[string]bool)
-	pvcSet := make(map[string]bool)
 
 	allContainers := append(pod.Spec.Containers, pod.Spec.InitContainers...)
 	for _, c := range allContainers {
@@ -89,9 +94,6 @@ func discoverReferences(pod *corev1.Pod) (secrets, configmaps, pvcs []string) {
 		if v.ConfigMap != nil {
 			cmSet[v.ConfigMap.Name] = true
 		}
-		if v.PersistentVolumeClaim != nil {
-			pvcSet[v.PersistentVolumeClaim.ClaimName] = true
-		}
 	}
 
 	for _, ips := range pod.Spec.ImagePullSecrets {
@@ -103,9 +105,6 @@ func discoverReferences(pod *corev1.Pod) (secrets, configmaps, pvcs []string) {
 	}
 	for name := range cmSet {
 		configmaps = append(configmaps, name)
-	}
-	for name := range pvcSet {
-		pvcs = append(pvcs, name)
 	}
 	return
 }
@@ -242,44 +241,93 @@ func (s *ResourceSyncer) syncServiceAccount(ctx context.Context, sourceNS, podNa
 	return nil
 }
 
-func (s *ResourceSyncer) syncPVC(ctx context.Context, sourceNS, podName, name string) error {
-	pvc, err := s.tenantClient.CoreV1().PersistentVolumeClaims(sourceNS).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			klog.Warningf("PVC %s/%s not found on tenant, skipping", sourceNS, name)
-			return nil
+func (s *ResourceSyncer) ValidateAndSyncPVCs(ctx context.Context, pod *corev1.Pod) (map[string]string, error) {
+	pvcMap := make(map[string]string)
+
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim == nil {
+			continue
 		}
+		claimName := v.PersistentVolumeClaim.ClaimName
+
+		pvc, err := s.tenantClient.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(ctx, claimName, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("get PVC %s/%s: %w", pod.Namespace, claimName, err)
+		}
+
+		scName := ""
+		if pvc.Spec.StorageClassName != nil {
+			scName = *pvc.Spec.StorageClassName
+		}
+		if scName != catapultStorageClass {
+			return nil, fmt.Errorf(
+				"PVC %s/%s uses storageClass %q, not %q — Catapult only syncs catapult-class PVCs",
+				pod.Namespace, claimName, scName, catapultStorageClass,
+			)
+		}
+
+		remoteSC := s.defaultRemoteStorageClass
+		if ann := pvc.Annotations[catapultRemoteSCAnnotation]; ann != "" {
+			remoteSC = ann
+		}
+
+		if err := s.syncCatapultPVC(ctx, pod.Namespace, claimName, pvc, remoteSC); err != nil {
+			return nil, fmt.Errorf("sync catapult PVC %s/%s: %w", pod.Namespace, claimName, err)
+		}
+
+		pvcMap[claimName] = executionPVCName(pod.Namespace, claimName)
+	}
+
+	return pvcMap, nil
+}
+
+func (s *ResourceSyncer) syncCatapultPVC(ctx context.Context, sourceNS, pvcName string, sourcePVC *corev1.PersistentVolumeClaim, remoteStorageClass string) error {
+	execName := executionPVCName(sourceNS, pvcName)
+
+	_, err := s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).Get(ctx, execName, metav1.GetOptions{})
+	if err == nil {
+		klog.Infof("Execution PVC %s already exists in %s, skipping", execName, s.workerNamespace)
+		return nil
+	}
+	if !errors.IsNotFound(err) {
 		return err
 	}
 
 	workerPVC := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
+			Name:      execName,
 			Namespace: s.workerNamespace,
 			Labels: map[string]string{
 				labelManagedBy:       labelManagedByValue,
 				labelSourceNamespace: sourceNS,
-				labelSourcePod:       podName,
+				labelSourcePVC:       pvcName,
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: pvc.Spec.AccessModes,
-			Resources:   pvc.Spec.Resources,
+			AccessModes:      sourcePVC.Spec.AccessModes,
+			Resources:        sourcePVC.Spec.Resources,
+			StorageClassName: &remoteStorageClass,
 		},
 	}
 
-	_, err = s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).Get(ctx, name, metav1.GetOptions{})
-	if err == nil {
-		klog.Infof("PVC %s already exists in %s, skipping", name, s.workerNamespace)
-		return nil
-	} else if errors.IsNotFound(err) {
-		_, err = s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).Create(ctx, workerPVC, metav1.CreateOptions{})
-	}
-
+	_, err = s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).Create(ctx, workerPVC, metav1.CreateOptions{})
 	if err != nil {
 		return err
 	}
-	klog.Infof("Synced PVC %s -> %s/%s", name, s.workerNamespace, name)
+	klog.Infof("Created execution PVC %s/%s (storageClass=%s) for control PVC %s/%s",
+		s.workerNamespace, execName, remoteStorageClass, sourceNS, pvcName)
+	return nil
+}
+
+func (s *ResourceSyncer) CleanupExecutionPVC(ctx context.Context, sourceNS, pvcName string) error {
+	execName := executionPVCName(sourceNS, pvcName)
+	err := s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).Delete(ctx, execName, metav1.DeleteOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("delete execution PVC %s/%s: %w", s.workerNamespace, execName, err)
+	}
+	if err == nil {
+		klog.Infof("Deleted execution PVC %s/%s (control PVC %s/%s deleted)", s.workerNamespace, execName, sourceNS, pvcName)
+	}
 	return nil
 }
 
@@ -319,17 +367,6 @@ func (s *ResourceSyncer) CleanupResources(ctx context.Context, sourceNS, podName
 		for _, sa := range sas.Items {
 			if err := s.workerClient.CoreV1().ServiceAccounts(s.workerNamespace).Delete(ctx, sa.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
 				klog.Errorf("Failed to delete synced serviceaccount %s: %v", sa.Name, err)
-			}
-		}
-	}
-
-	pvcs, err := s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).List(ctx, metav1.ListOptions{
-		LabelSelector: labelSelector,
-	})
-	if err == nil {
-		for _, pvc := range pvcs.Items {
-			if err := s.workerClient.CoreV1().PersistentVolumeClaims(s.workerNamespace).Delete(ctx, pvc.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
-				klog.Errorf("Failed to delete synced PVC %s: %v", pvc.Name, err)
 			}
 		}
 	}

@@ -17,11 +17,12 @@ func main() {
 	klog.InitFlags(nil)
 
 	var (
-		nodeName         string
-		workerKubeconfig string
-		workerNamespace  string
-		gpuCount         int
-		tenantKubeconfig string
+		nodeName                  string
+		workerKubeconfig          string
+		workerNamespace           string
+		gpuCount                  int
+		tenantKubeconfig          string
+		defaultRemoteStorageClass string
 	)
 
 	flag.StringVar(&nodeName, "nodename", "gpu-worker", "Name of the virtual node")
@@ -29,6 +30,8 @@ func main() {
 	flag.StringVar(&workerNamespace, "worker-namespace", "vk-workloads", "Namespace on worker for pods")
 	flag.IntVar(&gpuCount, "gpu-count", 1, "Number of GPUs to advertise")
 	flag.StringVar(&tenantKubeconfig, "kubeconfig", "", "Path to tenant cluster kubeconfig (empty = in-cluster)")
+	flag.StringVar(&defaultRemoteStorageClass, "default-remote-storage-class", "lvms-vg1",
+		"Default StorageClass for execution PVCs on the GPU cluster")
 	flag.Parse()
 
 	if workerKubeconfig == "" {
@@ -49,11 +52,12 @@ func main() {
 	}
 
 	provider := NewGPUProvider(GPUProviderConfig{
-		NodeName:        nodeName,
-		WorkerNamespace: workerNamespace,
-		GPUCount:        gpuCount,
-		TenantClient:    tenantClient,
-		WorkerClient:    workerClient,
+		NodeName:                  nodeName,
+		WorkerNamespace:           workerNamespace,
+		GPUCount:                  gpuCount,
+		DefaultRemoteStorageClass: defaultRemoteStorageClass,
+		TenantClient:              tenantClient,
+		WorkerClient:              workerClient,
 	})
 
 	if err := provider.Run(ctx); err != nil {

@@ -30,11 +30,12 @@ const (
 )
 
 type GPUProviderConfig struct {
-	NodeName        string
-	WorkerNamespace string
-	GPUCount        int
-	TenantClient    kubernetes.Interface
-	WorkerClient    kubernetes.Interface
+	NodeName                  string
+	WorkerNamespace           string
+	GPUCount                  int
+	DefaultRemoteStorageClass string
+	TenantClient              kubernetes.Interface
+	WorkerClient              kubernetes.Interface
 }
 
 type GPUProvider struct {
@@ -48,7 +49,7 @@ type GPUProvider struct {
 func NewGPUProvider(cfg GPUProviderConfig) *GPUProvider {
 	return &GPUProvider{
 		cfg:         cfg,
-		syncer:      NewResourceSyncer(cfg.TenantClient, cfg.WorkerClient, cfg.WorkerNamespace),
+		syncer:      NewResourceSyncer(cfg.TenantClient, cfg.WorkerClient, cfg.WorkerNamespace, cfg.DefaultRemoteStorageClass),
 		managedPods: make(map[string]string),
 	}
 }
@@ -97,6 +98,20 @@ func (p *GPUProvider) Run(ctx context.Context) error {
 			DeleteFunc: func(obj interface{}) { p.onTenantPodDelete(ctx, obj) },
 		},
 	)
+
+	pvcLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.TenantClient.CoreV1().RESTClient(),
+		"persistentvolumeclaims",
+		metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {},
+	)
+	_, pvcInformer := cache.NewInformer(pvcLW, &corev1.PersistentVolumeClaim{}, 5*time.Minute,
+		cache.ResourceEventHandlerFuncs{
+			DeleteFunc: func(obj interface{}) { p.onControlPVCDelete(ctx, obj) },
+		},
+	)
+	go pvcInformer.Run(ctx.Done())
+	klog.Info("Control PVC deletion informer started")
 
 	klog.Info("Starting tenant pod informer")
 	tenantInformer.Run(ctx.Done())
@@ -308,6 +323,30 @@ func (p *GPUProvider) onTenantPodDelete(ctx context.Context, obj interface{}) {
 	p.handleTenantPodDeleted(ctx, pod)
 }
 
+func (p *GPUProvider) onControlPVCDelete(ctx context.Context, obj interface{}) {
+	pvc, ok := obj.(*corev1.PersistentVolumeClaim)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		pvc, ok = tombstone.Obj.(*corev1.PersistentVolumeClaim)
+		if !ok {
+			return
+		}
+	}
+
+	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != catapultStorageClass {
+		return
+	}
+
+	klog.Infof("Control PVC deleted: %s/%s (storageClass=%s), cleaning up execution PVC",
+		pvc.Namespace, pvc.Name, catapultStorageClass)
+	if err := p.syncer.CleanupExecutionPVC(ctx, pvc.Namespace, pvc.Name); err != nil {
+		klog.Errorf("Failed to cleanup execution PVC for %s/%s: %v", pvc.Namespace, pvc.Name, err)
+	}
+}
+
 func (p *GPUProvider) handleWorkerPodEvent(ctx context.Context, obj interface{}) {
 	workerPod, ok := obj.(*corev1.Pod)
 	if !ok {
@@ -359,13 +398,20 @@ func (p *GPUProvider) handleTenantPod(ctx context.Context, pod *corev1.Pod) {
 
 	klog.Infof("New pod assigned to virtual node: %s", key)
 
+	pvcMap, err := p.syncer.ValidateAndSyncPVCs(ctx, pod)
+	if err != nil {
+		klog.Errorf("PVC validation failed for %s: %v", key, err)
+		p.setPodStatus(ctx, pod, corev1.PodFailed, "InvalidPVCStorageClass", err.Error())
+		return
+	}
+
 	if err := p.syncer.SyncResources(ctx, pod); err != nil {
 		klog.Errorf("Failed to sync resources for %s: %v", key, err)
 		p.setPodStatus(ctx, pod, corev1.PodFailed, "ResourceSyncFailed", err.Error())
 		return
 	}
 
-	workerPod := p.transformPod(pod)
+	workerPod := p.transformPod(pod, pvcMap)
 	created, err := p.cfg.WorkerClient.CoreV1().Pods(p.cfg.WorkerNamespace).Create(ctx, workerPod, metav1.CreateOptions{})
 	if err != nil {
 		if errors.IsAlreadyExists(err) {
@@ -451,7 +497,7 @@ func hasAnyPrefix(s string, prefixes []string) bool {
 	return false
 }
 
-func (p *GPUProvider) transformPod(pod *corev1.Pod) *corev1.Pod {
+func (p *GPUProvider) transformPod(pod *corev1.Pod, pvcNameMap map[string]string) *corev1.Pod {
 	workerPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      workerPodName(pod.Namespace, pod.Name),
@@ -497,6 +543,14 @@ func (p *GPUProvider) transformPod(pod *corev1.Pod) *corev1.Pod {
 	}
 
 	workerPod.Spec.Volumes = filterVolumes(workerPod.Spec.Volumes)
+
+	for i, v := range workerPod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil {
+			if execName, ok := pvcNameMap[v.PersistentVolumeClaim.ClaimName]; ok {
+				workerPod.Spec.Volumes[i].PersistentVolumeClaim.ClaimName = execName
+			}
+		}
+	}
 
 	for i := range workerPod.Spec.Containers {
 		workerPod.Spec.Containers[i].VolumeMounts = filterVolumeMounts(

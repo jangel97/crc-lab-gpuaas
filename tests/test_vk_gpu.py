@@ -25,7 +25,7 @@ import time
 import pytest
 from kubernetes import client
 
-from conftest import worker_pod_name
+from conftest import worker_pod_name, execution_pvc_name, CATAPULT_STORAGE_CLASS
 
 
 VK_NODE_NAME = "gpu-worker"
@@ -482,46 +482,47 @@ def test_pod_deletion_cleans_up(
 
 
 @pytest.mark.vk
-def test_pvc_sync(
+def test_catapult_pvc_sync(
     tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
-    Create a PVC on tenant, submit a pod that mounts it.
-    Verify VK syncs the PVC to worker with management labels.
-    Verify cleanup removes the PVC from worker.
+    Create a PVC with storageClass=catapult on tenant, submit a pod that
+    mounts it. Verify Catapult creates a namespace-prefixed execution PVC
+    on the worker with management labels. Verify execution PVC survives
+    pod deletion but is cleaned up when the control PVC is deleted.
     """
     tenant_core, _ = tenant_clients
     worker_core, _ = worker_clients
     ns = test_namespace
 
     pvc_name = "vk-test-pvc"
+    exec_pvc = execution_pvc_name(ns, pvc_name)
     pod_name = "vk-pvc-sync-test"
     w_pod_name = worker_pod_name(ns, pod_name)
 
     # Cleanup from previous runs
     force_delete_pod(tenant_core, pod_name, ns)
     force_delete_pod(worker_core, w_pod_name, vk_worker_namespace)
-    try:
-        tenant_core.delete_namespaced_persistent_volume_claim(
-            name=pvc_name, namespace=ns
-        )
-    except client.exceptions.ApiException:
-        pass
-    try:
-        worker_core.delete_namespaced_persistent_volume_claim(
-            name=pvc_name, namespace=vk_worker_namespace
-        )
-    except client.exceptions.ApiException:
-        pass
+    for name, target_ns, core in [
+        (pvc_name, ns, tenant_core),
+        (exec_pvc, vk_worker_namespace, worker_core),
+    ]:
+        try:
+            core.delete_namespaced_persistent_volume_claim(
+                name=name, namespace=target_ns
+            )
+        except client.exceptions.ApiException:
+            pass
     time.sleep(3)
 
-    # Create PVC on tenant
+    # Create catapult PVC on tenant
     tenant_core.create_namespaced_persistent_volume_claim(
         namespace=ns,
         body=client.V1PersistentVolumeClaim(
             metadata=client.V1ObjectMeta(name=pvc_name, namespace=ns),
             spec=client.V1PersistentVolumeClaimSpec(
                 access_modes=["ReadWriteOnce"],
+                storage_class_name=CATAPULT_STORAGE_CLASS,
                 resources=client.V1VolumeResourceRequirements(
                     requests={"storage": "1Gi"},
                 ),
@@ -566,17 +567,16 @@ def test_pvc_sync(
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod)
 
-    # Wait for PVC to appear on worker with management labels
+    # Wait for execution PVC to appear on worker (namespace-prefixed name)
     deadline = time.time() + 30
     pvc_synced = False
     while time.time() < deadline:
         try:
             wpvc = worker_core.read_namespaced_persistent_volume_claim(
-                name=pvc_name, namespace=vk_worker_namespace
+                name=exec_pvc, namespace=vk_worker_namespace
             )
-            if wpvc.metadata.labels and wpvc.metadata.labels.get(
-                "app.kubernetes.io/managed-by"
-            ) == "vk-gpu-provider":
+            labels = wpvc.metadata.labels or {}
+            if labels.get("app.kubernetes.io/managed-by") == "vk-gpu-provider":
                 pvc_synced = True
                 break
         except client.exceptions.ApiException:
@@ -584,27 +584,42 @@ def test_pvc_sync(
         time.sleep(3)
 
     assert pvc_synced, (
-        f"PVC {pvc_name} not synced to worker namespace {vk_worker_namespace}"
+        f"Execution PVC {exec_pvc} not created in {vk_worker_namespace}"
     )
 
-    # Verify PVC spec matches
+    # Verify execution PVC spec
     wpvc = worker_core.read_namespaced_persistent_volume_claim(
-        name=pvc_name, namespace=vk_worker_namespace
+        name=exec_pvc, namespace=vk_worker_namespace
     )
-    assert "ReadWriteOnce" in wpvc.spec.access_modes, (
-        f"Worker PVC access modes mismatch: {wpvc.spec.access_modes}"
-    )
+    assert "ReadWriteOnce" in wpvc.spec.access_modes
+    assert wpvc.metadata.labels.get("vk.gpuaas.io/source-pvc") == pvc_name
+    assert wpvc.metadata.labels.get("vk.gpuaas.io/source-namespace") == ns
 
-    # Delete tenant pod — should trigger cleanup
+    # Delete tenant pod — execution PVC must survive
     force_delete_pod(tenant_core, pod_name, ns)
+    time.sleep(5)
 
-    # Wait for PVC to be cleaned up on worker
+    try:
+        worker_core.read_namespaced_persistent_volume_claim(
+            name=exec_pvc, namespace=vk_worker_namespace
+        )
+    except client.exceptions.ApiException:
+        pytest.fail(
+            f"Execution PVC {exec_pvc} was deleted with the pod — "
+            "PVC lifecycle must be independent of pod lifecycle"
+        )
+
+    # Delete control PVC — should trigger execution PVC cleanup
+    tenant_core.delete_namespaced_persistent_volume_claim(
+        name=pvc_name, namespace=ns
+    )
+
     deadline = time.time() + 30
     pvc_gone = False
     while time.time() < deadline:
         try:
             worker_core.read_namespaced_persistent_volume_claim(
-                name=pvc_name, namespace=vk_worker_namespace
+                name=exec_pvc, namespace=vk_worker_namespace
             )
         except client.exceptions.ApiException as e:
             if e.status == 404:
@@ -613,10 +628,131 @@ def test_pvc_sync(
         time.sleep(3)
 
     assert pvc_gone, (
-        f"Synced PVC {pvc_name} not cleaned up on worker after pod deletion"
+        f"Execution PVC {exec_pvc} not cleaned up after control PVC deletion"
     )
 
-    # Cleanup tenant PVC
+
+@pytest.mark.vk
+def test_non_catapult_pvc_rejected(
+    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+):
+    """
+    Submit a pod referencing a PVC without storageClass=catapult.
+    Verify the pod is rejected with a clear error, and no execution
+    PVC is created on the worker.
+    """
+    tenant_core, _ = tenant_clients
+    worker_core, _ = worker_clients
+    ns = test_namespace
+
+    pvc_name = "vk-non-catapult-pvc"
+    pod_name = "vk-non-catapult-test"
+    exec_pvc = execution_pvc_name(ns, pvc_name)
+    w_pod_name = worker_pod_name(ns, pod_name)
+
+    # Cleanup from previous runs
+    force_delete_pod(tenant_core, pod_name, ns)
+    force_delete_pod(worker_core, w_pod_name, vk_worker_namespace)
+    for name, target_ns, core in [
+        (pvc_name, ns, tenant_core),
+        (exec_pvc, vk_worker_namespace, worker_core),
+    ]:
+        try:
+            core.delete_namespaced_persistent_volume_claim(
+                name=name, namespace=target_ns
+            )
+        except client.exceptions.ApiException:
+            pass
+    time.sleep(3)
+
+    # Create PVC without catapult storageClass (uses cluster default)
+    tenant_core.create_namespaced_persistent_volume_claim(
+        namespace=ns,
+        body=client.V1PersistentVolumeClaim(
+            metadata=client.V1ObjectMeta(name=pvc_name, namespace=ns),
+            spec=client.V1PersistentVolumeClaimSpec(
+                access_modes=["ReadWriteOnce"],
+                resources=client.V1VolumeResourceRequirements(
+                    requests={"storage": "1Gi"},
+                ),
+            ),
+        ),
+    )
+
+    # Create pod that mounts the non-catapult PVC
+    pod = client.V1Pod(
+        metadata=client.V1ObjectMeta(name=pod_name, namespace=ns),
+        spec=client.V1PodSpec(
+            node_name=VK_NODE_NAME,
+            restart_policy="Never",
+            tolerations=[
+                client.V1Toleration(
+                    key="virtual-kubelet.io/provider",
+                    operator="Exists",
+                ),
+            ],
+            containers=[
+                client.V1Container(
+                    name="test",
+                    image="registry.access.redhat.com/ubi9-micro:latest",
+                    command=["echo", "should-not-run"],
+                    volume_mounts=[
+                        client.V1VolumeMount(
+                            name="data",
+                            mount_path="/data",
+                        )
+                    ],
+                )
+            ],
+            volumes=[
+                client.V1Volume(
+                    name="data",
+                    persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                        claim_name=pvc_name,
+                    ),
+                )
+            ],
+        ),
+    )
+    tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+
+    # Wait for pod to be marked Failed with InvalidPVCStorageClass
+    deadline = time.time() + 30
+    pod_failed = False
+    reason = ""
+    while time.time() < deadline:
+        tp = tenant_core.read_namespaced_pod(name=pod_name, namespace=ns)
+        if tp.status.phase == "Failed":
+            reason = tp.status.reason or ""
+            pod_failed = True
+            break
+        time.sleep(3)
+
+    assert pod_failed, (
+        f"Pod {pod_name} was not rejected — expected Failed phase"
+    )
+    assert "InvalidPVCStorageClass" in reason, (
+        f"Pod rejection reason should be InvalidPVCStorageClass, got: {reason!r}"
+    )
+
+    # Verify no execution PVC was created on worker
+    try:
+        worker_core.read_namespaced_persistent_volume_claim(
+            name=exec_pvc, namespace=vk_worker_namespace
+        )
+        pytest.fail(
+            f"Execution PVC {exec_pvc} should not exist for non-catapult PVC"
+        )
+    except client.exceptions.ApiException as e:
+        assert e.status == 404
+
+    # Cleanup
+    try:
+        tenant_core.delete_namespaced_pod(
+            name=pod_name, namespace=ns, grace_period_seconds=0
+        )
+    except client.exceptions.ApiException:
+        pass
     try:
         tenant_core.delete_namespaced_persistent_volume_claim(
             name=pvc_name, namespace=ns
