@@ -641,7 +641,9 @@ func (p *GPUProvider) syncStatusToTenant(ctx context.Context, workerPod *corev1.
 		return
 	}
 
-	if tenantPod.Status.Phase == workerPod.Status.Phase && !containerStatusChanged(tenantPod, workerPod) {
+	if tenantPod.Status.Phase == workerPod.Status.Phase &&
+		tenantPod.Status.PodIP == workerPod.Status.PodIP &&
+		!containerStatusChanged(tenantPod, workerPod) {
 		return
 	}
 
@@ -653,6 +655,8 @@ func (p *GPUProvider) syncStatusToTenant(ctx context.Context, workerPod *corev1.
 	tenantPod.Status.ContainerStatuses = workerPod.Status.ContainerStatuses
 	tenantPod.Status.InitContainerStatuses = workerPod.Status.InitContainerStatuses
 	tenantPod.Status.StartTime = workerPod.Status.StartTime
+	tenantPod.Status.PodIP = workerPod.Status.PodIP
+	tenantPod.Status.PodIPs = workerPod.Status.PodIPs
 
 	_, err = p.cfg.TenantClient.CoreV1().Pods(sourceNS).UpdateStatus(ctx, tenantPod, metav1.UpdateOptions{})
 	if err != nil {

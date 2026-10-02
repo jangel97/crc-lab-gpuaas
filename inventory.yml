@@ -15,6 +15,8 @@ all:
     openshift_install_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ ocp_version }}/openshift-install-linux.tar.gz"
     oc_client_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ ocp_version }}/openshift-client-linux.tar.gz"
 
+    submariner_version: "0.24"
+
     gaming_pc_host: "192.168.1.139"
 
     vk_image: "quay.io/jmorenas/gpuaas-virtual-kubelet:latest"

@@ -54,6 +54,7 @@ ansible-playbook -i inventory.yml playbooks/01-create-vms.yml
 ansible-playbook -i inventory.yml playbooks/02-wait-and-discover.yml
 ansible-playbook -i inventory.yml playbooks/03-configure-clusters.yml
 ansible-playbook -i inventory.yml playbooks/04-setup-virtual-kubelet.yml
+ansible-playbook -i inventory.yml playbooks/05-setup-submariner.yml
 ```
 
 After provisioning, kubeconfigs are at `~/.kube/tenant` and `~/.kube/worker`.
@@ -66,6 +67,7 @@ After provisioning, kubeconfigs are at `~/.kube/tenant` and `~/.kube/worker`.
 | `02-wait-and-discover.yml` | Waits for install to complete, discovers API endpoints |
 | `03-configure-clusters.yml` | Installs GPU Operator, Kueue, LVMS on worker; RHOAI on tenant |
 | `04-setup-virtual-kubelet.yml` | Builds VK image, sets up worker namespace/RBAC/Kueue queues, deploys VK on tenant |
+| `05-setup-submariner.yml` | Installs subctl, deploys Submariner broker on GPU cluster, joins both clusters, verifies cross-cluster connectivity |
 | `teardown.yml` | Destroys VMs and cleans up |
 
 ## Resource Sync
@@ -133,16 +135,19 @@ The VK preserves RHOAI training operator labels (`training.kubeflow.org/*`) so
 the operator can track pod status. Worker pod names are namespace-prefixed
 (`{namespace}--{name}`) to avoid collisions across tenant namespaces.
 
-### Known Gaps
+### Cross-Cluster Networking (Submariner)
 
-| Workload | Gap | Impact |
-|----------|-----|--------|
-| Notebooks | Pod on worker, route on tenant points nowhere | No browser access |
-| KServe | Inference endpoint unreachable from tenant | No model serving |
-| Distributed training | Headless services on tenant, pods on worker | DNS fails for multi-node |
+Submariner v0.24 provides L3 connectivity between clusters. The VK syncs
+worker PodIPs into tenant virtual pod status, making regular Services and
+Routes work transparently. See [docs/submariner-architecture.md](docs/submariner-architecture.md).
 
-These require cross-cluster networking (Submariner or similar) and are out of
-scope for this spike.
+| Workload | Status | Notes |
+|----------|--------|-------|
+| Batch (PyTorchJob, nvidia-smi) | Working | No cross-cluster networking needed |
+| Notebooks | Ready to validate | Route → Service → EndpointSlice → Submariner tunnel → worker pod |
+| KServe (raw Deployment) | Ready to validate | Same path as Notebooks |
+| KServe (Knative-managed) | Not validated | Autoscaler, activator, queue-proxy need investigation |
+| Distributed training | Not validated | Headless Service sync to worker cluster may be needed |
 
 ## Tests
 
