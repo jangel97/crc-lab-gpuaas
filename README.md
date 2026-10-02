@@ -165,21 +165,25 @@ python -m pytest tests/ -v -m vk
 
 # Run only RHOAI tests
 python -m pytest tests/ -v -m rhoai
+
+# Run only networking tests (Submariner)
+python -m pytest tests/ -v -m networking
 ```
 
 ### Test Results (2026-10-02)
 
-All 8 tests pass. Runtime: ~40 seconds.
+All 9 tests pass.
 
 ```
-tests/test_rhoai_vk.py::test_pytorchjob_via_vk            PASSED
-tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker      PASSED
-tests/test_vk_gpu.py::test_virtual_node_exists             PASSED
-tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk       PASSED
-tests/test_vk_gpu.py::test_resource_sync                   PASSED
-tests/test_vk_gpu.py::test_pod_deletion_cleans_up          PASSED
-tests/test_vk_gpu.py::test_catapult_pvc_sync               PASSED
-tests/test_vk_gpu.py::test_non_catapult_pvc_rejected       PASSED
+tests/test_vk_gpu.py::test_virtual_node_exists                          PASSED
+tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk                    PASSED
+tests/test_vk_gpu.py::test_resource_sync                                PASSED
+tests/test_vk_gpu.py::test_pod_deletion_cleans_up                       PASSED
+tests/test_vk_gpu.py::test_catapult_pvc_sync                            PASSED
+tests/test_vk_gpu.py::test_non_catapult_pvc_rejected                    PASSED
+tests/test_rhoai_vk.py::test_pytorchjob_via_vk                         PASSED
+tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker                   PASSED
+tests/test_submariner_networking.py::test_gpu_service_via_submariner    PASSED
 ```
 
 ### Test Descriptions
@@ -194,6 +198,7 @@ tests/test_vk_gpu.py::test_non_catapult_pvc_rejected       PASSED
 | `test_non_catapult_pvc_rejected` | vk | Pod referencing non-catapult PVC → rejected with `InvalidPVCStorageClass` → no execution PVC created |
 | `test_pytorchjob_via_vk` | rhoai | PyTorchJob CR on tenant → training operator creates master pod → VK dispatches to worker GPU → nvidia-smi succeeds → status synced → PyTorchJob condition Succeeded |
 | `test_no_rhoai_crds_on_worker` | rhoai | Worker cluster has no RHOAI CRDs (pytorchjobs, notebooks, inferenceservices, rayclusters) — confirms it stays a bare GPU node |
+| `test_gpu_service_via_submariner` | networking | GPU HTTP server dispatched to worker → Service on tenant → PodIP synced → EndpointSlice created → curl through Service via Submariner tunnel → HTTP 200 with RTX 5090 GPU info |
 
 ### What the Tests Prove
 
@@ -206,6 +211,12 @@ tests/test_vk_gpu.py::test_non_catapult_pvc_rejected       PASSED
    the operator sees the job as Succeeded. No RHOAI modifications needed.
 4. **Worker stays bare**: no RHOAI CRDs or operator workloads on the GPU
    cluster. It only runs GPU Operator + Kueue for quota management.
+5. **Cross-cluster networking works**: regular Services and Routes reach remote
+   GPU pods via Submariner tunnel. VK syncs PodIP, Kubernetes creates
+   EndpointSlices, Submariner provides L3 routing. No Submariner-specific code.
+
+For the full spike assessment with all scenarios, results, and gaps, see
+[docs/spike-assessment.md](docs/spike-assessment.md).
 
 ## Teardown
 

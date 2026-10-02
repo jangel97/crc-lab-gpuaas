@@ -919,7 +919,116 @@ Tenant pod:  10.132.0.144  (synced from worker pod via Catapult)
 Worker pod:  10.132.0.144  (real pod IP on sno-worker)
 ```
 
-### 15.4 Known Issues
+### 15.4 GPU Inference Service Test (2026-10-02)
+
+End-to-end validation that a GPU workload on the worker is accessible via
+Service and Route on the tenant through Submariner.
+
+**What was deployed:**
+
+A CUDA container running a Python HTTP server that calls `nvidia-smi` on
+each request and returns GPU info as JSON. Dispatched via VK to the worker
+GPU, accessed from the tenant via Service and Route.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-inference-svc
+  namespace: vk-test
+  labels:
+    app: gpu-inference
+spec:
+  nodeName: gpu-worker
+  tolerations:
+  - key: virtual-kubelet.io/provider
+    operator: Exists
+  containers:
+  - name: server
+    image: nvcr.io/nvidia/cuda:12.8.1-base-ubi9
+    command:
+    - python3
+    - -c
+    - |
+      import http.server, subprocess, json
+      class H(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              r = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total,utilization.gpu,temperature.gpu', '--format=csv,noheader,nounits'], capture_output=True, text=True)
+              body = json.dumps({'gpu': r.stdout.strip(), 'status': 'ok'})
+              self.send_response(200)
+              self.send_header('Content-Type', 'application/json')
+              self.end_headers()
+              self.wfile.write(body.encode())
+          def log_message(self, *a): pass
+      http.server.HTTPServer(('', 8080), H).serve_forever()
+    ports:
+    - containerPort: 8080
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-inference
+  namespace: vk-test
+spec:
+  selector:
+    app: gpu-inference
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+Then expose via Route: `oc expose svc gpu-inference -n vk-test`
+
+**Results:**
+
+```
+# PodIP synced from worker to tenant
+Tenant pod:  10.132.0.148  (PodIP synced by Catapult)
+Worker pod:  10.132.0.148  (real pod on sno-worker)
+
+# EndpointSlice created automatically by endpoint controller
+EndpointSlice: gpu-inference-xjwx5 → 10.132.0.148:8080 (ready: true)
+
+# Service test (from inside cluster)
+$ oc run curl-test --rm -i --restart=Never --image=curlimages/curl -- \
+    curl -s http://gpu-inference.vk-test.svc.cluster.local
+{"gpu": "NVIDIA GeForce RTX 5090, 32607, 0, 40", "status": "ok"}
+
+# Route test (from gaming PC)
+$ curl --resolve gpu-inference-vk-test.apps.tenant.local.lab:80:192.168.122.10 \
+    http://gpu-inference-vk-test.apps.tenant.local.lab
+{"gpu": "NVIDIA GeForce RTX 5090, 32607, 0, 40", "status": "ok"}
+```
+
+**Traffic flow:**
+```
+curl → Service (tenant) → EndpointSlice (10.132.0.148)
+  → Submariner route agent → IPsec tunnel (UDP 4500)
+  → worker gateway → OVN → GPU pod
+  → nvidia-smi on RTX 5090
+  → JSON response back through tunnel
+```
+
+**What this proves:**
+1. GPU inference pod dispatched via VK runs on real GPU
+2. PodIP synced back to tenant virtual pod
+3. Kubernetes endpoint controller creates EndpointSlice with worker PodIP
+4. Service ClusterIP routes through Submariner tunnel transparently
+5. OpenShift Route (HAProxy) reaches remote GPU pod via tunnel
+6. No Submariner-specific code in the pod, Service, or Route
+
+**Cleanup:**
+
+```bash
+oc delete route gpu-inference -n vk-test
+oc delete svc gpu-inference -n vk-test
+oc delete pod gpu-inference-svc -n vk-test
+```
+
+### 15.5 Known Issues
 
 | Issue | Impact | Workaround |
 |-------|--------|------------|

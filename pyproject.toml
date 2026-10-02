@@ -15,4 +15,5 @@ filterwarnings = [
 markers = [
     "vk: Virtual Kubelet cross-cluster GPU dispatch tests",
     "rhoai: RHOAI workload dispatch via Virtual Kubelet",
+    "networking: Cross-cluster networking via Submariner (Service/Route to remote GPU pod)",
 ]
