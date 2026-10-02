@@ -13,8 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 )
 
@@ -60,9 +60,47 @@ func (p *GPUProvider) Run(ctx context.Context) error {
 	klog.Infof("Virtual node %q registered", p.cfg.NodeName)
 
 	go p.heartbeatLoop(ctx)
-	go p.watchWorkerPods(ctx)
 
-	return p.watchTenantPods(ctx)
+	workerLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.WorkerClient.CoreV1().RESTClient(),
+		"pods",
+		p.cfg.WorkerNamespace,
+		func(options *metav1.ListOptions) {
+			options.LabelSelector = labelManagedBy + "=" + labelManagedByValue
+		},
+	)
+	_, workerInformer := cache.NewInformer(workerLW, &corev1.Pod{}, 30*time.Second,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) { p.handleWorkerPodEvent(ctx, obj) },
+			UpdateFunc: func(_, obj interface{}) { p.handleWorkerPodEvent(ctx, obj) },
+		},
+	)
+
+	go workerInformer.Run(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), workerInformer.HasSynced) {
+		return fmt.Errorf("worker informer cache sync failed")
+	}
+	klog.Info("Worker pod informer synced, managedPods rebuilt from existing worker pods")
+
+	tenantLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.TenantClient.CoreV1().RESTClient(),
+		"pods",
+		metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", p.cfg.NodeName).String()
+		},
+	)
+	_, tenantInformer := cache.NewInformer(tenantLW, &corev1.Pod{}, 30*time.Second,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) { p.onTenantPodEvent(ctx, obj) },
+			UpdateFunc: func(_, obj interface{}) { p.onTenantPodEvent(ctx, obj) },
+			DeleteFunc: func(obj interface{}) { p.onTenantPodDelete(ctx, obj) },
+		},
+	)
+
+	klog.Info("Starting tenant pod informer")
+	tenantInformer.Run(ctx.Done())
+	return ctx.Err()
 }
 
 func (p *GPUProvider) registerNode(ctx context.Context) error {
@@ -247,42 +285,50 @@ func (p *GPUProvider) renewLease(ctx context.Context, name, ns string) {
 	}
 }
 
-func (p *GPUProvider) watchTenantPods(ctx context.Context) error {
-	fieldSelector := fields.OneTermEqualSelector("spec.nodeName", p.cfg.NodeName).String()
-
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		watcher, err := p.cfg.TenantClient.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{
-			FieldSelector: fieldSelector,
-		})
-		if err != nil {
-			klog.Errorf("Failed to watch tenant pods: %v", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		klog.Info("Watching tenant pods assigned to virtual node")
-
-		for event := range watcher.ResultChan() {
-			pod, ok := event.Object.(*corev1.Pod)
-			if !ok {
-				continue
-			}
-
-			switch event.Type {
-			case watch.Added, watch.Modified:
-				p.handleTenantPod(ctx, pod)
-			case watch.Deleted:
-				p.handleTenantPodDeleted(ctx, pod)
-			}
-		}
-
-		klog.Warning("Tenant pod watch ended, restarting...")
-		time.Sleep(2 * time.Second)
+func (p *GPUProvider) onTenantPodEvent(ctx context.Context, obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return
 	}
+	p.handleTenantPod(ctx, pod)
+}
+
+func (p *GPUProvider) onTenantPodDelete(ctx context.Context, obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		pod, ok = tombstone.Obj.(*corev1.Pod)
+		if !ok {
+			return
+		}
+	}
+	p.handleTenantPodDeleted(ctx, pod)
+}
+
+func (p *GPUProvider) handleWorkerPodEvent(ctx context.Context, obj interface{}) {
+	workerPod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+
+	sourceNS := workerPod.Labels[labelSourceNamespace]
+	sourceName := workerPod.Labels[labelSourceName]
+	if sourceNS == "" || sourceName == "" {
+		return
+	}
+
+	key := sourceNS + "/" + sourceName
+	p.mu.Lock()
+	if _, exists := p.managedPods[key]; !exists {
+		p.managedPods[key] = workerPod.Name
+		klog.Infof("Recovered managed pod mapping: %s -> %s", key, workerPod.Name)
+	}
+	p.mu.Unlock()
+
+	p.syncStatusToTenant(ctx, workerPod)
 }
 
 func (p *GPUProvider) handleTenantPod(ctx context.Context, pod *corev1.Pod) {
@@ -523,41 +569,6 @@ func (p *GPUProvider) setPodStatus(ctx context.Context, pod *corev1.Pod, phase c
 	_, err := p.cfg.TenantClient.CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, pod, metav1.UpdateOptions{})
 	if err != nil {
 		klog.Errorf("Failed to update tenant pod status %s/%s: %v", pod.Namespace, pod.Name, err)
-	}
-}
-
-func (p *GPUProvider) watchWorkerPods(ctx context.Context) {
-	labelSelector := labelManagedBy + "=" + labelManagedByValue
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		watcher, err := p.cfg.WorkerClient.CoreV1().Pods(p.cfg.WorkerNamespace).Watch(ctx, metav1.ListOptions{
-			LabelSelector: labelSelector,
-		})
-		if err != nil {
-			klog.Errorf("Failed to watch worker pods: %v", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		klog.Info("Watching worker pods for status sync")
-
-		for event := range watcher.ResultChan() {
-			workerPod, ok := event.Object.(*corev1.Pod)
-			if !ok {
-				continue
-			}
-
-			if event.Type == watch.Added || event.Type == watch.Modified {
-				p.syncStatusToTenant(ctx, workerPod)
-			}
-		}
-
-		klog.Warning("Worker pod watch ended, restarting...")
-		time.Sleep(2 * time.Second)
 	}
 }
 

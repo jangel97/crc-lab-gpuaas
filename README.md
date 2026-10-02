@@ -10,14 +10,14 @@ pod there. Kueue on the worker manages GPU quota.
 Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 +----- sno-tenant VM --------+    +----- sno-worker VM --------+
 |  12 vCPU, 16 GB RAM        |    |  8 vCPU, 24 GB RAM         |
-|                              |    |  GPU Operator (RTX 5090)   |
-|  VK Deployment              |    |  Kueue (local quota mgmt)  |
-|    registers virtual node   |    |  LVMS (local storage)      |
-|    "gpu-worker" (1 GPU)     |    |                             |
-|                              |    |  vk-workloads namespace    |
-|  scheduler ──> virtual node +--->|    synced secrets/cms/sas   |
-|                              |    |    real pods running here   |
-|  status synced back <────────+<--|                             |
+|                            |    |  GPU Operator (RTX 5090)   |
+|  VK Deployment             |    |  Kueue (local quota mgmt)  |
+|    registers virtual node  |    |  LVMS (local storage)      |
+|    "gpu-worker" (1 GPU)    |    |                             |
+|                            |    |  vk-workloads namespace    |
+|  scheduler ──> virtual node +-->|    synced secrets/cms/sas   |
+|                            |    |    real pods running here   |
+|  status synced back <───── ─+<--|                             |
 +-----------------------------+    +-----------------------------+
 ```
 
@@ -76,6 +76,7 @@ VK discovers resource references by walking the pod spec:
 |---------------|---------------|
 | Secrets | `env[].valueFrom.secretKeyRef`, `envFrom[].secretRef`, `volumes[].secret`, `imagePullSecrets` |
 | ConfigMaps | `env[].valueFrom.configMapKeyRef`, `envFrom[].configMapRef`, `volumes[].configMap` |
+| PVCs | `volumes[].persistentVolumeClaim` |
 | ServiceAccounts | `serviceAccountName` (plus the SA's image pull secrets) |
 
 Synced resources get management labels (`app.kubernetes.io/managed-by: vk-gpu-provider`,
@@ -137,7 +138,7 @@ python -m pytest tests/ -v -m rhoai
 
 ### Test Results (2026-10-02)
 
-All 6 tests pass. Runtime: ~20 seconds.
+All 7 tests pass. Runtime: ~33 seconds.
 
 ```
 tests/test_rhoai_vk.py::test_pytorchjob_via_vk        PASSED
@@ -146,6 +147,7 @@ tests/test_vk_gpu.py::test_virtual_node_exists         PASSED
 tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk   PASSED
 tests/test_vk_gpu.py::test_resource_sync               PASSED
 tests/test_vk_gpu.py::test_pod_deletion_cleans_up      PASSED
+tests/test_vk_gpu.py::test_pvc_sync                    PASSED
 ```
 
 ### Test Descriptions
@@ -156,6 +158,7 @@ tests/test_vk_gpu.py::test_pod_deletion_cleans_up      PASSED
 | `test_gpu_pod_dispatched_via_vk` | vk | GPU pod submitted on tenant → dispatched to worker → `nvidia-smi` runs on RTX 5090 → status synced back as Succeeded |
 | `test_resource_sync` | vk | Pod referencing a Secret + ConfigMap on tenant → both synced to worker namespace with management labels → pod reads them successfully |
 | `test_pod_deletion_cleans_up` | vk | Tenant pod deleted → worker pod and synced secret cleaned up automatically |
+| `test_pvc_sync` | vk | PVC on tenant → synced to worker with management labels → access modes match → cleaned up on pod deletion |
 | `test_pytorchjob_via_vk` | rhoai | PyTorchJob CR on tenant → training operator creates master pod → VK dispatches to worker GPU → nvidia-smi succeeds → status synced → PyTorchJob condition Succeeded |
 | `test_no_rhoai_crds_on_worker` | rhoai | Worker cluster has no RHOAI CRDs (pytorchjobs, notebooks, inferenceservices, rayclusters) — confirms it stays a bare GPU node |
 
@@ -163,8 +166,8 @@ tests/test_vk_gpu.py::test_pod_deletion_cleans_up      PASSED
 
 1. **Cross-cluster GPU dispatch works end-to-end**: pods scheduled on a virtual
    node execute on a real GPU (RTX 5090) in a different cluster.
-2. **Resource isolation**: secrets, configmaps, and service accounts are synced
-   on-demand and cleaned up on pod deletion. No data leaks between tenants.
+2. **Resource isolation**: secrets, configmaps, PVCs, and service accounts are
+   synced on-demand and cleaned up on pod deletion. No data leaks between tenants.
 3. **Operator compatibility**: RHOAI training operator (PyTorchJob) works
    transparently — it creates pods, VK dispatches them, status syncs back, and
    the operator sees the job as Succeeded. No RHOAI modifications needed.

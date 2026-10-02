@@ -479,3 +479,147 @@ def test_pod_deletion_cleans_up(
         tenant_core.delete_namespaced_secret(name=secret_name, namespace=ns)
     except client.exceptions.ApiException:
         pass
+
+
+@pytest.mark.vk
+def test_pvc_sync(
+    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+):
+    """
+    Create a PVC on tenant, submit a pod that mounts it.
+    Verify VK syncs the PVC to worker with management labels.
+    Verify cleanup removes the PVC from worker.
+    """
+    tenant_core, _ = tenant_clients
+    worker_core, _ = worker_clients
+    ns = test_namespace
+
+    pvc_name = "vk-test-pvc"
+    pod_name = "vk-pvc-sync-test"
+    w_pod_name = worker_pod_name(ns, pod_name)
+
+    # Cleanup from previous runs
+    force_delete_pod(tenant_core, pod_name, ns)
+    force_delete_pod(worker_core, w_pod_name, vk_worker_namespace)
+    try:
+        tenant_core.delete_namespaced_persistent_volume_claim(
+            name=pvc_name, namespace=ns
+        )
+    except client.exceptions.ApiException:
+        pass
+    try:
+        worker_core.delete_namespaced_persistent_volume_claim(
+            name=pvc_name, namespace=vk_worker_namespace
+        )
+    except client.exceptions.ApiException:
+        pass
+    time.sleep(3)
+
+    # Create PVC on tenant
+    tenant_core.create_namespaced_persistent_volume_claim(
+        namespace=ns,
+        body=client.V1PersistentVolumeClaim(
+            metadata=client.V1ObjectMeta(name=pvc_name, namespace=ns),
+            spec=client.V1PersistentVolumeClaimSpec(
+                access_modes=["ReadWriteOnce"],
+                resources=client.V1VolumeResourceRequirements(
+                    requests={"storage": "1Gi"},
+                ),
+            ),
+        ),
+    )
+
+    # Create pod that mounts the PVC
+    pod = client.V1Pod(
+        metadata=client.V1ObjectMeta(name=pod_name, namespace=ns),
+        spec=client.V1PodSpec(
+            node_name=VK_NODE_NAME,
+            restart_policy="Never",
+            tolerations=[
+                client.V1Toleration(
+                    key="virtual-kubelet.io/provider",
+                    operator="Exists",
+                ),
+            ],
+            containers=[
+                client.V1Container(
+                    name="test",
+                    image="registry.access.redhat.com/ubi9-micro:latest",
+                    command=["echo", "pvc-mounted"],
+                    volume_mounts=[
+                        client.V1VolumeMount(
+                            name="data",
+                            mount_path="/data",
+                        )
+                    ],
+                )
+            ],
+            volumes=[
+                client.V1Volume(
+                    name="data",
+                    persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                        claim_name=pvc_name,
+                    ),
+                )
+            ],
+        ),
+    )
+    tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+
+    # Wait for PVC to appear on worker with management labels
+    deadline = time.time() + 30
+    pvc_synced = False
+    while time.time() < deadline:
+        try:
+            wpvc = worker_core.read_namespaced_persistent_volume_claim(
+                name=pvc_name, namespace=vk_worker_namespace
+            )
+            if wpvc.metadata.labels and wpvc.metadata.labels.get(
+                "app.kubernetes.io/managed-by"
+            ) == "vk-gpu-provider":
+                pvc_synced = True
+                break
+        except client.exceptions.ApiException:
+            pass
+        time.sleep(3)
+
+    assert pvc_synced, (
+        f"PVC {pvc_name} not synced to worker namespace {vk_worker_namespace}"
+    )
+
+    # Verify PVC spec matches
+    wpvc = worker_core.read_namespaced_persistent_volume_claim(
+        name=pvc_name, namespace=vk_worker_namespace
+    )
+    assert "ReadWriteOnce" in wpvc.spec.access_modes, (
+        f"Worker PVC access modes mismatch: {wpvc.spec.access_modes}"
+    )
+
+    # Delete tenant pod — should trigger cleanup
+    force_delete_pod(tenant_core, pod_name, ns)
+
+    # Wait for PVC to be cleaned up on worker
+    deadline = time.time() + 30
+    pvc_gone = False
+    while time.time() < deadline:
+        try:
+            worker_core.read_namespaced_persistent_volume_claim(
+                name=pvc_name, namespace=vk_worker_namespace
+            )
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                pvc_gone = True
+                break
+        time.sleep(3)
+
+    assert pvc_gone, (
+        f"Synced PVC {pvc_name} not cleaned up on worker after pod deletion"
+    )
+
+    # Cleanup tenant PVC
+    try:
+        tenant_core.delete_namespaced_persistent_volume_claim(
+            name=pvc_name, namespace=ns
+        )
+    except client.exceptions.ApiException:
+        pass
