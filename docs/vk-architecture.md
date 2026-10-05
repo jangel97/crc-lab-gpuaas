@@ -7,16 +7,19 @@ worker cluster. Plain `k8s.io/client-go` — no virtual-kubelet library.
 
 ```
 cmd/vk-gpu-provider/
-├── main.go            # CLI flags, kubeconfig loading, signal handling
+├── main.go            # CLI flags, kubeconfig loading, namespace prefix resolution
 ├── provider.go        # Node registration, informers, dispatch loop, status sync
+├── provider_test.go   # Unit tests for pod transformation (SecurityContext, labels)
 ├── resourcesync.go    # Secret/ConfigMap/SA/PVC discovery and cross-cluster sync
 └── Dockerfile
 ```
 
 ## Startup Sequence
 
-`main.go` parses flags, builds two Kubernetes clients (tenant + worker), and
-calls `provider.Run(ctx)`. The provider:
+`main.go` parses flags, builds two Kubernetes clients (tenant + worker),
+resolves the worker namespace prefix (from `--worker-namespace-prefix` flag
+or auto-generated and persisted in ConfigMap `vk-gpu-provider-config` in
+`kube-system`), and calls `provider.Run(ctx)`. The provider:
 
 1. **Registers the virtual node** on the tenant cluster (`registerNode`).
    Creates or updates a Node object `gpu-worker` with labels
@@ -27,8 +30,8 @@ calls `provider.Run(ctx)`. The provider:
    the node Lease in `kube-node-lease` and refreshes the Node status
    (conditions, capacity). Keeps the node Ready so the scheduler trusts it.
 
-3. **Starts the worker pod informer.** Filtered `ListWatch` on the worker
-   namespace for pods with label `app.kubernetes.io/managed-by: vk-gpu-provider`.
+3. **Starts the worker pod informer.** Filtered `ListWatch` across **all
+   namespaces** for pods with label `app.kubernetes.io/managed-by: vk-gpu-provider`.
    On Add/Update: rebuilds the `managedPods` map (tenant key → worker pod name)
    and syncs worker pod status back to the tenant virtual pod. This informer
    starts first so that on restart the provider recovers its state from existing
@@ -53,6 +56,12 @@ tenant pod event (Add/Update)
     ├── skip if already managed (in managedPods map)
     ├── skip if DeletionTimestamp set → route to deletion handler
     ├── skip if already terminal (Succeeded/Failed)
+    │
+    ▼
+ensureNamespace
+    │  Derive worker namespace: {prefix}{tenant-namespace}
+    │  Create namespace on worker if it doesn't exist, with label
+    │    app.kubernetes.io/managed-by: vk-gpu-provider
     │
     ▼
 ValidateAndSyncPVCs
@@ -89,14 +98,14 @@ SyncHeadlessServices
 transformPod
     │  Deep-copy the pod spec and rewrite it for the worker cluster:
     │    - Name: {namespace}--{name}
-    │    - Namespace: vk-workloads
+    │    - Namespace: {prefix}{tenant-namespace}
     │    - Labels: copy user labels (skip openshift.io/*, kueue queue, managed-by)
-    │              add: managed-by, source-namespace, source-name, kueue queue
+    │              add: managed-by, source-namespace, source-name
     │    - Annotations: copy user annotations (skip openshift.io/*, kubernetes.io/*, k8s.ovn.org/*)
     │    - Clear: nodeName, nodeSelector, affinity, tolerations, schedulerName, priority
     │    - Remap PVC claim names using the pvcNameMap from step 1
     │    - Strip: kube-api-access volumes, SA token projected volumes
-    │    - Strip: SecurityContext on pod and all containers (SCC mutations)
+    │    - SecurityContext: passed through as-is (see docs/security-context-handling.md)
     │    - Filter volume mounts to only reference surviving volumes
     │
     ▼
@@ -115,7 +124,7 @@ It lists all Services in the pod's tenant namespace and syncs any headless
 Service (ClusterIP=None) whose selector matches the pod's labels.
 
 ```
-tenant namespace (vk-test)              worker namespace (vk-workloads)
+tenant namespace (vk-test)              worker namespace ({prefix}vk-test)
 ┌──────────────────────────┐            ┌──────────────────────────┐
 │ Headless Service         │            │ Synced Headless Service  │
 │   name: job1-worker      │  sync ───> │   name: job1-worker      │
@@ -134,7 +143,7 @@ tenant namespace (vk-test)              worker namespace (vk-workloads)
 ```
 
 **DNS resolution on worker:**
-`job1-worker-0.job1-worker.vk-workloads.svc.cluster.local` resolves to
+`job1-worker-0.job1-worker.{prefix}vk-test.svc.cluster.local` resolves to
 the pod's IP because:
 1. The synced headless Service's selector matches the worker pod's labels
 2. The worker endpoint controller creates EndpointSlices
@@ -143,8 +152,8 @@ the pod's IP because:
 
 **Service name is NOT namespace-prefixed.** Unlike pod names (which get
 `{ns}--{name}` prefixing), the headless Service must keep its original name
-to match the pod's `subdomain` field. Name collisions are possible across
-tenant namespaces (same limitation as secrets/configmaps).
+to match the pod's `subdomain` field. Per-tenant worker namespaces prevent
+name collisions across tenant namespaces.
 
 **Non-fatal on error.** If headless Service sync fails (e.g., RBAC, network),
 the pod is still dispatched. Inter-pod DNS won't work, but the pod itself
@@ -188,17 +197,17 @@ by the control PVC informer via `CleanupExecutionPVC`).
 | Field | Tenant pod | Worker pod |
 |-------|-----------|------------|
 | Name | `my-pod` | `my-namespace--my-pod` |
-| Namespace | user namespace | `vk-workloads` |
+| Namespace | user namespace | `{prefix}{tenant-namespace}` |
 | nodeName | `gpu-worker` | *(cleared — let Kueue/scheduler decide)* |
 | nodeSelector, affinity, tolerations | set by user/operator | *(cleared)* |
 | schedulerName, priority | set by user/operator | *(cleared)* |
-| SecurityContext (pod) | SCC-mutated by OpenShift | `{}` (empty) |
-| SecurityContext (containers) | SCC-mutated by OpenShift | `nil` |
+| SecurityContext (pod) | SCC-mutated by OpenShift | **passed through as-is** |
+| SecurityContext (containers) | SCC-mutated by OpenShift | **passed through as-is** |
 | ServiceAccountName | user SA | kept (SA synced to worker) |
 | kube-api-access volumes | injected by kubelet | *(stripped)* |
 | SA token projected volumes | injected by kubelet | *(stripped)* |
 | PVC claim names | `checkpoint` | `my-namespace--checkpoint` |
-| Labels | user labels | user labels + managed-by + source labels + kueue queue |
+| Labels | user labels | user labels + managed-by + source labels |
 
 ## Management Labels
 
@@ -230,26 +239,34 @@ Both informers use a 30-second resync period. The control PVC informer uses
 idempotent — repeated events for the same pod produce no additional API calls
 if state hasn't changed.
 
+## Per-Tenant Worker Namespaces
+
+Each tenant namespace gets its own worker namespace: `{prefix}{tenant-ns}`.
+The prefix is either set via `--worker-namespace-prefix` or auto-generated
+(8 hex chars, e.g., `vk-27af5d3c-`) and persisted in ConfigMap
+`vk-gpu-provider-config` in `kube-system` so it survives restarts.
+
+Worker namespaces are created on-demand by `ensureNamespace` with label
+`app.kubernetes.io/managed-by: vk-gpu-provider`. This provides:
+
+- **Resource isolation**: secrets, configmaps, and SAs from different tenants
+  never share a namespace — no name collisions.
+- **Network isolation potential**: NetworkPolicies can be applied per worker
+  namespace to restrict cross-tenant traffic.
+
+## SecurityContext Handling
+
+SecurityContext is passed through unchanged from the tenant pod to the worker
+pod. OpenShift SCC mutates SecurityContext fields before the pod reaches VK,
+and we cannot distinguish user-set fields from SCC-injected ones. Stripping
+any field risks losing user intent silently. If an SCC-generated value is
+incompatible with the worker cluster's security policy, the pod fails visibly
+(worker SCC/PSA rejects it).
+
+See [security-context-handling.md](security-context-handling.md) for the full
+field classification and design rationale.
+
 ## Limitations
-
-### Single worker namespace (no multi-tenant isolation)
-
-All dispatched pods land in one namespace (`vk-workloads`) regardless of which
-tenant namespace they came from. This has three consequences:
-
-| Issue | Detail |
-|-------|--------|
-| **Secret/ConfigMap name collisions** | Synced resources keep their original name. If team A and team B both have a secret called `db-creds`, the second sync overwrites the first. Pod names are namespace-prefixed (`{ns}--{name}`) but synced resources are not. |
-| **ServiceAccount collisions** | Same problem — two teams with a SA named `trainer` clobber each other. |
-| **No network isolation between teams** | All worker pods share a namespace with no NetworkPolicy. Any pod can reach any other pod. |
-
-Tenant-side isolation is fine — each team works in their own namespace with
-standard RBAC. The gap is on the worker side.
-
-**Fix (not yet implemented):** use one worker namespace per tenant namespace
-(e.g., `vk-team-a`, `vk-team-b`). This gives real RBAC and network isolation
-without changing the sync logic. Resource name prefixing alone (like PVCs
-already do) would fix collisions but not network isolation.
 
 ### Headless Service sync
 
@@ -276,7 +293,7 @@ submariner-architecture.md §7.
 |------|---------|-------------|
 | `--nodename` | `gpu-worker` | Virtual node name on tenant |
 | `--worker-kubeconfig` | *(required)* | Path to worker cluster kubeconfig |
-| `--worker-namespace` | `vk-workloads` | Namespace on worker for dispatched pods |
+| `--worker-namespace-prefix` | *(auto-generated)* | Prefix for per-tenant worker namespaces. Auto-generated and persisted in ConfigMap if empty. |
 | `--gpu-count` | `1` | GPUs advertised in node capacity |
 | `--kubeconfig` | in-cluster | Tenant cluster kubeconfig (empty = in-cluster) |
 | `--default-remote-storage-class` | `lvms-vg1` | Default StorageClass for execution PVCs |

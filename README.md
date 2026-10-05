@@ -14,10 +14,10 @@ Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 |  VK Deployment             |    |  Kueue (local quota mgmt)  |
 |    registers virtual node  |    |  LVMS (local storage)      |
 |    "gpu-worker" (1 GPU)    |    |                             |
-|                            |    |  vk-workloads namespace    |
-|  scheduler ──> virtual node +-->|    synced secrets/cms/sas   |
-|                            |    |    real pods running here   |
-|  status synced back <───── ─+<--|                             |
+|                            |    |  per-tenant namespaces     |
+|  scheduler ──> virtual node +-->|    {prefix}{tenant-ns}      |
+|                            |    |    synced secrets/cms/sas   |
+|  status synced back <───── ─+<--|    real pods running here   |
 +-----------------------------+    +-----------------------------+
 ```
 
@@ -33,10 +33,11 @@ Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
      operator: Exists
    ```
 3. VK watches for pods assigned to its node, then:
+   - Derives a per-tenant worker namespace (`{prefix}{tenant-ns}`) and creates it if needed
    - Walks the pod spec to discover referenced secrets, configmaps, and service accounts
-   - Syncs those resources to the `vk-workloads` namespace on the worker
-   - Transforms the pod spec (strips OpenShift SELinux/SCC mutations, adds Kueue
-     queue-name label, clears scheduling fields)
+   - Syncs those resources to the per-tenant worker namespace
+   - Transforms the pod spec (clears scheduling fields, strips kube-api-access volumes,
+     passes SecurityContext through as-is)
    - Creates the pod on the worker
 4. VK watches worker pods and syncs status back to the tenant pod.
 5. When a tenant pod is deleted, VK deletes the worker pod and cleans up synced
@@ -171,9 +172,9 @@ python -m pytest tests/ -v -m rhoai
 python -m pytest tests/ -v -m networking
 ```
 
-### Test Results (2026-10-02)
+### Test Results (2026-10-05)
 
-All 13 tests pass.
+7 core VK tests pass (RHOAI and Submariner tests not re-run this session).
 
 ```
 tests/test_vk_gpu.py::test_virtual_node_exists                                PASSED
@@ -182,13 +183,7 @@ tests/test_vk_gpu.py::test_resource_sync                                      PA
 tests/test_vk_gpu.py::test_pod_deletion_cleans_up                             PASSED
 tests/test_vk_gpu.py::test_catapult_pvc_sync                                  PASSED
 tests/test_vk_gpu.py::test_non_catapult_pvc_rejected                          PASSED
-tests/test_vk_gpu.py::test_multitenant_secret_collision                       PASSED
-tests/test_rhoai_vk.py::test_pytorchjob_via_vk                               PASSED
-tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker                         PASSED
-tests/test_submariner_networking.py::test_gpu_service_via_submariner          PASSED
-tests/test_submariner_networking.py::test_notebook_workbench_via_submariner   PASSED
-tests/test_submariner_networking.py::test_submariner_tunnel_failure_recovery  PASSED
-tests/test_distributed_training.py::test_headless_service_dns_resolution     PASSED
+tests/test_vk_gpu.py::test_multitenant_namespace_isolation                    PASSED
 ```
 
 ### Test Descriptions
@@ -206,7 +201,7 @@ tests/test_distributed_training.py::test_headless_service_dns_resolution     PAS
 | `test_gpu_service_via_submariner` | networking | GPU HTTP server dispatched to worker → Service on tenant → PodIP synced → EndpointSlice created → curl through Service via Submariner tunnel → HTTP 200 with RTX 5090 GPU info |
 | `test_notebook_workbench_via_submariner` | networking | Long-running GPU notebook server dispatched to worker → Service on tenant → pod stays Running → curl returns HTML with GPU info via Submariner tunnel |
 | `test_submariner_tunnel_failure_recovery` | networking | GPU server + Service working → kill Submariner gateway → verify outage → gateway restarts → tunnel re-establishes → connectivity restored |
-| `test_multitenant_secret_collision` | vk | Two namespaces create same-named Secret → VK syncs both to single worker namespace → second overwrites first → collision proven (documents known limitation) |
+| `test_multitenant_namespace_isolation` | vk | Two namespaces create same-named Secret → VK syncs each to its own per-tenant worker namespace → both exist with correct data → isolation proven |
 | `test_headless_service_dns_resolution` | networking | Two pods with hostname/subdomain + headless Service → VK syncs Service to worker → Pod B resolves Pod A via DNS → inter-pod DNS works for distributed training |
 
 ### What the Tests Prove
@@ -214,7 +209,8 @@ tests/test_distributed_training.py::test_headless_service_dns_resolution     PAS
 1. **Cross-cluster GPU dispatch works end-to-end**: pods scheduled on a virtual
    node execute on a real GPU (RTX 5090) in a different cluster.
 2. **Resource isolation**: secrets, configmaps, PVCs, and service accounts are
-   synced on-demand and cleaned up on pod deletion. No data leaks between tenants.
+   synced on-demand to per-tenant worker namespaces and cleaned up on pod
+   deletion. No data leaks or name collisions between tenants.
 3. **Operator compatibility**: RHOAI training operator (PyTorchJob) works
    transparently — it creates pods, VK dispatches them, status syncs back, and
    the operator sees the job as Succeeded. No RHOAI modifications needed.
@@ -229,8 +225,8 @@ tests/test_distributed_training.py::test_headless_service_dns_resolution     PAS
    tunnel re-establishes → connectivity restored.
 8. **Headless Service sync enables distributed training DNS**: inter-pod DNS
    resolution works via synced headless Services.
-9. **Multi-tenant collision is documented and proven**: same-named resources
-   from different namespaces collide in the single worker namespace.
+9. **Multi-tenant isolation works**: per-tenant worker namespaces prevent
+   same-named resources from different tenant namespaces from colliding.
 
 For the full spike assessment with all scenarios, results, and gaps, see
 [docs/spike-assessment.md](docs/spike-assessment.md).

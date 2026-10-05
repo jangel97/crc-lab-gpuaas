@@ -176,14 +176,14 @@ OpenShift Route → HAProxy → Service → EndpointSlice → Submariner tunnel 
 
 ### 6. Multi-Tenant Isolation
 
-#### S12. Multi-tenant resource collision
+#### S12. Multi-tenant namespace isolation
 
 | | |
 |---|---|
-| **Test** | `test_vk_gpu.py::test_multitenant_secret_collision` |
-| **What** | Two tenant namespaces (`vk-team-a`, `vk-team-b`) each create a Secret named `shared-config` with different data → both dispatch pods via VK → second sync overwrites first in the single worker namespace → proves documented collision |
-| **Result** | PASS (collision confirmed) |
-| **Proves** | Same-named resources from different tenant namespaces collide in the single `vk-workloads` namespace. This is the documented architectural limitation. Fix: use one worker namespace per tenant namespace. |
+| **Test** | `test_vk_gpu.py::test_multitenant_namespace_isolation` |
+| **What** | Two tenant namespaces (`vk-team-a`, `vk-team-b`) each create a Secret named `shared-config` with different data → both dispatch pods via VK → each synced to its own per-tenant worker namespace (`{prefix}vk-team-a`, `{prefix}vk-team-b`) → both secrets exist with correct data |
+| **Result** | PASS |
+| **Proves** | Per-tenant worker namespaces prevent resource collisions. Same-named resources from different tenant namespaces are fully isolated. |
 
 ### 7. Distributed Training
 
@@ -207,7 +207,7 @@ tests/test_vk_gpu.py::test_resource_sync                                      PA
 tests/test_vk_gpu.py::test_pod_deletion_cleans_up                             PASSED
 tests/test_vk_gpu.py::test_catapult_pvc_sync                                  PASSED
 tests/test_vk_gpu.py::test_non_catapult_pvc_rejected                          PASSED
-tests/test_vk_gpu.py::test_multitenant_secret_collision                       PASSED
+tests/test_vk_gpu.py::test_multitenant_namespace_isolation                    PASSED
 tests/test_rhoai_vk.py::test_pytorchjob_via_vk                               PASSED
 tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker                         PASSED
 tests/test_submariner_networking.py::test_gpu_service_via_submariner          PASSED
@@ -233,19 +233,14 @@ tests/test_distributed_training.py::test_headless_service_dns_resolution     PAS
 
 ## Limitations
 
-### Single worker namespace
+### SecurityContext pass-through
 
-All dispatched pods land in `vk-workloads` regardless of source tenant
-namespace. Secrets and ConfigMaps keep their original names, so same-named
-resources from different tenant namespaces collide. Pod names are
-namespace-prefixed (`{ns}--{name}`) so pods don't collide, but synced
-resources are not prefixed.
-
-**Impact:** Multi-tenant deployments will see data corruption if teams use
-the same resource names.
-
-**Fix:** Use one worker namespace per tenant namespace (e.g., `vk-team-a`).
-Not yet implemented.
+SecurityContext is passed through unchanged. OpenShift SCC mutates
+SecurityContext fields before VK sees the pod, and we cannot distinguish
+user-set fields from SCC-injected ones (see
+[security-context-handling.md](security-context-handling.md)). If an
+SCC-generated value (e.g., tenant MCS label) is incompatible with the worker
+cluster's security policy, the pod fails visibly on the worker.
 
 ### Headless Service sync (implemented)
 
@@ -279,8 +274,9 @@ selector but does not affect function.
    No RHOAI code changes or CRDs needed on the worker.
 
 3. **Resource isolation works.** Secrets, ConfigMaps, ServiceAccounts, and
-   PVCs are synced on-demand, labeled for tracking, and cleaned up on pod
-   deletion. No data leaks between pods.
+   PVCs are synced on-demand to per-tenant worker namespaces, labeled for
+   tracking, and cleaned up on pod deletion. No data leaks or name collisions
+   between tenants.
 
 4. **Cross-cluster networking works via Submariner.** Regular Kubernetes
    Services and OpenShift Routes reach remote GPU pods transparently. VK
@@ -293,9 +289,8 @@ selector but does not affect function.
 6. **Interactive workloads (notebooks) work.** Long-running GPU pods stay
    Running and remain accessible through Service/Route via Submariner (S10).
 
-7. **Multi-tenant collision is real and proven.** Same-named resources from
-   different namespaces collide in the single worker namespace (S12).
-   Documented as a known limitation with a clear fix path.
+7. **Multi-tenant isolation works.** Per-tenant worker namespaces prevent
+   same-named resources from different tenant namespaces from colliding (S12).
 
 8. **Headless Service sync enables distributed training DNS.** Inter-pod
    DNS resolution works via synced headless Services (S13). This is the
@@ -318,7 +313,7 @@ selector but does not affect function.
    Deployment inference works (S9).
 
 4. **Production readiness.** No HA, no Globalnet for overlapping CIDRs,
-   no performance benchmarks, no multi-tenant namespace isolation.
+   no performance benchmarks, no worker namespace garbage collection.
 
 ---
 
@@ -330,4 +325,5 @@ selector but does not affect function.
 | [vk-architecture.md](vk-architecture.md) | VK internals: dispatch loop, resource sync, pod transformation, status sync |
 | [submariner-architecture.md](submariner-architecture.md) | Cross-cluster networking: topology, traffic flows, failure modes, deployment log |
 | [pvc-architecture.md](pvc-architecture.md) | Catapult PVC lifecycle and design |
+| [security-context-handling.md](security-context-handling.md) | SecurityContext field classification and SCC ambiguity |
 | [00-prerequisites.md](../00-prerequisites.md) | Hardware setup, VFIO, QEMU 9.2, RTX 5090 XML tweaks |

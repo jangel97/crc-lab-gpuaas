@@ -10,13 +10,16 @@ import (
 	"os/signal"
 	"syscall"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
+
+	"github.com/virtual-kubelet/virtual-kubelet/node"
+	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 )
 
 func main() {
@@ -66,17 +69,41 @@ func main() {
 	}
 	klog.Infof("Worker namespace prefix: %s", workerNamespacePrefix)
 
-	provider := NewGPUProvider(GPUProviderConfig{
-		NodeName:                  nodeName,
-		WorkerNamespacePrefix:     workerNamespacePrefix,
-		GPUCount:                  gpuCount,
-		DefaultRemoteStorageClass: defaultRemoteStorageClass,
-		TenantClient:              tenantClient,
-		WorkerClient:              workerClient,
-	})
+	vkNode, err := nodeutil.NewNode(nodeName,
+		func(cfg nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
+			provider := NewGPUProvider(GPUProviderConfig{
+				NodeName:                  nodeName,
+				WorkerNamespacePrefix:     workerNamespacePrefix,
+				GPUCount:                  gpuCount,
+				DefaultRemoteStorageClass: defaultRemoteStorageClass,
+				TenantClient:              tenantClient,
+				WorkerClient:              workerClient,
+			})
+			provider.ConfigureNode(cfg.Node)
 
-	if err := provider.Run(ctx); err != nil {
-		klog.Fatalf("Provider exited with error: %v", err)
+			if err := provider.startWorkerInformer(ctx); err != nil {
+				return nil, nil, fmt.Errorf("start worker informer: %w", err)
+			}
+			provider.startPVCInformer(ctx)
+
+			return provider, provider, nil
+		},
+		nodeutil.WithClient(tenantClient),
+	)
+	if err != nil {
+		klog.Fatalf("Failed to create virtual kubelet node: %v", err)
+	}
+
+	go func() {
+		if err := vkNode.Run(ctx); err != nil {
+			klog.Fatalf("Virtual kubelet node exited with error: %v", err)
+		}
+	}()
+
+	klog.Info("Virtual kubelet started")
+	<-vkNode.Done()
+	if err := vkNode.Err(); err != nil {
+		klog.Fatalf("Virtual kubelet error: %v", err)
 	}
 }
 
