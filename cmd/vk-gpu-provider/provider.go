@@ -23,15 +23,12 @@ const (
 	labelManagedByValue  = "vk-gpu-provider"
 	labelSourceNamespace = "vk.gpuaas.io/source-namespace"
 	labelSourceName      = "vk.gpuaas.io/source-name"
-	labelSourcePod       = "vk.gpuaas.io/source-pod"
-
-	kueueQueueLabel = "kueue.x-k8s.io/queue-name"
-	kueueQueueName  = "user-queue"
+	labelSourcePod = "vk.gpuaas.io/source-pod"
 )
 
 type GPUProviderConfig struct {
 	NodeName                  string
-	WorkerNamespace           string
+	WorkerNamespacePrefix     string
 	GPUCount                  int
 	DefaultRemoteStorageClass string
 	TenantClient              kubernetes.Interface
@@ -49,7 +46,7 @@ type GPUProvider struct {
 func NewGPUProvider(cfg GPUProviderConfig) *GPUProvider {
 	return &GPUProvider{
 		cfg:         cfg,
-		syncer:      NewResourceSyncer(cfg.TenantClient, cfg.WorkerClient, cfg.WorkerNamespace, cfg.DefaultRemoteStorageClass),
+		syncer:      NewResourceSyncer(cfg.TenantClient, cfg.WorkerClient, cfg.WorkerNamespacePrefix, cfg.DefaultRemoteStorageClass),
 		managedPods: make(map[string]string),
 	}
 }
@@ -65,7 +62,7 @@ func (p *GPUProvider) Run(ctx context.Context) error {
 	workerLW := cache.NewFilteredListWatchFromClient(
 		p.cfg.WorkerClient.CoreV1().RESTClient(),
 		"pods",
-		p.cfg.WorkerNamespace,
+		metav1.NamespaceAll,
 		func(options *metav1.ListOptions) {
 			options.LabelSelector = labelManagedBy + "=" + labelManagedByValue
 		},
@@ -398,6 +395,13 @@ func (p *GPUProvider) handleTenantPod(ctx context.Context, pod *corev1.Pod) {
 
 	klog.Infof("New pod assigned to virtual node: %s", key)
 
+	workerNS := workerNamespace(p.cfg.WorkerNamespacePrefix, pod.Namespace)
+	if err := p.ensureNamespace(ctx, workerNS); err != nil {
+		klog.Errorf("Failed to ensure worker namespace %s: %v", workerNS, err)
+		p.setPodStatus(ctx, pod, corev1.PodFailed, "NamespaceCreateFailed", err.Error())
+		return
+	}
+
 	pvcMap, err := p.syncer.ValidateAndSyncPVCs(ctx, pod)
 	if err != nil {
 		klog.Errorf("PVC validation failed for %s: %v", key, err)
@@ -411,8 +415,12 @@ func (p *GPUProvider) handleTenantPod(ctx context.Context, pod *corev1.Pod) {
 		return
 	}
 
-	workerPod := p.transformPod(pod, pvcMap)
-	created, err := p.cfg.WorkerClient.CoreV1().Pods(p.cfg.WorkerNamespace).Create(ctx, workerPod, metav1.CreateOptions{})
+	if err := p.syncer.SyncHeadlessServices(ctx, pod); err != nil {
+		klog.Warningf("Failed to sync headless services for %s: %v", key, err)
+	}
+
+	workerPod := p.transformPod(pod, workerNS, pvcMap)
+	created, err := p.cfg.WorkerClient.CoreV1().Pods(workerNS).Create(ctx, workerPod, metav1.CreateOptions{})
 	if err != nil {
 		if errors.IsAlreadyExists(err) {
 			klog.Infof("Worker pod already exists for %s", key)
@@ -426,7 +434,7 @@ func (p *GPUProvider) handleTenantPod(ctx context.Context, pod *corev1.Pod) {
 		return
 	}
 
-	klog.Infof("Created worker pod %s/%s for tenant pod %s", p.cfg.WorkerNamespace, created.Name, key)
+	klog.Infof("Created worker pod %s/%s for tenant pod %s", workerNS, created.Name, key)
 	p.mu.Lock()
 	p.managedPods[key] = created.Name
 	p.mu.Unlock()
@@ -448,9 +456,10 @@ func (p *GPUProvider) handleTenantPodDeleted(ctx context.Context, pod *corev1.Po
 		return
 	}
 
+	workerNS := workerNamespace(p.cfg.WorkerNamespacePrefix, pod.Namespace)
 	klog.Infof("Tenant pod deleted: %s, cleaning up worker pod %s", key, workerPodName)
 
-	err := p.cfg.WorkerClient.CoreV1().Pods(p.cfg.WorkerNamespace).Delete(ctx, workerPodName, metav1.DeleteOptions{})
+	err := p.cfg.WorkerClient.CoreV1().Pods(workerNS).Delete(ctx, workerPodName, metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		klog.Errorf("Failed to delete worker pod %s: %v", workerPodName, err)
 	}
@@ -460,8 +469,35 @@ func (p *GPUProvider) handleTenantPodDeleted(ctx context.Context, pod *corev1.Po
 	}
 }
 
+func (p *GPUProvider) ensureNamespace(ctx context.Context, ns string) error {
+	_, err := p.cfg.WorkerClient.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
+	if err == nil {
+		return nil
+	}
+	if !errors.IsNotFound(err) {
+		return err
+	}
+	nsObj := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ns,
+			Labels: map[string]string{
+				labelManagedBy: labelManagedByValue,
+			},
+		},
+	}
+	_, err = p.cfg.WorkerClient.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{})
+	if errors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
 func workerPodName(namespace, name string) string {
 	return fmt.Sprintf("%s--%s", namespace, name)
+}
+
+func workerNamespace(prefix, tenantNS string) string {
+	return prefix + tenantNS
 }
 
 func isSystemNamespace(ns string) bool {
@@ -473,8 +509,8 @@ func isSystemNamespace(ns string) bool {
 }
 
 var labelSkipSet = map[string]bool{
-	kueueQueueLabel: true,
-	labelManagedBy:  true,
+	"kueue.x-k8s.io/queue-name": true,
+	labelManagedBy:               true,
 }
 
 var labelSkipPrefixes = []string{
@@ -497,16 +533,15 @@ func hasAnyPrefix(s string, prefixes []string) bool {
 	return false
 }
 
-func (p *GPUProvider) transformPod(pod *corev1.Pod, pvcNameMap map[string]string) *corev1.Pod {
+func (p *GPUProvider) transformPod(pod *corev1.Pod, workerNS string, pvcNameMap map[string]string) *corev1.Pod {
 	workerPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      workerPodName(pod.Namespace, pod.Name),
-			Namespace: p.cfg.WorkerNamespace,
+			Namespace: workerNS,
 			Labels: map[string]string{
 				labelManagedBy:       labelManagedByValue,
 				labelSourceNamespace: pod.Namespace,
 				labelSourceName:      pod.Name,
-				kueueQueueLabel:      kueueQueueName,
 			},
 			Annotations: map[string]string{},
 		},
@@ -565,17 +600,14 @@ func (p *GPUProvider) transformPod(pod *corev1.Pod, pvcNameMap map[string]string
 		)
 	}
 
-	workerPod.Spec.SecurityContext = &corev1.PodSecurityContext{}
-
-	for i := range workerPod.Spec.Containers {
-		workerPod.Spec.Containers[i].SecurityContext = nil
-	}
-	for i := range workerPod.Spec.InitContainers {
-		workerPod.Spec.InitContainers[i].SecurityContext = nil
-	}
+	// SecurityContext is passed through as-is. We cannot distinguish
+	// user-set fields from SCC-injected ones (see docs/security-context-handling.md).
+	// If a value is incompatible with the worker cluster's SCC/PSA,
+	// the pod fails visibly rather than losing user intent silently.
 
 	return workerPod
 }
+
 
 func filterVolumes(volumes []corev1.Volume) []corev1.Volume {
 	var filtered []corev1.Volume

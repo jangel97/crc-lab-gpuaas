@@ -156,22 +156,66 @@ $ curl --resolve gpu-inference-vk-test.apps.tenant.local.lab:80:192.168.122.10 \
 
 OpenShift Route → HAProxy → Service → EndpointSlice → Submariner tunnel → GPU pod. Works transparently.
 
+#### S10. Notebook workbench via Submariner
+
+| | |
+|---|---|
+| **Test** | `test_submariner_networking.py::test_notebook_workbench_via_submariner` |
+| **What** | Long-running GPU HTTP server (simulating a Jupyter notebook) dispatched to worker via VK → Service on tenant → pod stays Running (not Succeeded) → curl returns HTML with GPU info through Submariner tunnel |
+| **Result** | PASS |
+| **Proves** | Persistent interactive workloads (notebooks, IDEs) work through Submariner. The VK keeps long-running pods in Running state and the networking path remains stable. Combined with Route access from S9, this validates the full notebook access chain. |
+
+#### S11. Submariner tunnel failure and recovery
+
+| | |
+|---|---|
+| **Test** | `test_submariner_networking.py::test_submariner_tunnel_failure_recovery` |
+| **What** | Deploy GPU HTTP server + Service → verify connectivity works → kill Submariner gateway pod on worker → verify tunnel drops → wait for gateway restart and tunnel re-establishment → verify connectivity restored |
+| **Result** | PASS |
+| **Proves** | Submariner tunnel self-heals after gateway pod failure. IPsec tunnel re-establishes automatically via Deployment restart. Workloads remain running during outage; only network path is disrupted. |
+
+### 6. Multi-Tenant Isolation
+
+#### S12. Multi-tenant resource collision
+
+| | |
+|---|---|
+| **Test** | `test_vk_gpu.py::test_multitenant_secret_collision` |
+| **What** | Two tenant namespaces (`vk-team-a`, `vk-team-b`) each create a Secret named `shared-config` with different data → both dispatch pods via VK → second sync overwrites first in the single worker namespace → proves documented collision |
+| **Result** | PASS (collision confirmed) |
+| **Proves** | Same-named resources from different tenant namespaces collide in the single `vk-workloads` namespace. This is the documented architectural limitation. Fix: use one worker namespace per tenant namespace. |
+
+### 7. Distributed Training
+
+#### S13. Headless Service sync for inter-pod DNS
+
+| | |
+|---|---|
+| **Test** | `test_distributed_training.py::test_headless_service_dns_resolution` |
+| **What** | Two pods with hostname/subdomain deployed via VK + headless Service created on tenant → VK syncs headless Service to worker namespace → Pod B resolves Pod A's DNS name via synced Service → DNS lookup returns an IP |
+| **Result** | PASS |
+| **Proves** | Headless Service sync enables inter-pod DNS resolution on the worker cluster. This is the mechanism that makes multi-pod PyTorchJob work: training operator creates headless Services, VK syncs them, worker CoreDNS resolves pod hostnames. Combined with S7 (single-pod PyTorchJob proven), multi-pod distributed training infrastructure is in place. |
+
 ---
 
 ## Test Results Summary
 
 ```
-tests/test_vk_gpu.py::test_virtual_node_exists             PASSED
-tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk       PASSED
-tests/test_vk_gpu.py::test_resource_sync                   PASSED
-tests/test_vk_gpu.py::test_pod_deletion_cleans_up          PASSED
-tests/test_vk_gpu.py::test_catapult_pvc_sync               PASSED
-tests/test_vk_gpu.py::test_non_catapult_pvc_rejected       PASSED
-tests/test_rhoai_vk.py::test_pytorchjob_via_vk             PASSED
-tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker       PASSED
-tests/test_submariner_networking.py::test_gpu_service_via_submariner  PASSED
+tests/test_vk_gpu.py::test_virtual_node_exists                                PASSED
+tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk                          PASSED
+tests/test_vk_gpu.py::test_resource_sync                                      PASSED
+tests/test_vk_gpu.py::test_pod_deletion_cleans_up                             PASSED
+tests/test_vk_gpu.py::test_catapult_pvc_sync                                  PASSED
+tests/test_vk_gpu.py::test_non_catapult_pvc_rejected                          PASSED
+tests/test_vk_gpu.py::test_multitenant_secret_collision                       PASSED
+tests/test_rhoai_vk.py::test_pytorchjob_via_vk                               PASSED
+tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker                         PASSED
+tests/test_submariner_networking.py::test_gpu_service_via_submariner          PASSED
+tests/test_submariner_networking.py::test_notebook_workbench_via_submariner   PASSED
+tests/test_submariner_networking.py::test_submariner_tunnel_failure_recovery  PASSED
+tests/test_distributed_training.py::test_headless_service_dns_resolution     PASSED
 
-9 passed
+13 passed
 ```
 
 ---
@@ -180,12 +224,10 @@ tests/test_submariner_networking.py::test_gpu_service_via_submariner  PASSED
 
 | Scenario | Category | Why not assessed | Priority |
 |----------|----------|-----------------|----------|
-| **Workbenches (Jupyter Notebooks)** | Networking | Requires RHOAI dashboard → StatefulSet → Pod → Service → Route chain. S9 proves the Service/Route path works; workbench-specific validation (WebSocket persistence, file upload) deferred. | High |
-| **KServe inference (Knative-managed)** | Networking | Knative autoscaler, activator, queue-proxy, scale-to-zero need investigation. Raw Deployment inference works (S9 proves the path). | Medium |
-| **Distributed training (multi-pod)** | Networking | Requires headless Service sync to worker for inter-pod DNS. Not implemented. Single-pod training works (S7). | Medium |
-| **Multi-tenant isolation** | Architecture | All worker pods land in single `vk-workloads` namespace. Secret/ConfigMap name collisions possible across tenant namespaces. See Limitations. | High |
-| **Tunnel failure and recovery** | Networking | What happens when Submariner tunnel drops mid-workload? Documented in theory (submariner-architecture.md §11) but not validated. | Low |
+| **KServe inference (Knative-managed)** | Networking | Knative autoscaler, activator, queue-proxy, scale-to-zero need investigation. No Serverless operator installed in lab. Raw Deployment inference works (S9 proves the path). | Medium |
+| **Multi-pod PyTorchJob (full distributed)** | Training | Headless Service sync is proven (S13), but actual multi-GPU training needs >1 GPU. Lab has 1 GPU. Mechanism is validated; full end-to-end deferred to multi-GPU environment. | Medium |
 | **Overlapping CIDRs (Globalnet)** | Networking | Lab uses non-overlapping CIDRs by design. Overlapping CIDRs require Globalnet which changes the PodIP sync model. Not PoC scope. | Low |
+| **RHOAI dashboard → Notebook CRD** | Integration | S10 proves the networking path for notebooks. Full RHOAI Notebook CRD creates StatefulSets (not bare Pods), which requires VK awareness of StatefulSet ownership. Deferred. | Medium |
 
 ---
 
@@ -205,11 +247,11 @@ the same resource names.
 **Fix:** Use one worker namespace per tenant namespace (e.g., `vk-team-a`).
 Not yet implemented.
 
-### No headless Service sync
+### Headless Service sync (implemented)
 
-Distributed training frameworks (PyTorchJob multi-worker) rely on headless
-Services for inter-pod DNS discovery. VK does not sync Services to the worker
-cluster. Single-pod training works; multi-pod training does not.
+VK now syncs headless Services whose selectors match dispatched pods. This
+enables inter-pod DNS for distributed training. Service names are NOT
+namespace-prefixed (must match pod `subdomain` for DNS). Validated in S13.
 
 ### VK is not using the virtual-kubelet library
 
@@ -248,20 +290,35 @@ selector but does not affect function.
 5. **The worker stays bare.** No RHOAI operators, no CRDs, no training
    framework on the GPU cluster. Just GPU Operator + Kueue for quota.
 
+6. **Interactive workloads (notebooks) work.** Long-running GPU pods stay
+   Running and remain accessible through Service/Route via Submariner (S10).
+
+7. **Multi-tenant collision is real and proven.** Same-named resources from
+   different namespaces collide in the single worker namespace (S12).
+   Documented as a known limitation with a clear fix path.
+
+8. **Headless Service sync enables distributed training DNS.** Inter-pod
+   DNS resolution works via synced headless Services (S13). This is the
+   mechanism for multi-pod PyTorchJob.
+
+9. **Submariner tunnel self-heals.** Gateway pod failure → tunnel drops →
+   automatic restart → tunnel re-establishes → connectivity restored (S11).
+
 ## What This Spike Does Not Prove
 
-1. **Workbenches and interactive workloads.** The Service/Route path works
-   (S9), but Jupyter WebSocket persistence and RHOAI dashboard integration
-   are not validated.
+1. **Full multi-pod distributed training.** The DNS mechanism is proven
+   (S13), but actual multi-GPU training needs >1 GPU. Single-GPU lab
+   validates the infrastructure, not the workload.
 
-2. **Multi-tenant safety.** Single worker namespace with resource name
-   collisions is a known gap.
+2. **RHOAI Notebook CRD integration.** The networking path works (S10),
+   but RHOAI Notebook creates StatefulSets, which requires VK awareness
+   of StatefulSet pod ownership.
 
-3. **Distributed training.** Single-pod training works, but multi-pod
-   inter-pod DNS requires headless Service sync.
+3. **KServe with Knative.** No Serverless operator installed. Raw
+   Deployment inference works (S9).
 
-4. **Production readiness.** No HA, no failure recovery testing, no
-   Globalnet for overlapping CIDRs, no performance benchmarks.
+4. **Production readiness.** No HA, no Globalnet for overlapping CIDRs,
+   no performance benchmarks, no multi-tenant namespace isolation.
 
 ---
 

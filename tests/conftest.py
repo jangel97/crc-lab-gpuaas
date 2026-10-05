@@ -7,8 +7,10 @@ from kubernetes import client, config
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 VK_TEST_NAMESPACE = "vk-test"
-VK_WORKER_NAMESPACE = "vk-workloads"
 CATAPULT_STORAGE_CLASS = "catapult"
+
+VK_PREFIX_CONFIGMAP = "vk-gpu-provider-config"
+VK_PREFIX_CONFIGMAP_NS = "kube-system"
 
 
 def worker_pod_name(tenant_namespace, pod_name):
@@ -63,12 +65,32 @@ def worker_clients():
 
 
 @pytest.fixture(scope="session")
+def worker_namespace_prefix(tenant_clients):
+    """Read the auto-generated worker namespace prefix from the VK ConfigMap."""
+    tenant_core, _ = tenant_clients
+    cm = tenant_core.read_namespaced_config_map(
+        name=VK_PREFIX_CONFIGMAP, namespace=VK_PREFIX_CONFIGMAP_NS,
+    )
+    prefix = cm.data.get("worker-namespace-prefix", "")
+    assert prefix, (
+        f"ConfigMap {VK_PREFIX_CONFIGMAP_NS}/{VK_PREFIX_CONFIGMAP} has no "
+        f"worker-namespace-prefix key — is the VK running?"
+    )
+    return prefix
+
+
+def worker_namespace_for_prefix(prefix, tenant_namespace):
+    """Compute the per-tenant worker namespace given a prefix."""
+    return f"{prefix}{tenant_namespace}"
+
+
+@pytest.fixture(scope="session")
 def test_namespace():
     """Return the pre-provisioned VK test namespace on the tenant."""
     return VK_TEST_NAMESPACE
 
 
 @pytest.fixture(scope="session")
-def vk_worker_namespace():
-    """Return the namespace on the worker where VK creates pods."""
-    return VK_WORKER_NAMESPACE
+def vk_worker_namespace(worker_namespace_prefix):
+    """Return the per-tenant worker namespace for the default test namespace."""
+    return worker_namespace_for_prefix(worker_namespace_prefix, VK_TEST_NAMESPACE)

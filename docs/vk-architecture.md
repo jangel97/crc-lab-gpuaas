@@ -78,6 +78,14 @@ SyncResources
     │    vk.gpuaas.io/source-pod: <name>
     │
     ▼
+SyncHeadlessServices
+    │  List Services in the tenant namespace. For each headless Service
+    │  (ClusterIP=None) whose selector matches the pod's labels:
+    │    CREATE or UPDATE on worker with management labels.
+    │  Service name is NOT prefixed — must match pod subdomain for DNS.
+    │  Enables inter-pod DNS for distributed training (PyTorchJob).
+    │
+    ▼
 transformPod
     │  Deep-copy the pod spec and rewrite it for the worker cluster:
     │    - Name: {namespace}--{name}
@@ -100,6 +108,52 @@ Create pod on worker
 Record in managedPods map: "namespace/name" → worker pod name
 ```
 
+## Headless Service Sync
+
+`SyncHeadlessServices` runs after `SyncResources` in the dispatch path.
+It lists all Services in the pod's tenant namespace and syncs any headless
+Service (ClusterIP=None) whose selector matches the pod's labels.
+
+```
+tenant namespace (vk-test)              worker namespace (vk-workloads)
+┌──────────────────────────┐            ┌──────────────────────────┐
+│ Headless Service         │            │ Synced Headless Service  │
+│   name: job1-worker      │  sync ───> │   name: job1-worker      │
+│   selector:              │            │   selector:              │
+│     job-name: job1       │            │     job-name: job1       │
+│     replica-type: worker │            │     replica-type: worker │
+├──────────────────────────┤            ├──────────────────────────┤
+│ Pod (virtual)            │            │ Pod (real)               │
+│   name: job1-worker-0    │  dispatch  │   name: vk-test--job1-worker-0
+│   hostname: job1-worker-0│  ───────>  │   hostname: job1-worker-0│
+│   subdomain: job1-worker │            │   subdomain: job1-worker │
+│   labels:                │            │   labels:                │
+│     job-name: job1       │            │     job-name: job1       │
+│     replica-type: worker │            │     replica-type: worker │
+└──────────────────────────┘            └──────────────────────────┘
+```
+
+**DNS resolution on worker:**
+`job1-worker-0.job1-worker.vk-workloads.svc.cluster.local` resolves to
+the pod's IP because:
+1. The synced headless Service's selector matches the worker pod's labels
+2. The worker endpoint controller creates EndpointSlices
+3. The pod's `subdomain` matches the Service name
+4. CoreDNS on the worker resolves `<hostname>.<subdomain>.<ns>.svc.cluster.local`
+
+**Service name is NOT namespace-prefixed.** Unlike pod names (which get
+`{ns}--{name}` prefixing), the headless Service must keep its original name
+to match the pod's `subdomain` field. Name collisions are possible across
+tenant namespaces (same limitation as secrets/configmaps).
+
+**Non-fatal on error.** If headless Service sync fails (e.g., RBAC, network),
+the pod is still dispatched. Inter-pod DNS won't work, but the pod itself
+will run.
+
+**RBAC requirements:** The VK service account needs `list` on Services in
+tenant namespaces (tenant ClusterRole), and `get/create/update/delete` on
+Services in the worker namespace (worker ClusterRole).
+
 ## Status Sync
 
 The worker pod informer fires on every Add/Update of managed pods.
@@ -121,9 +175,9 @@ When a tenant pod is deleted (`handleTenantPodDeleted`):
 
 1. Remove entry from `managedPods` map
 2. Delete the worker pod
-3. `CleanupResources`: list secrets, configmaps, and service accounts on
-   worker matching the management labels for this source namespace + pod name,
-   delete each one
+3. `CleanupResources`: list secrets, configmaps, service accounts, and
+   headless services on worker matching the management labels for this
+   source namespace + pod name, delete each one
 
 Execution PVCs are **not** deleted on pod deletion — they persist across pod
 restarts. They are only deleted when the control PVC itself is deleted (handled
@@ -197,13 +251,18 @@ standard RBAC. The gap is on the worker side.
 without changing the sync logic. Resource name prefixing alone (like PVCs
 already do) would fix collisions but not network isolation.
 
-### No headless Service sync
+### Headless Service sync
 
-Distributed training frameworks (PyTorchJob multi-worker) rely on headless
-Services for inter-pod DNS discovery. The training operator creates the
-headless Service on the tenant, but GPU pods use worker-side CoreDNS which
-doesn't know about it. Single-pod training works; multi-pod training does
-not yet. See submariner-architecture.md §8.
+Headless Services (ClusterIP=None) whose selectors match a dispatched pod
+are synced to the worker namespace. This enables inter-pod DNS for
+distributed training (PyTorchJob multi-worker). The synced Service name is
+NOT namespace-prefixed — it must match the pod's `subdomain` field for DNS
+to work: `<hostname>.<subdomain>.<namespace>.svc.cluster.local`.
+
+PyTorchJob compatibility: the training operator creates headless Services
+with selector `training.kubeflow.org/job-name`. `transformPod` preserves
+these labels and the `hostname`/`subdomain` fields. The worker-side endpoint
+controller creates EndpointSlices matching the synced Service's selector.
 
 ### No Knative/KServe support
 

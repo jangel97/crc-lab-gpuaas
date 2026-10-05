@@ -144,10 +144,11 @@ Routes work transparently. See [docs/submariner-architecture.md](docs/submariner
 | Workload | Status | Notes |
 |----------|--------|-------|
 | Batch (PyTorchJob, nvidia-smi) | Working | No cross-cluster networking needed |
-| Notebooks | Ready to validate | Route → Service → EndpointSlice → Submariner tunnel → worker pod |
-| KServe (raw Deployment) | Ready to validate | Same path as Notebooks |
-| KServe (Knative-managed) | Not validated | Autoscaler, activator, queue-proxy need investigation |
-| Distributed training | Not validated | Headless Service sync to worker cluster may be needed |
+| Notebooks | Working | Route → Service → EndpointSlice → Submariner tunnel → worker pod (S10) |
+| KServe (raw Deployment) | Working | Same path as Notebooks (S9) |
+| KServe (Knative-managed) | Not validated | No Serverless operator installed |
+| Distributed training (DNS) | Working | Headless Service sync enables inter-pod DNS (S13) |
+| Tunnel failure/recovery | Working | Gateway restart → tunnel self-heals (S11) |
 
 ## Tests
 
@@ -172,18 +173,22 @@ python -m pytest tests/ -v -m networking
 
 ### Test Results (2026-10-02)
 
-All 9 tests pass.
+All 13 tests pass.
 
 ```
-tests/test_vk_gpu.py::test_virtual_node_exists                          PASSED
-tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk                    PASSED
-tests/test_vk_gpu.py::test_resource_sync                                PASSED
-tests/test_vk_gpu.py::test_pod_deletion_cleans_up                       PASSED
-tests/test_vk_gpu.py::test_catapult_pvc_sync                            PASSED
-tests/test_vk_gpu.py::test_non_catapult_pvc_rejected                    PASSED
-tests/test_rhoai_vk.py::test_pytorchjob_via_vk                         PASSED
-tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker                   PASSED
-tests/test_submariner_networking.py::test_gpu_service_via_submariner    PASSED
+tests/test_vk_gpu.py::test_virtual_node_exists                                PASSED
+tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk                          PASSED
+tests/test_vk_gpu.py::test_resource_sync                                      PASSED
+tests/test_vk_gpu.py::test_pod_deletion_cleans_up                             PASSED
+tests/test_vk_gpu.py::test_catapult_pvc_sync                                  PASSED
+tests/test_vk_gpu.py::test_non_catapult_pvc_rejected                          PASSED
+tests/test_vk_gpu.py::test_multitenant_secret_collision                       PASSED
+tests/test_rhoai_vk.py::test_pytorchjob_via_vk                               PASSED
+tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker                         PASSED
+tests/test_submariner_networking.py::test_gpu_service_via_submariner          PASSED
+tests/test_submariner_networking.py::test_notebook_workbench_via_submariner   PASSED
+tests/test_submariner_networking.py::test_submariner_tunnel_failure_recovery  PASSED
+tests/test_distributed_training.py::test_headless_service_dns_resolution     PASSED
 ```
 
 ### Test Descriptions
@@ -199,6 +204,10 @@ tests/test_submariner_networking.py::test_gpu_service_via_submariner    PASSED
 | `test_pytorchjob_via_vk` | rhoai | PyTorchJob CR on tenant → training operator creates master pod → VK dispatches to worker GPU → nvidia-smi succeeds → status synced → PyTorchJob condition Succeeded |
 | `test_no_rhoai_crds_on_worker` | rhoai | Worker cluster has no RHOAI CRDs (pytorchjobs, notebooks, inferenceservices, rayclusters) — confirms it stays a bare GPU node |
 | `test_gpu_service_via_submariner` | networking | GPU HTTP server dispatched to worker → Service on tenant → PodIP synced → EndpointSlice created → curl through Service via Submariner tunnel → HTTP 200 with RTX 5090 GPU info |
+| `test_notebook_workbench_via_submariner` | networking | Long-running GPU notebook server dispatched to worker → Service on tenant → pod stays Running → curl returns HTML with GPU info via Submariner tunnel |
+| `test_submariner_tunnel_failure_recovery` | networking | GPU server + Service working → kill Submariner gateway → verify outage → gateway restarts → tunnel re-establishes → connectivity restored |
+| `test_multitenant_secret_collision` | vk | Two namespaces create same-named Secret → VK syncs both to single worker namespace → second overwrites first → collision proven (documents known limitation) |
+| `test_headless_service_dns_resolution` | networking | Two pods with hostname/subdomain + headless Service → VK syncs Service to worker → Pod B resolves Pod A via DNS → inter-pod DNS works for distributed training |
 
 ### What the Tests Prove
 
@@ -214,6 +223,14 @@ tests/test_submariner_networking.py::test_gpu_service_via_submariner    PASSED
 5. **Cross-cluster networking works**: regular Services and Routes reach remote
    GPU pods via Submariner tunnel. VK syncs PodIP, Kubernetes creates
    EndpointSlices, Submariner provides L3 routing. No Submariner-specific code.
+6. **Interactive workloads (notebooks) work**: long-running GPU pods stay
+   Running and accessible through Submariner.
+7. **Submariner tunnel self-heals**: gateway failure → automatic restart →
+   tunnel re-establishes → connectivity restored.
+8. **Headless Service sync enables distributed training DNS**: inter-pod DNS
+   resolution works via synced headless Services.
+9. **Multi-tenant collision is documented and proven**: same-named resources
+   from different namespaces collide in the single worker namespace.
 
 For the full spike assessment with all scenarios, results, and gaps, see
 [docs/spike-assessment.md](docs/spike-assessment.md).

@@ -23,7 +23,6 @@ spec:
         args:
         - --nodename=gpu-worker
         - --worker-kubeconfig=/etc/vk/kubeconfig
-        - --worker-namespace=vk-workloads
         - --gpu-count=1
         - --default-remote-storage-class=lvms-vg1
         - --v=2

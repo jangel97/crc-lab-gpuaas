@@ -21,13 +21,13 @@
       subjects:
       - kind: ServiceAccount
         name: vk-remote-sa
-        namespace: {{ vk_worker_namespace }}
+        namespace: vk-workloads
   environment:
     KUBECONFIG: "{{ kubeconfig_dir }}/worker"
 
 - name: Grant privileged SCC to default SA in vk-workloads
   command: >
-    oc adm policy add-scc-to-user privileged -z default -n {{ vk_worker_namespace }}
+    oc adm policy add-scc-to-user privileged -z default -n vk-workloads
   environment:
     KUBECONFIG: "{{ kubeconfig_dir }}/worker"
 
@@ -46,7 +46,7 @@
       kind: Secret
       metadata:
         name: vk-remote-sa-token
-        namespace: {{ vk_worker_namespace }}
+        namespace: vk-workloads
         annotations:
           kubernetes.io/service-account.name: vk-remote-sa
       type: kubernetes.io/service-account-token
@@ -55,7 +55,7 @@
 
 - name: Wait for token to be populated
   shell: >
-    oc get secret vk-remote-sa-token -n {{ vk_worker_namespace }}
+    oc get secret vk-remote-sa-token -n vk-workloads
     -o jsonpath='{.data.token}'
   environment:
     KUBECONFIG: "{{ kubeconfig_dir }}/worker"
@@ -74,7 +74,7 @@
 
 - name: Get worker CA certificate
   shell: >
-    oc get secret vk-remote-sa-token -n {{ vk_worker_namespace }}
+    oc get secret vk-remote-sa-token -n vk-workloads
     -o jsonpath='{.data.ca\.crt}'
   environment:
     KUBECONFIG: "{{ kubeconfig_dir }}/worker"
