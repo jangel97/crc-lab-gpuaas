@@ -36,6 +36,7 @@ type GPUProviderConfig struct {
 	WorkerNamespacePrefix     string
 	GPUCount                  int
 	DefaultRemoteStorageClass string
+	TaintValue                string
 	TenantClient              kubernetes.Interface
 	WorkerClient              kubernetes.Interface
 }
@@ -399,8 +400,8 @@ func (p *GPUProvider) ConfigureNode(n *corev1.Node) {
 	n.Labels["node.kubernetes.io/gpu"] = "true"
 
 	n.Spec.Taints = []corev1.Taint{
-		{Key: "virtual-kubelet.io/provider", Value: "gpu-provider", Effect: corev1.TaintEffectNoSchedule},
-		{Key: "virtual-kubelet.io/provider", Value: "gpu-provider", Effect: corev1.TaintEffectNoExecute},
+		{Key: "virtual-kubelet.io/provider", Value: p.cfg.TaintValue, Effect: corev1.TaintEffectNoSchedule},
+		{Key: "virtual-kubelet.io/provider", Value: p.cfg.TaintValue, Effect: corev1.TaintEffectNoExecute},
 	}
 
 	gpuQty := resource.MustParse(fmt.Sprintf("%d", p.cfg.GPUCount))

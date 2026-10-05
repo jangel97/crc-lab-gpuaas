@@ -26,11 +26,17 @@ Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 1. VK registers a virtual node `gpu-worker` on the tenant with `nvidia.com/gpu: 1`
    in allocatable resources.
 2. Users submit pods with `nodeName: gpu-worker` and a toleration for the VK
-   taints (NoSchedule + NoExecute):
+   taints (NoSchedule + NoExecute, value configurable via `--taint-value`):
    ```yaml
    tolerations:
    - key: virtual-kubelet.io/provider
-     operator: Exists
+     value: catapult
+     operator: Equal
+     effect: NoSchedule
+   - key: virtual-kubelet.io/provider
+     value: catapult
+     operator: Equal
+     effect: NoExecute
    ```
 3. VK watches for pods assigned to its node, then:
    - Derives a per-tenant worker namespace (`{prefix}{tenant-ns}`) and creates it if needed
@@ -113,13 +119,26 @@ restarts and are deleted when the control PVC is deleted.
 
 ## VK Image
 
-The VK provider is a Go binary built from `cmd/vk-gpu-provider/`. It uses
-plain `k8s.io/client-go` (no virtual-kubelet library dependency).
+The VK provider is a Go binary built from `cmd/vk-gpu-provider/` using
+the `virtual-kubelet/virtual-kubelet` v1.11.0 library for pod lifecycle
+management (work queue with retry, node heartbeat, lease renewal).
 
 ```bash
 podman build -t quay.io/jmorenas/gpuaas-virtual-kubelet:latest -f cmd/vk-gpu-provider/Dockerfile .
 podman push quay.io/jmorenas/gpuaas-virtual-kubelet:latest
 ```
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--nodename` | `gpu-worker` | Name of the virtual node |
+| `--worker-kubeconfig` | *(required)* | Path to worker cluster kubeconfig |
+| `--kubeconfig` | *(in-cluster)* | Path to tenant cluster kubeconfig |
+| `--gpu-count` | `1` | Number of GPUs to advertise |
+| `--worker-namespace-prefix` | *(auto-generated)* | Prefix for per-tenant worker namespaces |
+| `--default-remote-storage-class` | `lvms-vg1` | StorageClass for execution PVCs on the GPU cluster |
+| `--taint-value` | `catapult` | Value for the `virtual-kubelet.io/provider` taint |
 
 ## Storage
 

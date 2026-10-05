@@ -32,6 +32,7 @@ func main() {
 		gpuCount                  int
 		tenantKubeconfig          string
 		defaultRemoteStorageClass string
+		taintValue                string
 	)
 
 	flag.StringVar(&nodeName, "nodename", "gpu-worker", "Name of the virtual node")
@@ -41,6 +42,8 @@ func main() {
 	flag.StringVar(&tenantKubeconfig, "kubeconfig", "", "Path to tenant cluster kubeconfig (empty = in-cluster)")
 	flag.StringVar(&defaultRemoteStorageClass, "default-remote-storage-class", "lvms-vg1",
 		"Default StorageClass for execution PVCs on the GPU cluster")
+	flag.StringVar(&taintValue, "taint-value", "catapult",
+		"Value for the virtual-kubelet.io/provider taint")
 	flag.Parse()
 
 	if workerKubeconfig == "" {
@@ -76,6 +79,7 @@ func main() {
 				WorkerNamespacePrefix:     workerNamespacePrefix,
 				GPUCount:                  gpuCount,
 				DefaultRemoteStorageClass: defaultRemoteStorageClass,
+				TaintValue:                taintValue,
 				TenantClient:              tenantClient,
 				WorkerClient:              workerClient,
 			})
