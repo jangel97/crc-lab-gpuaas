@@ -117,26 +117,28 @@ func resolveNamespacePrefix(ctx context.Context, client kubernetes.Interface) (s
 		return "", fmt.Errorf("get configmap %s/%s: %w", prefixConfigMapNS, prefixConfigMapName, err)
 	}
 
+	existingCM := cm
+	if errors.IsNotFound(err) {
+		existingCM = nil
+	}
+
 	b := make([]byte, 4)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("generate random prefix: %w", err)
 	}
 	prefix := "vk-" + hex.EncodeToString(b) + "-"
 
-	cmObj := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      prefixConfigMapName,
-			Namespace: prefixConfigMapNS,
-		},
-		Data: map[string]string{
-			"worker-namespace-prefix": prefix,
-		},
-	}
-
-	if cm != nil {
-		cm.Data = cmObj.Data
-		_, err = client.CoreV1().ConfigMaps(prefixConfigMapNS).Update(ctx, cm, metav1.UpdateOptions{})
+	if existingCM != nil {
+		existingCM.Data = map[string]string{"worker-namespace-prefix": prefix}
+		_, err = client.CoreV1().ConfigMaps(prefixConfigMapNS).Update(ctx, existingCM, metav1.UpdateOptions{})
 	} else {
+		cmObj := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      prefixConfigMapName,
+				Namespace: prefixConfigMapNS,
+			},
+			Data: map[string]string{"worker-namespace-prefix": prefix},
+		}
 		_, err = client.CoreV1().ConfigMaps(prefixConfigMapNS).Create(ctx, cmObj, metav1.CreateOptions{})
 	}
 	if err != nil {
