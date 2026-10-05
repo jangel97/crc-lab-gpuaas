@@ -125,6 +125,7 @@ func (p *GPUProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 			klog.Infof("Worker pod already exists for %s", key)
 			p.mu.Lock()
 			p.managedPods[key] = workerPod.Name
+			p.podCache[key] = pod.DeepCopy()
 			p.mu.Unlock()
 			return nil
 		}
@@ -135,6 +136,7 @@ func (p *GPUProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	klog.Infof("Created worker pod %s/%s for tenant pod %s", workerNS, created.Name, key)
 	p.mu.Lock()
 	p.managedPods[key] = created.Name
+	p.podCache[key] = pod.DeepCopy()
 	p.mu.Unlock()
 	return nil
 }
@@ -336,19 +338,34 @@ func (p *GPUProvider) handleWorkerPodEvent(obj interface{}) {
 
 	key := sourceNS + "/" + sourceName
 
-	tenantPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      sourceName,
-			Namespace: sourceNS,
-		},
-		Status: *workerPod.Status.DeepCopy(),
-	}
-
 	p.mu.Lock()
 	if _, exists := p.managedPods[key]; !exists {
 		p.managedPods[key] = workerPod.Name
 		klog.Infof("Recovered managed pod mapping: %s -> %s", key, workerPod.Name)
 	}
+	cached := p.podCache[key]
+	p.mu.Unlock()
+
+	var tenantPod *corev1.Pod
+	if cached != nil {
+		tenantPod = cached.DeepCopy()
+	} else {
+		freshPod, err := p.cfg.TenantClient.CoreV1().Pods(sourceNS).Get(context.TODO(), sourceName, metav1.GetOptions{})
+		if err != nil {
+			klog.Warningf("Cannot read tenant pod %s for metadata: %v", key, err)
+			tenantPod = &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sourceName,
+					Namespace: sourceNS,
+				},
+			}
+		} else {
+			tenantPod = freshPod
+		}
+	}
+	tenantPod.Status = *workerPod.Status.DeepCopy()
+
+	p.mu.Lock()
 	p.podCache[key] = tenantPod
 	cb := p.notifyCb
 	p.mu.Unlock()
