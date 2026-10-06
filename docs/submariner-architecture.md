@@ -198,11 +198,25 @@ if tenantPod.Status.Phase == workerPod.Status.Phase &&
 
 **Design constraint**: This code must NOT embed assumptions about globally unique Pod CIDRs. The PodIP sync is a mechanical copy of whatever IP the execution pod reports. Whether that IP is globally unique (non-overlapping CIDRs) or requires translation (Globalnet) is an infrastructure concern, not a Catapult concern. If Globalnet is needed in production, the translation layer belongs outside Catapult — either as a separate adapter or as a future Catapult extension point. The PoC validates the mechanism; the CIDR constraint belongs in deployment configuration and documentation.
 
-### 3.2 Sync headless Services to GPU cluster (deferred)
+### 3.2 Sync headless Services to GPU cluster (implemented)
 
-For distributed training, the training operator creates a headless Service on the control cluster. GPU pods use GPU-side DNS, which doesn't know about control cluster Services. Catapult may need to sync headless Services.
+For distributed training, the training operator creates headless Services on
+the tenant cluster. GPU pods run on the worker where DNS doesn't know about
+tenant Services. VK syncs headless Services whose selectors match dispatched
+pods to the worker namespace, enabling inter-pod DNS resolution.
 
-**Do not implement yet.** First create a small multi-pod experiment (Validation §9) and determine exactly what DNS/service behavior the remotely executing pods require. Then decide whether syncing headless Services is the correct abstraction.
+**Implementation:** `SyncHeadlessServices` runs after `SyncResources` in the
+dispatch path. It lists all Services in the tenant namespace and syncs any
+headless Service (`ClusterIP=None`) whose selector matches the pod's labels.
+The Service name is NOT namespace-prefixed — it must match the pod's
+`subdomain` field for CoreDNS to resolve
+`<hostname>.<subdomain>.<namespace>.svc.cluster.local`.
+
+**Validated in S13** (`test_headless_service_dns_resolution`): two pods with
+hostname/subdomain + headless Service on tenant → VK syncs Service to worker
+→ Pod B resolves Pod A via DNS. See [vk-architecture.md](vk-architecture.md)
+for the full design and [spike-assessment.md](spike-assessment.md) S13 for
+test details.
 
 ### 3.3 What does NOT change
 
@@ -221,12 +235,12 @@ For distributed training, the training operator creates a headless Service on th
 | Resource | Already synced | Change needed |
 |----------|---------------|---------------|
 | Pod (create on GPU cluster) | Yes | No |
-| Pod status (GPU → control) | Yes (partial) | **Add PodIP/PodIPs** |
+| Pod status (GPU → control) | Yes | No — PodIP/PodIPs included |
 | Secrets | Yes | No |
 | ConfigMaps | Yes | No |
 | ServiceAccounts | Yes | No |
 | PVCs (catapult class) | Yes | No |
-| **Headless Services** | **No** | **Deferred — validate need first (§V.9)** |
+| Headless Services | Yes | No — synced for inter-pod DNS (S13) |
 | ClusterIP Services | No | Not needed — endpoint controller handles it via PodIP |
 | Routes | No | Not needed — HAProxy uses Service endpoints |
 | ServiceExport/Import | No | Not needed — we use regular Services + PodIP |
@@ -339,9 +353,12 @@ The training operator creates these on the control cluster. Catapult dispatches 
 
 3. Keeping it in Catapult maintains the clean abstraction — Catapult handles all GPU-side resource creation, Submariner handles only L3 routing.
 
-### Do not implement yet
+### Status: implemented and validated
 
-First create a small multi-pod experiment (Validation §9) and determine exactly what DNS/service behavior the remotely executing pods require. Then decide whether syncing headless Services is actually the correct abstraction.
+Headless Service sync is implemented in `SyncHeadlessServices` and validated
+in S13 (`test_headless_service_dns_resolution`). Inter-pod DNS resolution
+works on the worker via synced headless Services — the correct abstraction
+for distributed training.
 
 ### When would Lighthouse/ServiceExport matter?
 
@@ -532,7 +549,7 @@ Control cluster ←──tunnel──→ GPU cluster A (RTX 5090)
 
 1. **Globalnet performance** — if overlapping CIDRs are unavoidable, all traffic through NAT on gateway node. Could bottleneck GPU data transfers.
 2. **No namespace-level isolation** — flat L3 network. Multi-tenant needs careful NetworkPolicy.
-3. **OCP 4.22 not yet GA for Submariner** — may need to run OCP 4.21 for the PoC or wait.
+3. **OCP 4.22 Submariner support** — validated in this spike with Submariner v0.24 on OCP 4.22 (tenant) and OCP 4.18 (tenant2). Both work.
 
 ---
 
@@ -802,24 +819,22 @@ Start with raw vLLM Deployment (not Knative-managed).
 | Readiness/probing | Unknown | Test probe latency through tunnel |
 | Controllers expecting local execution | Unknown | Verify revision/configuration controllers handle virtual node |
 
-### V.9 Headless Services
+### V.9 Headless Services — VALIDATED
 
-**Do not implement Service synchronization yet.**
+Headless Service sync is implemented and validated in S13
+(`test_headless_service_dns_resolution`).
 
-First create a small multi-pod experiment:
-
-1. Deploy 2 pods on the GPU cluster manually (not via Catapult)
-2. Create a headless Service on the GPU cluster selecting those pods
-3. From pod A, resolve pod B via DNS: `pod-b.<svc>.<ns>.svc.cluster.local`
-4. Verify inter-pod connectivity via the headless Service
-
-Then determine:
-- What DNS names do training frameworks actually query?
-- Does `hostname` / `subdomain` on the pod spec matter?
-- Does the PyTorchJob training operator set `hostname` on pods?
-- Would the mirror Service on the GPU cluster need EndpointSlice management, or does the GPU-side endpoint controller handle it?
-
-Then decide whether syncing headless Services is the correct abstraction, or if something else (e.g., injecting DNS config) is simpler.
+**Answers to the original questions:**
+- Training frameworks query `<hostname>.<subdomain>.<ns>.svc.cluster.local`
+- `hostname` / `subdomain` on the pod spec are essential — they tell CoreDNS
+  which pods belong to which headless Service
+- The PyTorchJob training operator sets `hostname` on pods via the pod
+  template's `hostname` field
+- The GPU-side endpoint controller handles EndpointSlice management
+  automatically — no custom EndpointSlice code needed
+- Syncing headless Services IS the correct abstraction — the Service name
+  must match the pod's `subdomain` field, and the selector must match the
+  pod's labels. VK preserves both during `transformPod`.
 
 ### V.10 Globalnet
 
