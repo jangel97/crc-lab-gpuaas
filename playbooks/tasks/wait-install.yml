@@ -15,7 +15,7 @@
 
 - name: "{{ cluster }} | Wait for agent-based install"
   command: >
-    {{ ansible_env.HOME }}/.local/bin/openshift-install agent wait-for install-complete
+    {{ local_bin }}/openshift-install-{{ c.ocp_version | default(ocp_version) }} agent wait-for install-complete
     --dir {{ work_dir }}/{{ cluster }}
     --log-level info
   async: 3600

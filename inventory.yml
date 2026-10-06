@@ -27,9 +27,11 @@ all:
     clusters:
       hosts:
         tenant:
+          ocp_version: "4.22"
+          role: tenant
           vm_name: sno-tenant
           vm_cpus: 12
-          vm_ram_mb: 16384
+          vm_ram_mb: 14336
           vm_disk_gb: 120
           vm_mac: "52:54:00:aa:bb:01"
           vm_ip: "192.168.122.10"
@@ -39,9 +41,26 @@ all:
           cluster_network_prefix: 23
           service_network_cidr: "172.30.0.0/16"
           components:
-            kueue: false
+            rhoai: true
+        tenant2:
+          ocp_version: "4.18"
+          role: tenant
+          vm_name: sno-tenant2
+          vm_cpus: 10
+          vm_ram_mb: 14336
+          vm_disk_gb: 120
+          vm_mac: "52:54:00:aa:bb:03"
+          vm_ip: "192.168.122.12"
+          gpu_passthrough: false
+          data_disk_gb: 50
+          cluster_network_cidr: "10.136.0.0/14"
+          cluster_network_prefix: 23
+          service_network_cidr: "172.32.0.0/16"
+          components:
             rhoai: true
         worker:
+          role: worker
+          ocp_version: "4.22"
           vm_name: sno-worker
           vm_cpus: 8
           vm_ram_mb: 24576

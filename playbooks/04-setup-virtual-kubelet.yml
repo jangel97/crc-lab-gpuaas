@@ -8,6 +8,10 @@
     PATH: "{{ local_bin }}:{{ lookup('env', 'PATH') }}"
 
   tasks:
+  - name: Identify tenant clusters
+    set_fact:
+      tenant_clusters: "{{ groups['clusters'] | select('match', 'tenant') | list }}"
+
   # Step 1: Build and push VK image
   - name: Build and push VK image
     include_tasks: tasks/build-vk-image.yml
@@ -16,25 +20,29 @@
   - name: Set up VK worker resources
     include_tasks: tasks/setup-vk-worker.yml
 
-  # Step 3: Deploy VK on tenant (Secret, RBAC, Deployment)
+  # Step 3: Deploy VK on each tenant
   - name: Deploy VK on tenant
     include_tasks: tasks/deploy-vk-tenant.yml
+    loop: "{{ tenant_clusters }}"
+    loop_control:
+      loop_var: tenant_cluster
+    vars:
+      tenant_kubeconfig: "{{ kubeconfig_dir }}/{{ tenant_cluster }}"
 
-  # Step 4: Create test namespace on tenant
-  - name: Create test namespace on tenant
+  # Step 4: Create test namespace on each tenant
+  - name: Create test namespace on tenants
     command: >
       oc create namespace {{ vk_test_namespace }}
-      --kubeconfig {{ kubeconfig_dir }}/tenant
-    register: ns_tenant
-    failed_when: ns_tenant.rc != 0 and 'already exists' not in (ns_tenant.stderr | default(''))
-    changed_when: ns_tenant.rc == 0
+      --kubeconfig {{ kubeconfig_dir }}/{{ item }}
+    loop: "{{ tenant_clusters }}"
+    register: ns_result
+    failed_when: ns_result.rc != 0 and 'already exists' not in (ns_result.stderr | default(''))
+    changed_when: ns_result.rc == 0
 
   # Step 5: Print status
   - name: Print VK status
     debug:
       msg: |
-        Virtual Kubelet deployed.
+        Virtual Kubelet deployed on {{ tenant_clusters | join(', ') }}.
         Virtual node: {{ vk_node_name }}
-        Worker namespace: {{ vk_worker_namespace }}
         Test namespace: {{ vk_test_namespace }}
-        Submit pods on tenant with nodeName: {{ vk_node_name }}

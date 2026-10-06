@@ -11,6 +11,10 @@
   register: broker_deploy
   changed_when: "'Deploying the broker' in broker_deploy.stdout"
 
+- name: Identify tenant clusters
+  set_fact:
+    tenant_clusters: "{{ groups['clusters'] | select('match', 'tenant') | list }}"
+
 - name: Join GPU cluster to broker
   command: >
     subctl join
@@ -22,31 +26,36 @@
   register: gpu_join
   changed_when: "'Deploying submariner' in gpu_join.stdout"
 
-- name: Join control cluster to broker
+- name: Join tenant clusters to broker
   command: >
     subctl join
-    --kubeconfig {{ kubeconfig_dir }}/tenant
+    --kubeconfig {{ kubeconfig_dir }}/{{ item }}
     {{ work_dir }}/broker-info.subm
-    --clusterid control
+    --clusterid {{ item }}
     --natt=false
     --cable-driver libreswan
-  register: control_join
-  changed_when: "'Deploying submariner' in control_join.stdout"
+  loop: "{{ tenant_clusters }}"
+  register: tenant_join
+  changed_when: "'Deploying submariner' in (tenant_join.stdout | default(''))"
 
-- name: Wait for Submariner tunnel to connect
+- name: Wait for Submariner tunnels to connect
   shell: >
-    subctl show connections --kubeconfig {{ kubeconfig_dir }}/tenant 2>&1
+    subctl show connections --kubeconfig {{ kubeconfig_dir }}/{{ item }} 2>&1
   register: sub_conn
   retries: 12
   delay: 10
   until: "'connected' in sub_conn.stdout"
   changed_when: false
+  loop: "{{ tenant_clusters }}"
 
 - name: Print connection status
   debug:
-    msg: "{{ sub_conn.stdout }}"
+    msg: "{{ item.stdout }}"
+  loop: "{{ sub_conn.results }}"
+  loop_control:
+    label: "{{ item.item }}"
 
-# Verify cross-cluster pod connectivity
+# Verify cross-cluster pod connectivity (worker ↔ first tenant)
 - name: Create verification pod on worker
   command:
     cmd: oc apply -f -
@@ -63,7 +72,7 @@
   environment:
     KUBECONFIG: "{{ kubeconfig_dir }}/worker"
 
-- name: Create verification pod on tenant
+- name: Create verification pod on each tenant
   command:
     cmd: oc apply -f -
     stdin: |
@@ -77,68 +86,60 @@
         - name: nginx
           image: docker.io/library/nginx:latest
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}"
+  loop: "{{ tenant_clusters }}"
 
-- name: Wait for verification pods to be ready
+- name: Wait for worker verification pod
   shell: >
-    oc wait pod/submariner-verify -n {{ item.ns }}
+    oc wait pod/submariner-verify -n {{ vk_worker_namespace }}
     --for=condition=Ready --timeout=120s
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item.cluster }}"
-  loop:
-    - { cluster: worker, ns: "{{ vk_worker_namespace }}" }
-    - { cluster: tenant, ns: "{{ vk_test_namespace }}" }
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
 
-- name: Get verification pod IPs
+- name: Wait for tenant verification pods
   shell: >
-    oc get pod submariner-verify -n {{ item.ns }}
+    oc wait pod/submariner-verify -n {{ vk_test_namespace }}
+    --for=condition=Ready --timeout=120s
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}"
+  loop: "{{ tenant_clusters }}"
+
+- name: Get worker verification pod IP
+  shell: >
+    oc get pod submariner-verify -n {{ vk_worker_namespace }}
     -o jsonpath='{.status.podIP}'
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item.cluster }}"
-  register: verify_ips
-  loop:
-    - { cluster: worker, ns: "{{ vk_worker_namespace }}" }
-    - { cluster: tenant, ns: "{{ vk_test_namespace }}" }
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+  register: worker_verify_ip
   changed_when: false
 
-- name: Test cross-cluster connectivity (tenant → worker)
+- name: Test cross-cluster connectivity (each tenant → worker)
   shell: >
     oc exec -n {{ vk_test_namespace }} submariner-verify --
     curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10
-    http://{{ verify_ips.results[0].stdout }}
+    http://{{ worker_verify_ip.stdout }}
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
-  register: conn_test_fwd
+    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}"
+  loop: "{{ tenant_clusters }}"
+  register: conn_tests
   retries: 3
   delay: 5
-  until: conn_test_fwd.stdout == '200'
+  until: conn_tests.stdout == '200'
   changed_when: false
 
-- name: Test cross-cluster connectivity (worker → tenant)
-  shell: >
-    oc exec -n {{ vk_worker_namespace }} submariner-verify --
-    curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10
-    http://{{ verify_ips.results[1].stdout }}
+- name: Delete worker verification pod
+  command: >
+    oc delete pod submariner-verify --ignore-not-found -n {{ vk_worker_namespace }}
   environment:
     KUBECONFIG: "{{ kubeconfig_dir }}/worker"
-  register: conn_test_rev
-  retries: 3
-  delay: 5
-  until: conn_test_rev.stdout == '200'
-  changed_when: false
 
-- name: Delete verification pods
+- name: Delete tenant verification pods
   command: >
-    oc delete pod submariner-verify -n {{ item.ns }}
+    oc delete pod submariner-verify --ignore-not-found -n {{ vk_test_namespace }}
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item.cluster }}"
-  loop:
-    - { cluster: worker, ns: "{{ vk_worker_namespace }}" }
-    - { cluster: tenant, ns: "{{ vk_test_namespace }}" }
+    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}"
+  loop: "{{ tenant_clusters }}"
 
 - name: Print verification result
   debug:
-    msg: |
-      Submariner cross-cluster connectivity verified.
-      Tenant → Worker: HTTP {{ conn_test_fwd.stdout }}
-      Worker → Tenant: HTTP {{ conn_test_rev.stdout }}
+    msg: "Submariner connectivity verified for {{ tenant_clusters | join(', ') }}"

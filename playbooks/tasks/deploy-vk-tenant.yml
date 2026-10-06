@@ -8,7 +8,7 @@
 - name: Delete old worker-kubeconfig Secret on tenant (if exists)
   command: oc delete secret worker-kubeconfig -n kube-system --ignore-not-found
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+    KUBECONFIG: "{{ tenant_kubeconfig | default(kubeconfig_dir + '/tenant') }}"
 
 - name: Create worker-kubeconfig Secret on tenant
   command: >
@@ -16,7 +16,7 @@
     -n kube-system
     --from-file=kubeconfig=/tmp/vk-worker-kubeconfig
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+    KUBECONFIG: "{{ tenant_kubeconfig | default(kubeconfig_dir + '/tenant') }}"
 
 - name: Remove temp kubeconfig file
   file:
@@ -28,21 +28,21 @@
     cmd: oc apply -f -
     stdin: "{{ lookup('file', playbook_dir + '/../deploy/vk-rbac.yml') }}"
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+    KUBECONFIG: "{{ tenant_kubeconfig | default(kubeconfig_dir + '/tenant') }}"
 
 - name: Apply VK Deployment on tenant
   command:
     cmd: oc apply -f -
     stdin: "{{ lookup('file', playbook_dir + '/../deploy/vk-deployment.yml') }}"
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+    KUBECONFIG: "{{ tenant_kubeconfig | default(kubeconfig_dir + '/tenant') }}"
 
 - name: Wait for VK pod to be Ready
   command: >
     oc wait deployment -n kube-system vk-gpu-provider
     --for=condition=Available --timeout=120s
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+    KUBECONFIG: "{{ tenant_kubeconfig | default(kubeconfig_dir + '/tenant') }}"
   retries: 3
   delay: 10
   register: vk_ready
@@ -53,7 +53,7 @@
     oc get node {{ vk_node_name }}
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
   environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/tenant"
+    KUBECONFIG: "{{ tenant_kubeconfig | default(kubeconfig_dir + '/tenant') }}"
   register: vk_node_status
   retries: 12
   delay: 10

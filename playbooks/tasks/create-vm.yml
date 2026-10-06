@@ -31,7 +31,7 @@
 
 - name: "{{ cluster }} | Generate agent ISO"
   command: >
-    {{ local_bin }}/openshift-install agent create image
+    {{ local_bin }}/openshift-install-{{ c.ocp_version | default(ocp_version) }} agent create image
     --dir {{ work_dir }}/{{ cluster }}
   environment:
     PATH: "{{ local_bin }}:{{ ansible_env.PATH }}"
