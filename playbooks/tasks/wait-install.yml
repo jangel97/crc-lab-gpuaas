@@ -47,6 +47,14 @@
   until: vm_ip.stdout | length > 0
   changed_when: false
 
+- name: "{{ cluster }} | Ensure /etc/hosts entries"
+  become: true
+  lineinfile:
+    path: /etc/hosts
+    regexp: ".*api(-int)?\\.{{ cluster }}\\.{{ base_domain }}.*"
+    line: "{{ vm_ip.stdout }} api.{{ cluster }}.{{ base_domain }} api-int.{{ cluster }}.{{ base_domain }}"
+    state: present
+
 - name: "{{ cluster }} | Add to in-memory inventory"
   add_host:
     name: "{{ cluster }}"

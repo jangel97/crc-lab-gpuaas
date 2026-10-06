@@ -41,7 +41,7 @@
     become: true
     command: >
       virsh net-update default add ip-dhcp-host
-      '<host mac="{{ hostvars[item].vm_mac }}" ip="{{ hostvars[item].vm_ip }}"/>'
+      '<host mac="{{ hostvars[item].vm_mac }}" name="{{ hostvars[item].vm_name }}" ip="{{ hostvars[item].vm_ip }}"/>'
       --live --config
     loop: "{{ groups['clusters'] }}"
     register: dhcp_result
