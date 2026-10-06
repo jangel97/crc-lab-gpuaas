@@ -596,20 +596,19 @@ three approaches, all of which fail:
    `tolerations` field only applies to the gateway DaemonSet. The
    routeagent always gets the hardcoded `operator: Exists` toleration.
 
-**Possible fixes:**
+**Applied fix:** VK now skips any pod with a DaemonSet `ownerReference`
+in `CreatePod`. This is a general fix — not just for Submariner — since
+DaemonSet pods are node-level infrastructure that should never be
+dispatched cross-cluster. The routeagent pod still shows `Pending` on
+the virtual node (DaemonSet controller keeps creating it, but the virtual
+node has no real kubelet to run it), but it is no longer dispatched to
+the worker and generates no API traffic.
 
-- **VK-side: add `submariner-operator` to the system namespace skip list.**
-  This prevents VK from dispatching the pod to the worker. The pod would
-  still show `Init:0/1` on the tenant (no real kubelet on the virtual node),
-  but it wouldn't run on the worker or generate API traffic. This is the
-  simplest fix.
-
-- **Upstream Submariner: add a `routeAgentNodeSelector` field** to the CR
-  so operators can exclude virtual nodes.
-
-- **Mutating admission webhook** on the tenant that injects a nodeAffinity
-  anti-rule for `type=virtual-kubelet` into pods from the
-  `submariner-operator` namespace.
+**Remaining cosmetic issue:** The routeagent pod on the virtual node
+shows as `Pending` indefinitely. This cannot be fixed without an upstream
+Submariner change (e.g., a `routeAgentNodeSelector` field in the CR) or
+a mutating admission webhook that injects a nodeAffinity anti-rule for
+`type=virtual-kubelet`.
 
 ### Kubelet API server requires privileged SCC
 
