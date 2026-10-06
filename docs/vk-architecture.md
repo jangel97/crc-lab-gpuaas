@@ -1,7 +1,9 @@
 # Virtual Kubelet (Catapult) Architecture
 
 Custom Virtual Kubelet that dispatches pods from a tenant cluster to a GPU
-worker cluster. Plain `k8s.io/client-go` — no virtual-kubelet library.
+worker cluster. Built on the `virtual-kubelet/virtual-kubelet` v1.11.0
+library for production-grade pod lifecycle management (work queue with
+retry, node heartbeat, lease renewal).
 
 ## Source Layout
 
@@ -19,31 +21,40 @@ cmd/vk-gpu-provider/
 `main.go` parses flags, builds two Kubernetes clients (tenant + worker),
 resolves the worker namespace prefix (from `--worker-namespace-prefix` flag
 or auto-generated and persisted in ConfigMap `vk-gpu-provider-config` in
-`kube-system`), and calls `provider.Run(ctx)`. The provider:
+`kube-system`), and creates a `nodeutil.Node` via the VK library. The
+provider implements `PodLifecycleHandler`, `PodNotifier`, and `NodeProvider`.
 
-1. **Registers the virtual node** on the tenant cluster (`registerNode`).
-   Creates or updates a Node object `gpu-worker` with labels
-   (`node.kubernetes.io/gpu: true`), taints (NoSchedule + NoExecute for
-   `virtual-kubelet.io/provider`), and a status advertising GPU capacity.
+1. **Node registration and heartbeat** are handled by the VK library's
+   `PodController` and `NodeController`. The library creates or updates the
+   Node object, manages the Lease in `kube-node-lease`, and calls
+   `ConfigureNode` to set labels (`node.kubernetes.io/gpu: true`), taints
+   (NoSchedule + NoExecute for `virtual-kubelet.io/provider`), capacity
+   (GPU count, CPU, memory), and the node's InternalIP + kubelet port.
 
-2. **Starts the heartbeat loop** (`heartbeatLoop`). Every 10 seconds: renews
-   the node Lease in `kube-node-lease` and refreshes the Node status
-   (conditions, capacity). Keeps the node Ready so the scheduler trusts it.
+2. **Starts the worker pod informer** (our own, not managed by the library).
+   Filtered `ListWatch` across **all namespaces** for pods with label
+   `app.kubernetes.io/managed-by: vk-gpu-provider`. On Add/Update: rebuilds
+   the `managedPods` map (tenant key → worker pod name) and syncs worker pod
+   status back to the tenant virtual pod via `NotifyPods` callback. This
+   informer starts first so that on restart the provider recovers its state
+   from existing worker pods without re-dispatching.
 
-3. **Starts the worker pod informer.** Filtered `ListWatch` across **all
-   namespaces** for pods with label `app.kubernetes.io/managed-by: vk-gpu-provider`.
-   On Add/Update: rebuilds the `managedPods` map (tenant key → worker pod name)
-   and syncs worker pod status back to the tenant virtual pod. This informer
-   starts first so that on restart the provider recovers its state from existing
-   worker pods without re-dispatching.
-
-4. **Starts the control PVC informer.** Watches all PersistentVolumeClaims on
+3. **Starts the control PVC informer.** Watches all PersistentVolumeClaims on
    the tenant. On Delete: if the PVC has `storageClassName: catapult`, deletes
    the corresponding execution PVC on the worker.
 
-5. **Starts the tenant pod informer** (blocking). Filtered `ListWatch` across
-   all namespaces for pods assigned to the virtual node
-   (`spec.nodeName = gpu-worker`). On Add/Update: dispatch. On Delete: cleanup.
+4. **Starts the kubelet API server** (if `--kubelet-cert` is provided). An
+   HTTPS server on port 10350 (configurable via `--kubelet-port`) that handles
+   `kubectl logs`, `kubectl exec`, and `kubectl attach` requests. Uses the
+   node's existing kubelet serving cert for TLS. The VK library's
+   `AttachProviderRoutes` wires `GetContainerLogs` (and other provider
+   methods) to the HTTP handler. Requires `hostNetwork: true` so the server
+   binds on the node IP matching the cert SANs.
+
+5. **The VK library starts the tenant pod informer** and its work queue.
+   Pods assigned to the virtual node trigger `CreatePod` / `UpdatePod` /
+   `DeletePod` on the provider. The library handles retries, rate limiting,
+   and concurrent workers (`runtime.NumCPU()`).
 
 ## Dispatch Loop
 
@@ -166,7 +177,13 @@ Services in the worker namespace (worker ClusterRole).
 ## Status Sync
 
 The worker pod informer fires on every Add/Update of managed pods.
-`syncStatusToTenant` copies:
+`handleWorkerPodEvent` copies the full worker pod status to the cached
+tenant pod and calls the `NotifyPods` callback. The VK library then calls
+`GetPodStatus` and patches the tenant pod via its own status sync loop.
+
+The cached tenant pod preserves the original tenant pod metadata (labels,
+annotations, UID, etc.) while replacing status with the worker pod's status,
+which includes:
 
 - Phase, Message, Reason
 - Conditions
@@ -174,9 +191,6 @@ The worker pod informer fires on every Add/Update of managed pods.
 - StartTime
 - **PodIP, PodIPs** — the worker pod's real IP, which makes Services/Routes
   on the tenant work via Submariner (see submariner-architecture.md §3.1)
-
-Change detection avoids unnecessary updates: only writes to tenant if Phase,
-PodIP, or container Ready/RestartCount changed.
 
 ## Deletion and Cleanup
 
@@ -287,6 +301,45 @@ Knative-managed inference (autoscaling, scale-to-zero, queue-proxy) is not
 validated. Raw Deployment-based inference works. See
 submariner-architecture.md §7.
 
+## Kubelet API Server (Log Proxying)
+
+When `--kubelet-cert` is provided, the VK starts an HTTPS server that
+implements the kubelet API endpoints for logs, exec, and attach. This
+allows `kubectl logs` and `oc logs` to work transparently against pods
+on the virtual node.
+
+```
+kubectl logs my-pod -n vk-test
+    │
+    ▼
+API server → GET https://{nodeIP}:10350/containerLogs/vk-test/my-pod/container
+    │
+    ▼
+VK kubelet API server (provider.GetContainerLogs)
+    │  Look up worker pod name from managedPods map
+    │  Compute worker namespace from prefix + tenant namespace
+    │  Forward log options (follow, tail, since, timestamps)
+    │
+    ▼
+worker API server → GET /api/v1/namespaces/{wns}/pods/{wpod}/log
+    │
+    ▼
+Stream response back to kubectl
+```
+
+**Requirements:**
+- `hostNetwork: true` — the API server must bind on the node IP matching
+  the kubelet cert SANs
+- Kubelet serving cert at `/var/lib/kubelet/pki/kubelet-server-current.pem`
+  (combined cert+key PEM, already trusted by the API server's
+  `--kubelet-certificate-authority`)
+- Port 10350 (must differ from real kubelet on 10250)
+- Privileged SCC for the VK service account (OpenShift)
+
+**Supported operations:** `GetContainerLogs` (full logs, follow, tail,
+since, timestamps, limit-bytes). `RunInContainer`, `AttachToContainer`,
+and `PortForward` return "not supported".
+
 ## CLI Flags
 
 | Flag | Default | Description |
@@ -297,3 +350,7 @@ submariner-architecture.md §7.
 | `--gpu-count` | `1` | GPUs advertised in node capacity |
 | `--kubeconfig` | in-cluster | Tenant cluster kubeconfig (empty = in-cluster) |
 | `--default-remote-storage-class` | `lvms-vg1` | Default StorageClass for execution PVCs |
+| `--taint-value` | `catapult` | Value for the `virtual-kubelet.io/provider` taint |
+| `--insecure-skip-tls-verify` | `false` | Skip TLS cert verification for API servers |
+| `--kubelet-cert` | *(none)* | PEM file with cert+key for kubelet API TLS (enables `kubectl logs`) |
+| `--kubelet-port` | `10350` | Port for kubelet API server (must differ from real kubelet 10250) |
