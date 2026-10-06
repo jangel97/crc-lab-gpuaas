@@ -605,10 +605,17 @@ node has no real kubelet to run it), but it is no longer dispatched to
 the worker and generates no API traffic.
 
 **Remaining cosmetic issue:** The routeagent pod on the virtual node
-shows as `Pending` indefinitely. This cannot be fixed without an upstream
-Submariner change (e.g., a `routeAgentNodeSelector` field in the CR) or
-a mutating admission webhook that injects a nodeAffinity anti-rule for
-`type=virtual-kubelet`.
+shows as `Pending` indefinitely. This is stable and has no functional
+impact: no container runs, no CPU/memory is consumed, no API calls are
+generated. Submariner routing works fully — the real routeagent on the
+tenant SNO node handles all iptables rules and cross-cluster routes (all
+networking tests pass: S9, S10, S11, S13). The only consequence is a
+visible `Pending` pod in `oc get pods -n submariner-operator` that may
+trigger monitoring alerts if pod-health checks are configured.
+
+This cannot be fixed without an upstream Submariner change (e.g., a
+`routeAgentNodeSelector` field in the CR) or a mutating admission webhook
+that injects a nodeAffinity anti-rule for `type=virtual-kubelet`.
 
 ### Kubelet API server requires privileged SCC
 

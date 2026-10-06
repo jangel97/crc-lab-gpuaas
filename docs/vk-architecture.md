@@ -291,8 +291,11 @@ check, VK dispatched it to the worker where its init container
 
 The routeagent pod still shows as `Pending` on the virtual node (the
 DaemonSet controller keeps creating it, but with no real kubelet it can't
-run). This is cosmetic and does not affect Submariner routing — the real
-routeagent on the tenant SNO node handles all cross-cluster traffic.
+run). This is stable and has no functional impact: no container runs, no
+resources are consumed, no API calls are generated. Submariner routing
+works fully — the real routeagent on the tenant SNO node handles all
+iptables rules and cross-cluster routes. The only consequence is a visible
+`Pending` pod that may trigger monitoring alerts.
 
 ## SecurityContext Handling
 
