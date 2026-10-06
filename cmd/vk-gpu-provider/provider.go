@@ -75,6 +75,10 @@ func (p *GPUProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if isSystemNamespace(pod.Namespace) {
 		return nil
 	}
+	if isDaemonSetPod(pod) {
+		klog.V(2).Infof("Skipping DaemonSet-owned pod %s/%s", pod.Namespace, pod.Name)
+		return nil
+	}
 
 	key := pod.Namespace + "/" + pod.Name
 
@@ -528,6 +532,15 @@ func isSystemNamespace(ns string) bool {
 		strings.HasPrefix(ns, "redhat-ods-") ||
 		ns == "default" ||
 		ns == "kueue-system"
+}
+
+func isDaemonSetPod(pod *corev1.Pod) bool {
+	for _, ref := range pod.OwnerReferences {
+		if ref.Kind == "DaemonSet" {
+			return true
+		}
+	}
+	return false
 }
 
 var labelSkipSet = map[string]bool{
