@@ -1,3 +1,8 @@
+// TODO: extract resource-sync logic into a standalone library (e.g. pkg/resourcesync)
+// so it can be reused by other consumers (kueue-populator, AdmissionCheck controllers,
+// syncer-service, etc.). The API surface: Syncer struct with SyncForPod, Cleanup, and
+// PVC catapult handling. No virtual-kubelet or Kueue dependency.
+// Ref: https://github.com/kubernetes-sigs/kueue/issues/16504#issuecomment-6019740204
 package main
 
 import (
