@@ -37,6 +37,8 @@ type GPUProviderConfig struct {
 	GPUCount                  int
 	DefaultRemoteStorageClass string
 	TaintValue                string
+	NodeIP                    string
+	KubeletPort               int32
 	TenantClient              kubernetes.Interface
 	WorkerClient              kubernetes.Interface
 }
@@ -431,6 +433,9 @@ func (p *GPUProvider) storeAndNotify(pod *corev1.Pod, phase corev1.PodPhase, rea
 
 // ConfigureNode sets up the virtual node spec with GPU capacity and VK taints.
 func (p *GPUProvider) ConfigureNode(n *corev1.Node) {
+	if n.Labels == nil {
+		n.Labels = make(map[string]string)
+	}
 	n.Labels["kubernetes.io/os"] = "linux"
 	n.Labels["kubernetes.io/arch"] = "amd64"
 	n.Labels["node.kubernetes.io/gpu"] = "true"
@@ -441,8 +446,16 @@ func (p *GPUProvider) ConfigureNode(n *corev1.Node) {
 	}
 
 	gpuQty := resource.MustParse(fmt.Sprintf("%d", p.cfg.GPUCount))
+	nodeIP := p.cfg.NodeIP
+	if nodeIP == "" {
+		nodeIP = "127.0.0.1"
+	}
+
 	n.Status = corev1.NodeStatus{
 		Phase: corev1.NodeRunning,
+		DaemonEndpoints: corev1.NodeDaemonEndpoints{
+			KubeletEndpoint: corev1.DaemonEndpoint{Port: p.cfg.KubeletPort},
+		},
 		Capacity: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("8"),
 			corev1.ResourceMemory: resource.MustParse("24Gi"),
@@ -471,7 +484,7 @@ func (p *GPUProvider) ConfigureNode(n *corev1.Node) {
 			KubeletVersion:  "v1.31.0-vk",
 		},
 		Addresses: []corev1.NodeAddress{
-			{Type: corev1.NodeInternalIP, Address: "127.0.0.1"},
+			{Type: corev1.NodeInternalIP, Address: nodeIP},
 		},
 	}
 }

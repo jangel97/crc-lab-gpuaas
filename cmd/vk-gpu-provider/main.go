@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +37,8 @@ func main() {
 		defaultRemoteStorageClass string
 		taintValue                string
 		insecureSkipTLSVerify     bool
+		kubeletPort               int
+		kubeletCertPath           string
 	)
 
 	flag.StringVar(&nodeName, "nodename", "gpu-worker", "Name of the virtual node")
@@ -47,6 +52,10 @@ func main() {
 		"Value for the virtual-kubelet.io/provider taint")
 	flag.BoolVar(&insecureSkipTLSVerify, "insecure-skip-tls-verify", false,
 		"Skip TLS certificate verification for both tenant and worker API servers")
+	flag.IntVar(&kubeletPort, "kubelet-port", 10350,
+		"Port for the kubelet API server (logs/exec). Must differ from the real kubelet port 10250")
+	flag.StringVar(&kubeletCertPath, "kubelet-cert", "",
+		"Path to PEM file with cert+key for the kubelet API TLS (e.g. node's kubelet-server-current.pem)")
 	flag.Parse()
 
 	if workerKubeconfig == "" {
@@ -75,6 +84,54 @@ func main() {
 	}
 	klog.Infof("Worker namespace prefix: %s", workerNamespacePrefix)
 
+	nodeIP := os.Getenv("NODE_IP")
+
+	var nodeOpts []nodeutil.NodeOpt
+
+	if kubeletCertPath != "" {
+		mux := http.NewServeMux()
+		nodeOpts = append(nodeOpts,
+			nodeutil.WithNodeConfig(nodeutil.NodeConfig{
+				NumWorkers:     runtime.NumCPU(),
+				HTTPListenAddr: fmt.Sprintf(":%d", kubeletPort),
+				Handler:        mux,
+				NodeSpec: corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: nodeName,
+						Labels: map[string]string{
+							"type":                   "virtual-kubelet",
+							"kubernetes.io/role":     "agent",
+							"kubernetes.io/hostname": nodeName,
+						},
+					},
+					Status: corev1.NodeStatus{
+						Phase: corev1.NodePending,
+						Conditions: []corev1.NodeCondition{
+							{Type: corev1.NodeReady},
+							{Type: corev1.NodeDiskPressure},
+							{Type: corev1.NodeMemoryPressure},
+							{Type: corev1.NodePIDPressure},
+							{Type: corev1.NodeNetworkUnavailable},
+						},
+					},
+				},
+			}),
+			nodeutil.WithClient(tenantClient),
+			nodeutil.AttachProviderRoutes(mux),
+			nodeutil.WithTLSConfig(func(cfg *tls.Config) error {
+				cert, err := tls.LoadX509KeyPair(kubeletCertPath, kubeletCertPath)
+				if err != nil {
+					return fmt.Errorf("load kubelet cert %s: %w", kubeletCertPath, err)
+				}
+				cfg.Certificates = []tls.Certificate{cert}
+				return nil
+			}),
+		)
+		klog.Infof("Kubelet API server will listen on :%d with cert from %s", kubeletPort, kubeletCertPath)
+	} else {
+		nodeOpts = append(nodeOpts, nodeutil.WithClient(tenantClient))
+	}
+
 	vkNode, err := nodeutil.NewNode(nodeName,
 		func(cfg nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			provider := NewGPUProvider(GPUProviderConfig{
@@ -83,6 +140,8 @@ func main() {
 				GPUCount:                  gpuCount,
 				DefaultRemoteStorageClass: defaultRemoteStorageClass,
 				TaintValue:                taintValue,
+				NodeIP:                    nodeIP,
+				KubeletPort:               int32(kubeletPort),
 				TenantClient:              tenantClient,
 				WorkerClient:              workerClient,
 			})
@@ -95,7 +154,7 @@ func main() {
 
 			return provider, provider, nil
 		},
-		nodeutil.WithClient(tenantClient),
+		nodeOpts...,
 	)
 	if err != nil {
 		klog.Fatalf("Failed to create virtual kubelet node: %v", err)

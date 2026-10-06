@@ -140,6 +140,8 @@ podman push quay.io/jmorenas/gpuaas-virtual-kubelet:latest
 | `--default-remote-storage-class` | `lvms-vg1` | StorageClass for execution PVCs on the GPU cluster |
 | `--taint-value` | `catapult` | Value for the `virtual-kubelet.io/provider` taint |
 | `--insecure-skip-tls-verify` | `false` | Skip TLS certificate verification for API servers |
+| `--kubelet-cert` | *(none)* | PEM file with cert+key for kubelet API TLS (enables `kubectl logs`) |
+| `--kubelet-port` | `10350` | Port for the kubelet API server (must differ from real kubelet 10250) |
 
 ## Storage
 
