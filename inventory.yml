@@ -22,6 +22,7 @@ all:
     vk_image: "quay.io/jmorenas/gpuaas-virtual-kubelet:latest"
     vk_node_name: "gpu-worker"
     vk_test_namespace: "vk-test"
+    vk_worker_namespace: "vk-workloads"
 
   children:
     clusters:
@@ -47,7 +48,7 @@ all:
           role: tenant
           vm_name: sno-tenant2
           vm_cpus: 10
-          vm_ram_mb: 14336
+          vm_ram_mb: 16384
           vm_disk_gb: 120
           vm_mac: "52:54:00:aa:bb:03"
           vm_ip: "192.168.122.12"
