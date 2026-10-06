@@ -194,9 +194,10 @@ python -m pytest tests/ -v -m rhoai
 python -m pytest tests/ -v -m networking
 ```
 
-### Test Results (2026-10-05)
+### Test Results (2026-10-06)
 
-7 core VK tests pass (RHOAI and Submariner tests not re-run this session).
+8 core VK tests pass from both tenants (OCP 4.22 and OCP 4.18).
+14 total tests pass from tenant (VK + RHOAI + networking).
 
 ```
 tests/test_vk_gpu.py::test_virtual_node_exists                                PASSED
@@ -206,6 +207,7 @@ tests/test_vk_gpu.py::test_pod_deletion_cleans_up                             PA
 tests/test_vk_gpu.py::test_catapult_pvc_sync                                  PASSED
 tests/test_vk_gpu.py::test_non_catapult_pvc_rejected                          PASSED
 tests/test_vk_gpu.py::test_multitenant_namespace_isolation                    PASSED
+tests/test_vk_gpu.py::test_pod_logs_proxied_from_worker                       PASSED
 ```
 
 ### Test Descriptions
@@ -250,6 +252,11 @@ tests/test_vk_gpu.py::test_multitenant_namespace_isolation                    PA
    resolution works via synced headless Services.
 9. **Multi-tenant isolation works**: per-tenant worker namespaces prevent
    same-named resources from different tenant namespaces from colliding.
+10. **kubectl logs / oc logs work**: VK proxies log requests through a kubelet
+    API server to worker pods. Supports full logs, tail, and follow.
+11. **OCP/RHOAI version decoupling proven**: two tenants at different OCP
+    versions (4.22 and 4.18) share the same GPU worker. The AI platform
+    layer is fully decoupled from the GPU compute layer.
 
 For the full spike assessment with all scenarios, results, and gaps, see
 [docs/spike-assessment.md](docs/spike-assessment.md).
