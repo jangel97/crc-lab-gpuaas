@@ -64,6 +64,7 @@ When a pod is assigned to the virtual node, `handleTenantPod` runs:
 tenant pod event (Add/Update)
     │
     ├── skip if system namespace (openshift-*, kube-*, redhat-ods-*, default, kueue-system)
+    ├── skip if DaemonSet-owned (ownerReferences contains Kind=DaemonSet)
     ├── skip if already managed (in managedPods map)
     ├── skip if DeletionTimestamp set → route to deletion handler
     ├── skip if already terminal (Succeeded/Failed)
@@ -267,6 +268,31 @@ Worker namespaces are created on-demand by `ensureNamespace` with label
   never share a namespace — no name collisions.
 - **Network isolation potential**: NetworkPolicies can be applied per worker
   namespace to restrict cross-tenant traffic.
+
+## DaemonSet Pod Exclusion
+
+`CreatePod` skips any pod with a DaemonSet `ownerReference`. DaemonSet pods
+are node-level infrastructure (routeagents, log collectors, monitoring agents)
+that must run on the actual host — dispatching them cross-cluster breaks them
+because:
+
+1. They typically need host-level access (iptables, network stack, filesystem)
+   that a remote cluster can't provide.
+2. Their ServiceAccounts are synced without ClusterRoleBindings, so they lose
+   RBAC on the worker.
+3. They retry failed operations in tight loops, generating sustained API
+   traffic against the worker API server.
+
+This was discovered with Submariner's routeagent DaemonSet, which uses
+`tolerations: [{operator: Exists}]` and no `nodeSelector`. The DaemonSet
+controller schedules it on every node including the virtual one. Without this
+check, VK dispatched it to the worker where its init container
+(`await-node-ready`) looped forever with RBAC errors (~1 req/sec).
+
+The routeagent pod still shows as `Pending` on the virtual node (the
+DaemonSet controller keeps creating it, but with no real kubelet it can't
+run). This is cosmetic and does not affect Submariner routing — the real
+routeagent on the tenant SNO node handles all cross-cluster traffic.
 
 ## SecurityContext Handling
 
