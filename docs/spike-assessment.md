@@ -533,21 +533,57 @@ but VK does not interact with Kueue's admission system yet.
 ### Submariner routeagent on virtual node
 
 Submariner's routeagent DaemonSet schedules a pod on the virtual `gpu-worker`
-node, where it gets stuck in `Init:0/1` permanently. This is cosmetic — the
-real routeagent on the tenant SNO node handles all routing — but it produces
-a visible unhealthy pod that can trigger alerts.
+node. The VK then dispatches it to the worker cluster, where it gets stuck
+in `Init:0/1` permanently, retrying a forbidden API call every second.
 
-**Why it happens:** The routeagent DaemonSet needs to run on every node in
-the cluster to configure iptables rules and IP routes for cross-cluster
-traffic. To ensure it can schedule everywhere (including control-plane
-nodes), the Submariner operator hardcodes `tolerations: [{operator: Exists}]`
-and no `nodeSelector` on the routeagent DaemonSet. This means it tolerates
-the VK's `virtual-kubelet.io/provider` taint and schedules on the virtual
-node. Since the virtual node has no real kubelet, the pod's init container
-never completes.
+**What the routeagent does:** The routeagent configures iptables rules and
+IP routes on every node for cross-cluster traffic. It runs as a DaemonSet
+so every node in the cluster gets the right routing tables. The init
+container (`await-node-ready`) waits until the local node is Ready before
+the main container starts configuring routes.
 
-**Why it can't be fixed without upstream changes:** We investigated three
-approaches, all of which fail:
+**The full failure chain:**
+
+1. The routeagent DaemonSet uses `tolerations: [{operator: Exists}]` and
+   no `nodeSelector`, so the DaemonSet controller schedules a pod on the
+   virtual node `gpu-worker`.
+
+2. VK's `CreatePod` picks up the pod. The `submariner-operator` namespace
+   is not in VK's system namespace skip list (`openshift-*`, `kube-*`,
+   `redhat-ods-*`, `default`, `kueue-system`), so VK treats it as a
+   regular user pod.
+
+3. VK syncs the `submariner-routeagent` ServiceAccount to the worker
+   namespace (`vk-{prefix}submariner-operator`) and creates the pod there.
+
+4. The init container starts on the worker and runs `await-node-ready`,
+   which tries to read the local node object (`sno-worker`) via the
+   Kubernetes API.
+
+5. The synced ServiceAccount has no ClusterRoleBinding on the worker
+   cluster — VK only syncs the SA object, not its RBAC bindings. The
+   request fails with:
+   ```
+   nodes "sno-worker" is forbidden: User
+   "system:serviceaccount:vk-{prefix}submariner-operator:submariner-routeagent"
+   cannot get resource "nodes" in API group "" at the cluster scope
+   ```
+
+6. The init container retries every ~1 second, indefinitely. The pod
+   stays in `Init:0/1` on the tenant side and the init container shows
+   `Running` (not crashed — it's in a retry loop).
+
+**Impact:** The real routeagent on `sno-tenant` handles all Submariner
+routing — cross-cluster networking works fully (validated by S9, S10, S11,
+S13). However, the dispatched pod is not truly cosmetic:
+
+- It consumes a pod slot on the worker (though minimal CPU/memory)
+- It generates ~1 forbidden API request per second against the worker
+  API server
+- It appears as an unhealthy pod in both tenant and worker monitoring
+
+**Why it can't be fixed via Submariner configuration:** We investigated
+three approaches, all of which fail:
 
 1. **Patch the DaemonSet directly** (add nodeAffinity to exclude
    `type=virtual-kubelet`): The Submariner operator reconciles the
@@ -555,24 +591,25 @@ approaches, all of which fail:
 
 2. **Set `nodeSelector` on the Submariner CR**: The CR's `nodeSelector`
    field only applies to the gateway DaemonSet, not the routeagent.
-   The operator ignores it for routeagent scheduling.
 
-3. **Set `tolerations` on the Submariner CR**: Same issue — the CR's
+3. **Set `tolerations` on the Submariner CR**: Same — the CR's
    `tolerations` field only applies to the gateway DaemonSet. The
-   routeagent always gets the hardcoded `operator: Exists` toleration
-   regardless of CR configuration.
+   routeagent always gets the hardcoded `operator: Exists` toleration.
 
-**Impact:** None on function. The real routeagent on `sno-tenant` handles
-all Submariner routing. The stuck pod consumes no resources (it never
-passes init). Cross-cluster networking works fully (validated by S9, S10,
-S11, S13).
+**Possible fixes:**
 
-**Possible production fixes:**
-- Upstream Submariner change to support routeagent node exclusion
-  (e.g., a `routeAgentNodeSelector` field in the CR)
-- A mutating admission webhook on the tenant that injects a
-  `nodeAffinity` anti-rule into pods targeting the virtual node
-  when they come from the `submariner-operator` namespace
+- **VK-side: add `submariner-operator` to the system namespace skip list.**
+  This prevents VK from dispatching the pod to the worker. The pod would
+  still show `Init:0/1` on the tenant (no real kubelet on the virtual node),
+  but it wouldn't run on the worker or generate API traffic. This is the
+  simplest fix.
+
+- **Upstream Submariner: add a `routeAgentNodeSelector` field** to the CR
+  so operators can exclude virtual nodes.
+
+- **Mutating admission webhook** on the tenant that injects a nodeAffinity
+  anti-rule for `type=virtual-kubelet` into pods from the
+  `submariner-operator` namespace.
 
 ### Kubelet API server requires privileged SCC
 
