@@ -222,6 +222,7 @@ tests/test_vk_gpu.py::test_multitenant_namespace_isolation                    PA
 | `test_notebook_workbench_via_submariner` | networking | Long-running GPU notebook server dispatched to worker → Service on tenant → pod stays Running → curl returns HTML with GPU info via Submariner tunnel |
 | `test_submariner_tunnel_failure_recovery` | networking | GPU server + Service working → kill Submariner gateway → verify outage → gateway restarts → tunnel re-establishes → connectivity restored |
 | `test_multitenant_namespace_isolation` | vk | Two namespaces create same-named Secret → VK syncs each to its own per-tenant worker namespace → both exist with correct data → isolation proven |
+| `test_pod_logs_proxied_from_worker` | vk | Pod echoes known marker → `kubectl logs` on tenant proxied to worker pod → full output matches → `tail_lines=1` returns only last line |
 | `test_headless_service_dns_resolution` | networking | Two pods with hostname/subdomain + headless Service → VK syncs Service to worker → Pod B resolves Pod A via DNS → inter-pod DNS works for distributed training |
 
 ### What the Tests Prove

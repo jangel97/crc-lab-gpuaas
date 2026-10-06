@@ -941,3 +941,84 @@ def test_multitenant_namespace_isolation(
             tenant_core.delete_namespace(name=ns)
         except client.exceptions.ApiException:
             pass
+
+
+@pytest.mark.vk
+def test_pod_logs_proxied_from_worker(
+    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+):
+    """
+    Submit a pod on the virtual node that prints a known message.
+    Read logs via the tenant API (kubectl logs path) and verify the
+    VK proxies them from the worker pod.
+    """
+    tenant_core, _ = tenant_clients
+    worker_core, _ = worker_clients
+    ns = test_namespace
+
+    pod_name = "vk-log-test"
+    w_pod_name = worker_pod_name(ns, pod_name)
+    marker = "catapult-log-marker-42"
+
+    force_delete_pod(tenant_core, pod_name, ns)
+    force_delete_pod(worker_core, w_pod_name, vk_worker_namespace)
+
+    pod = client.V1Pod(
+        metadata=client.V1ObjectMeta(name=pod_name, namespace=ns),
+        spec=client.V1PodSpec(
+            node_name=VK_NODE_NAME,
+            restart_policy="Never",
+            tolerations=[
+                client.V1Toleration(
+                    key="virtual-kubelet.io/provider",
+                    operator="Exists",
+                ),
+            ],
+            containers=[
+                client.V1Container(
+                    name="echo",
+                    image="docker.io/library/busybox:latest",
+                    command=["sh", "-c", f"echo {marker}; echo line2; echo line3"],
+                )
+            ],
+        ),
+    )
+    tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+
+    # Wait for pod to succeed
+    deadline = time.time() + 120
+    phase = None
+    while time.time() < deadline:
+        tp = tenant_core.read_namespaced_pod(name=pod_name, namespace=ns)
+        phase = tp.status.phase
+        if phase in ("Succeeded", "Failed"):
+            break
+        time.sleep(5)
+
+    assert phase == "Succeeded", f"Pod did not succeed. Phase: {phase!r}"
+
+    # Read logs from tenant — VK should proxy to worker
+    logs = tenant_core.read_namespaced_pod_log(
+        name=pod_name, namespace=ns, container="echo"
+    )
+    assert marker in logs, (
+        f"Expected marker {marker!r} in tenant-side logs, got: {logs!r}"
+    )
+    assert "line3" in logs, f"Expected all lines in logs, got: {logs!r}"
+
+    # Read logs with tail_lines option
+    tail_logs = tenant_core.read_namespaced_pod_log(
+        name=pod_name, namespace=ns, container="echo", tail_lines=1
+    )
+    lines = tail_logs.strip().splitlines()
+    assert len(lines) == 1, f"Expected 1 line with tail_lines=1, got {len(lines)}: {lines}"
+    assert lines[0] == "line3", f"Expected last line 'line3', got {lines[0]!r}"
+
+    # Verify the same logs are on the worker directly
+    worker_logs = worker_core.read_namespaced_pod_log(
+        name=w_pod_name, namespace=vk_worker_namespace, container="echo"
+    )
+    assert logs == worker_logs, "Tenant logs should match worker logs exactly"
+
+    # Cleanup
+    force_delete_pod(tenant_core, pod_name, ns)

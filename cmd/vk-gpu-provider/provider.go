@@ -231,7 +231,43 @@ func (p *GPUProvider) NotifyNodeStatus(ctx context.Context, cb func(*corev1.Node
 // --- nodeutil.Provider stubs (not used — no kubelet API server) ---
 
 func (p *GPUProvider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("not supported")
+	key := namespace + "/" + podName
+	p.mu.Lock()
+	wpName, ok := p.managedPods[key]
+	p.mu.Unlock()
+	if !ok {
+		return nil, errdefs.NotFoundf("pod %s not found", key)
+	}
+
+	workerNS := workerNamespace(p.cfg.WorkerNamespacePrefix, namespace)
+	logOpts := &corev1.PodLogOptions{
+		Container:  containerName,
+		Follow:     opts.Follow,
+		Previous:   opts.Previous,
+		Timestamps: opts.Timestamps,
+	}
+	if opts.Tail > 0 {
+		t := int64(opts.Tail)
+		logOpts.TailLines = &t
+	}
+	if opts.LimitBytes > 0 {
+		l := int64(opts.LimitBytes)
+		logOpts.LimitBytes = &l
+	}
+	if opts.SinceSeconds > 0 {
+		s := int64(opts.SinceSeconds)
+		logOpts.SinceSeconds = &s
+	}
+	if !opts.SinceTime.IsZero() {
+		t := metav1.NewTime(opts.SinceTime)
+		logOpts.SinceTime = &t
+	}
+
+	stream, err := p.cfg.WorkerClient.CoreV1().Pods(workerNS).GetLogs(wpName, logOpts).Stream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("logs for %s/%s container %q: %w", workerNS, wpName, containerName, err)
+	}
+	return stream, nil
 }
 
 func (p *GPUProvider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
