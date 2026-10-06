@@ -139,6 +139,7 @@ podman push quay.io/jmorenas/gpuaas-virtual-kubelet:latest
 | `--worker-namespace-prefix` | *(auto-generated)* | Prefix for per-tenant worker namespaces |
 | `--default-remote-storage-class` | `lvms-vg1` | StorageClass for execution PVCs on the GPU cluster |
 | `--taint-value` | `catapult` | Value for the `virtual-kubelet.io/provider` taint |
+| `--insecure-skip-tls-verify` | `false` | Skip TLS certificate verification for API servers |
 
 ## Storage
 

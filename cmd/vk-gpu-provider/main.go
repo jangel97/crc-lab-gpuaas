@@ -33,6 +33,7 @@ func main() {
 		tenantKubeconfig          string
 		defaultRemoteStorageClass string
 		taintValue                string
+		insecureSkipTLSVerify     bool
 	)
 
 	flag.StringVar(&nodeName, "nodename", "gpu-worker", "Name of the virtual node")
@@ -44,6 +45,8 @@ func main() {
 		"Default StorageClass for execution PVCs on the GPU cluster")
 	flag.StringVar(&taintValue, "taint-value", "catapult",
 		"Value for the virtual-kubelet.io/provider taint")
+	flag.BoolVar(&insecureSkipTLSVerify, "insecure-skip-tls-verify", false,
+		"Skip TLS certificate verification for both tenant and worker API servers")
 	flag.Parse()
 
 	if workerKubeconfig == "" {
@@ -53,12 +56,12 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	tenantClient, err := buildClient(tenantKubeconfig)
+	tenantClient, err := buildClient(tenantKubeconfig, insecureSkipTLSVerify)
 	if err != nil {
 		klog.Fatalf("Failed to create tenant client: %v", err)
 	}
 
-	workerClient, err := buildClient(workerKubeconfig)
+	workerClient, err := buildClient(workerKubeconfig, insecureSkipTLSVerify)
 	if err != nil {
 		klog.Fatalf("Failed to create worker client: %v", err)
 	}
@@ -111,7 +114,7 @@ func main() {
 	}
 }
 
-func buildClient(kubeconfig string) (kubernetes.Interface, error) {
+func buildClient(kubeconfig string, insecure bool) (kubernetes.Interface, error) {
 	var cfg *rest.Config
 	var err error
 
@@ -128,9 +131,11 @@ func buildClient(kubeconfig string) (kubernetes.Interface, error) {
 		return nil, err
 	}
 
-	cfg.TLSClientConfig.Insecure = true
-	cfg.TLSClientConfig.CAData = nil
-	cfg.TLSClientConfig.CAFile = ""
+	if insecure {
+		cfg.TLSClientConfig.Insecure = true
+		cfg.TLSClientConfig.CAData = nil
+		cfg.TLSClientConfig.CAFile = ""
+	}
 
 	return kubernetes.NewForConfig(cfg)
 }
