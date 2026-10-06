@@ -533,9 +533,46 @@ but VK does not interact with Kueue's admission system yet.
 ### Submariner routeagent on virtual node
 
 Submariner's routeagent DaemonSet schedules a pod on the virtual `gpu-worker`
-node, where it gets stuck in `Init:0/1`. Cosmetic — the real routeagent on
-the tenant SNO handles routing. Could be fixed with a toleration or node
-selector but does not affect function.
+node, where it gets stuck in `Init:0/1` permanently. This is cosmetic — the
+real routeagent on the tenant SNO node handles all routing — but it produces
+a visible unhealthy pod that can trigger alerts.
+
+**Why it happens:** The routeagent DaemonSet needs to run on every node in
+the cluster to configure iptables rules and IP routes for cross-cluster
+traffic. To ensure it can schedule everywhere (including control-plane
+nodes), the Submariner operator hardcodes `tolerations: [{operator: Exists}]`
+and no `nodeSelector` on the routeagent DaemonSet. This means it tolerates
+the VK's `virtual-kubelet.io/provider` taint and schedules on the virtual
+node. Since the virtual node has no real kubelet, the pod's init container
+never completes.
+
+**Why it can't be fixed without upstream changes:** We investigated three
+approaches, all of which fail:
+
+1. **Patch the DaemonSet directly** (add nodeAffinity to exclude
+   `type=virtual-kubelet`): The Submariner operator reconciles the
+   DaemonSet and reverts the patch within seconds.
+
+2. **Set `nodeSelector` on the Submariner CR**: The CR's `nodeSelector`
+   field only applies to the gateway DaemonSet, not the routeagent.
+   The operator ignores it for routeagent scheduling.
+
+3. **Set `tolerations` on the Submariner CR**: Same issue — the CR's
+   `tolerations` field only applies to the gateway DaemonSet. The
+   routeagent always gets the hardcoded `operator: Exists` toleration
+   regardless of CR configuration.
+
+**Impact:** None on function. The real routeagent on `sno-tenant` handles
+all Submariner routing. The stuck pod consumes no resources (it never
+passes init). Cross-cluster networking works fully (validated by S9, S10,
+S11, S13).
+
+**Possible production fixes:**
+- Upstream Submariner change to support routeagent node exclusion
+  (e.g., a `routeAgentNodeSelector` field in the CR)
+- A mutating admission webhook on the tenant that injects a
+  `nodeAffinity` anti-rule into pods targeting the virtual node
+  when they come from the `submariner-operator` namespace
 
 ### Kubelet API server requires privileged SCC
 
