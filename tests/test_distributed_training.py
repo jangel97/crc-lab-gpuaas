@@ -25,6 +25,11 @@ from conftest import worker_pod_name
 VK_NODE_NAME = "gpu-worker"
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _ensure_lab_env(single_tenant_env):
+    pass
+
+
 def _suffix():
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
 
@@ -50,7 +55,7 @@ def force_delete_pod(core_api, name, namespace, timeout=60):
 
 @pytest.mark.networking
 def test_headless_service_dns_resolution(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Deploy two pods with hostname/subdomain and a headless Service on
@@ -97,6 +102,7 @@ def test_headless_service_dns_resolution(
         ),
     )
     tenant_core.create_namespaced_service(namespace=ns, body=svc)
+    cleanup(tenant_core.delete_namespaced_service, name=svc_name, namespace=ns)
 
     # Pod A: long-running server pod with hostname/subdomain
     pod_a = client.V1Pod(
@@ -129,6 +135,7 @@ def test_headless_service_dns_resolution(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod_a)
+    cleanup(force_delete_pod, tenant_core, pod_a_name, ns)
 
     # Wait for Pod A to be Running
     deadline = time.time() + 120
@@ -202,6 +209,7 @@ def test_headless_service_dns_resolution(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod_b)
+    cleanup(force_delete_pod, tenant_core, pod_b_name, ns)
 
     # Wait for Pod B to complete
     deadline = time.time() + 120
@@ -225,11 +233,3 @@ def test_headless_service_dns_resolution(
     assert logs and ("." in logs), (
         f"DNS lookup did not resolve an address. Logs: {logs}"
     )
-
-    # Cleanup
-    force_delete_pod(tenant_core, pod_b_name, ns)
-    force_delete_pod(tenant_core, pod_a_name, ns)
-    try:
-        tenant_core.delete_namespaced_service(name=svc_name, namespace=ns)
-    except client.exceptions.ApiException:
-        pass

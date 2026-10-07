@@ -42,6 +42,11 @@ RHOAI_CRDS = [
 VK_TOLERATIONS = [{"key": "virtual-kubelet.io/provider", "operator": "Exists"}]
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _ensure_lab_env(high_memory_env):
+    pass
+
+
 def force_delete_pod(core_api, name, namespace, timeout=60):
     """Delete a pod with grace_period=0 and wait for it to disappear."""
     try:
@@ -92,7 +97,7 @@ def wait_pod_exists(core_api, name, namespace, timeout=120):
 
 @pytest.mark.rhoai
 def test_pytorchjob_via_vk(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Submit a single-node PyTorchJob on tenant targeting the VK node.
@@ -169,6 +174,9 @@ def test_pytorchjob_via_vk(
         plural=PYTORCHJOB_PLURAL,
         body=pytorchjob,
     )
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=PYTORCHJOB_GROUP, version=PYTORCHJOB_VERSION,
+            namespace=ns, plural=PYTORCHJOB_PLURAL, name=job_name)
 
     assert wait_pod_exists(tenant_core, master_pod_name, ns, timeout=60), (
         f"Training operator did not create master pod {master_pod_name} within 60s"
@@ -216,18 +224,6 @@ def test_pytorchjob_via_vk(
         f"PyTorchJob {job_name} did not reach Succeeded condition"
     )
 
-    # Cleanup
-    try:
-        tenant_custom.delete_namespaced_custom_object(
-            group=PYTORCHJOB_GROUP,
-            version=PYTORCHJOB_VERSION,
-            namespace=ns,
-            plural=PYTORCHJOB_PLURAL,
-            name=job_name,
-        )
-    except client.exceptions.ApiException:
-        pass
-
 
 @pytest.mark.rhoai
 def test_no_rhoai_crds_on_worker(worker_clients):
@@ -246,7 +242,7 @@ def test_no_rhoai_crds_on_worker(worker_clients):
 
 @pytest.mark.rhoai
 def test_notebook_cr_via_vk(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Create an RHOAI Notebook CR on the tenant targeting the VK node.
@@ -255,19 +251,8 @@ def test_notebook_cr_via_vk(
 
     This proves the Dashboard → Notebook → GPU workflow works via VK.
 
-    Lab setup (if notebook-controller is Pending due to memory):
-      1. Shut down tenant2 to free RAM:
-           sudo virsh shutdown sno-tenant2
-      2. Increase tenant RAM (e.g. 14GB → 28GB):
-           sudo virsh shutdown sno-tenant
-           sudo virsh setmaxmem sno-tenant 28G --config
-           sudo virsh setmem sno-tenant 28G --config
-           sudo virsh start sno-tenant
-      3. Wait for OCP to come back (~3-5 min), verify notebook-controller
-         is Running:
-           oc get pods -n redhat-ods-applications | grep notebook-controller
-      4. Remove the @pytest.mark.xfail decorator above and re-run.
-      5. Restore original RAM and restart tenant2 when done.
+    The high_memory_env fixture automatically configures tenant1 to
+    28GB and shuts down tenant2.
     """
     tenant_core, tenant_custom = tenant_clients
     worker_core, _ = worker_clients
@@ -345,6 +330,10 @@ def test_notebook_cr_via_vk(
         plural=NOTEBOOK_PLURAL,
         body=notebook_cr,
     )
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=NOTEBOOK_GROUP, version=NOTEBOOK_VERSION,
+            namespace=ns, plural=NOTEBOOK_PLURAL, name=nb_name)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
 
     # Wait for StatefulSet to be created by notebook controller
     apps_api = client.AppsV1Api(tenant_core.api_client)
@@ -431,24 +420,10 @@ def test_notebook_cr_via_vk(
         f"Conditions: {nb_conditions}, ContainerState: {container_state}"
     )
 
-    # Cleanup
-    try:
-        tenant_custom.delete_namespaced_custom_object(
-            group=NOTEBOOK_GROUP,
-            version=NOTEBOOK_VERSION,
-            namespace=ns,
-            plural=NOTEBOOK_PLURAL,
-            name=nb_name,
-        )
-    except client.exceptions.ApiException:
-        pass
-    time.sleep(5)
-    force_delete_pod(tenant_core, pod_name, ns)
-
 
 @pytest.mark.rhoai
 def test_pytorchjob_real_training(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Submit a PyTorchJob with an actual PyTorch training script.
@@ -550,6 +525,9 @@ def test_pytorchjob_real_training(
         plural=PYTORCHJOB_PLURAL,
         body=pytorchjob,
     )
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=PYTORCHJOB_GROUP, version=PYTORCHJOB_VERSION,
+            namespace=ns, plural=PYTORCHJOB_PLURAL, name=job_name)
 
     assert wait_pod_exists(tenant_core, master_pod_name, ns, timeout=60), (
         f"Training operator did not create master pod {master_pod_name} within 60s"
@@ -614,22 +592,10 @@ def test_pytorchjob_real_training(
         f"PyTorchJob {job_name} did not reach Succeeded condition"
     )
 
-    # Cleanup
-    try:
-        tenant_custom.delete_namespaced_custom_object(
-            group=PYTORCHJOB_GROUP,
-            version=PYTORCHJOB_VERSION,
-            namespace=ns,
-            plural=PYTORCHJOB_PLURAL,
-            name=job_name,
-        )
-    except client.exceptions.ApiException:
-        pass
-
 
 @pytest.mark.rhoai
 def test_pytorchjob_checkpoint_with_pvc(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Train a model on GPU and save a checkpoint to a catapult PVC.
@@ -695,6 +661,8 @@ def test_pytorchjob_checkpoint_with_pvc(
             ),
         ),
     )
+    cleanup(tenant_core.delete_namespaced_persistent_volume_claim,
+            name=pvc_name, namespace=ns)
 
     # Training script that saves a checkpoint
     training_script = "\n".join([
@@ -783,6 +751,9 @@ def test_pytorchjob_checkpoint_with_pvc(
         plural=PYTORCHJOB_PLURAL,
         body=pytorchjob,
     )
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=PYTORCHJOB_GROUP, version=PYTORCHJOB_VERSION,
+            namespace=ns, plural=PYTORCHJOB_PLURAL, name=job_name)
 
     assert wait_pod_exists(tenant_core, master_pod_name, ns, timeout=60), (
         f"Training operator did not create master pod within 60s"
@@ -858,6 +829,7 @@ def test_pytorchjob_checkpoint_with_pvc(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=verify_pod)
+    cleanup(force_delete_pod, tenant_core, verify_pod_name, ns)
 
     verify_phase = wait_pod_phase(
         worker_core, w_verify_pod, vk_worker_namespace, ("Succeeded", "Failed"),
@@ -874,30 +846,10 @@ def test_pytorchjob_checkpoint_with_pvc(
         f"Checkpoint verification failed. Logs: {verify_logs[:500]}"
     )
 
-    # Cleanup
-    try:
-        tenant_custom.delete_namespaced_custom_object(
-            group=PYTORCHJOB_GROUP,
-            version=PYTORCHJOB_VERSION,
-            namespace=ns,
-            plural=PYTORCHJOB_PLURAL,
-            name=job_name,
-        )
-    except client.exceptions.ApiException:
-        pass
-    force_delete_pod(tenant_core, verify_pod_name, ns)
-    time.sleep(5)
-    try:
-        tenant_core.delete_namespaced_persistent_volume_claim(
-            name=pvc_name, namespace=ns,
-        )
-    except client.exceptions.ApiException:
-        pass
-
 
 @pytest.mark.rhoai
 def test_kserve_inference_via_vk(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     End-to-end KServe InferenceService test: installs ServiceMesh and
@@ -915,8 +867,7 @@ def test_kserve_inference_via_vk(
       - Serverless operator installed from redhat-operators catalog.
       - RHOAI DSC has KServe serving.managementState: Managed (already
         the default in the lab).
-      - Tenant SNO needs ~28GB RAM for all components. See
-        test_notebook_cr_via_vk docstring for VM memory adjustment steps.
+      - Tenant SNO needs ~28GB RAM (handled by the high_memory_env fixture).
 
     Timing: First run takes 5-10 minutes (operator installs + CRD
     propagation). Subsequent runs with operators already installed
@@ -1235,6 +1186,9 @@ def test_kserve_inference_via_vk(
         plural=ISVC_PLURAL,
         body=isvc,
     )
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=ISVC_GROUP, version=ISVC_VERSION,
+            namespace=ns, plural=ISVC_PLURAL, name=isvc_name)
 
     # ── Step 6: Wait for KServe to create Deployment and pod ──
 
@@ -1316,18 +1270,6 @@ def test_kserve_inference_via_vk(
             f"Worker pod is Running — KServe status sync may have lag."
         )
 
-    # Cleanup
-    try:
-        tenant_custom.delete_namespaced_custom_object(
-            group=ISVC_GROUP,
-            version=ISVC_VERSION,
-            namespace=ns,
-            plural=ISVC_PLURAL,
-            name=isvc_name,
-        )
-    except client.exceptions.ApiException:
-        pass
-
 
 KSVC_GROUP = "serving.knative.dev"
 KSVC_VERSION = "v1"
@@ -1340,7 +1282,7 @@ SMM_PLURAL = "servicemeshmembers"
 
 @pytest.mark.rhoai
 def test_kserve_serverless_inference_via_vk(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     KServe InferenceService in serverless mode (Knative + Istio).
@@ -1453,6 +1395,9 @@ def test_kserve_serverless_inference_via_vk(
             )
         else:
             raise
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=SMM_GROUP, version=SMM_VERSION,
+            namespace=ns, plural=SMM_PLURAL, name="default")
 
     # ── Step 3: Create InferenceService (serverless mode — NO RawDeployment annotation) ──
 
@@ -1543,6 +1488,9 @@ def test_kserve_serverless_inference_via_vk(
         plural=ISVC_PLURAL,
         body=isvc,
     )
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=ISVC_GROUP, version=ISVC_VERSION,
+            namespace=ns, plural=ISVC_PLURAL, name=isvc_name)
 
     # ── Step 4: Verify Knative Service is created ──
 
@@ -1707,6 +1655,7 @@ def test_kserve_serverless_inference_via_vk(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=curl_pod)
+    cleanup(force_delete_pod, tenant_core, curl_pod_name, ns)
 
     deadline = time.time() + 60
     curl_phase = None
@@ -1775,26 +1724,3 @@ def test_kserve_serverless_inference_via_vk(
             f"Pod is Running on worker — Knative/Istio status propagation "
             f"may not work cross-cluster."
         )
-
-    # Cleanup
-    try:
-        tenant_custom.delete_namespaced_custom_object(
-            group=ISVC_GROUP,
-            version=ISVC_VERSION,
-            namespace=ns,
-            plural=ISVC_PLURAL,
-            name=isvc_name,
-        )
-    except client.exceptions.ApiException:
-        pass
-    # Clean up ServiceMeshMember
-    try:
-        tenant_custom.delete_namespaced_custom_object(
-            group=SMM_GROUP,
-            version=SMM_VERSION,
-            namespace=ns,
-            plural=SMM_PLURAL,
-            name="default",
-        )
-    except client.exceptions.ApiException:
-        pass

@@ -4,12 +4,61 @@ import pytest
 import urllib3
 from kubernetes import client, config
 
+from lab_env import LabEnvironment, LabEnvironmentError
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 VK_TEST_NAMESPACE = "vk-test"
+
+
+def _safe_delete(fn, *args, **kwargs):
+    try:
+        fn(*args, **kwargs)
+    except Exception:
+        pass
+
+
+def _force_delete_pod(core_api, name, namespace, timeout=30):
+    import time
+    try:
+        core_api.delete_namespaced_pod(
+            name=name, namespace=namespace, grace_period_seconds=0,
+        )
+    except client.exceptions.ApiException:
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            core_api.read_namespaced_pod(name=name, namespace=namespace)
+        except client.exceptions.ApiException:
+            return
+        time.sleep(2)
+
+
+@pytest.fixture
+def cleanup():
+    """Collect cleanup callbacks that run after the test, even on failure.
+
+    Usage::
+
+        def test_foo(cleanup, tenant_clients, ...):
+            tenant_core, _ = tenant_clients
+            tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+            cleanup(force_delete_pod, tenant_core, pod_name, ns)
+            ...
+    """
+    _callbacks = []
+
+    def register(fn, *args, **kwargs):
+        _callbacks.append((fn, args, kwargs))
+
+    yield register
+
+    for fn, args, kwargs in reversed(_callbacks):
+        _safe_delete(fn, *args, **kwargs)
 CATAPULT_STORAGE_CLASS = "catapult"
 
-VK_PREFIX_CONFIGMAP = "vk-gpu-provider-config"
+VK_PREFIX_CONFIGMAP = "vk-gpu-provider-config-gpu-worker"
 VK_PREFIX_CONFIGMAP_NS = "kube-system"
 
 
@@ -37,7 +86,7 @@ def tenant_clients():
 
 
 @pytest.fixture(scope="session", autouse=True)
-def ensure_catapult_storageclass(tenant_clients):
+def ensure_catapult_storageclass(lab_env, tenant_clients):
     """Ensure the catapult StorageClass exists on the tenant cluster."""
     tenant_core, _ = tenant_clients
     storage_api = client.StorageV1Api(tenant_core.api_client)
@@ -85,6 +134,28 @@ def worker_namespace_for_prefix(prefix, tenant_namespace):
 
 
 @pytest.fixture(scope="session")
+def tenant2_clients():
+    """API clients for the second tenant cluster (Kueue multi-tenant tests)."""
+    path = os.environ.get("TENANT2_KUBECONFIG", os.path.expanduser("~/.kube/tenant2"))
+    return _load_clients(path)
+
+
+@pytest.fixture(scope="session")
+def worker_namespace_prefix_t2(tenant2_clients):
+    """Read the auto-generated worker namespace prefix from tenant2's VK ConfigMap."""
+    tenant2_core, _ = tenant2_clients
+    cm = tenant2_core.read_namespaced_config_map(
+        name=VK_PREFIX_CONFIGMAP, namespace=VK_PREFIX_CONFIGMAP_NS,
+    )
+    prefix = cm.data.get("worker-namespace-prefix", "")
+    assert prefix, (
+        f"ConfigMap {VK_PREFIX_CONFIGMAP_NS}/{VK_PREFIX_CONFIGMAP} on tenant2 has no "
+        f"worker-namespace-prefix key — is tenant2's VK running?"
+    )
+    return prefix
+
+
+@pytest.fixture(scope="session")
 def test_namespace():
     """Return the pre-provisioned VK test namespace on the tenant."""
     return VK_TEST_NAMESPACE
@@ -94,3 +165,63 @@ def test_namespace():
 def vk_worker_namespace(worker_namespace_prefix):
     """Return the per-tenant worker namespace for the default test namespace."""
     return worker_namespace_for_prefix(worker_namespace_prefix, VK_TEST_NAMESPACE)
+
+
+@pytest.fixture(scope="session")
+def vk_worker_namespace_t2(worker_namespace_prefix_t2):
+    """Return tenant2's per-tenant worker namespace."""
+    return worker_namespace_for_prefix(worker_namespace_prefix_t2, VK_TEST_NAMESPACE)
+
+
+@pytest.fixture(scope="session")
+def lab_env():
+    """Lab VM manager. Starts tenant1 + worker as baseline."""
+    try:
+        env = LabEnvironment()
+    except LabEnvironmentError as e:
+        pytest.skip(f"Lab environment unavailable: {e}")
+    env.ensure_running("sno-tenant")
+    env.ensure_running("sno-worker")
+    return env
+
+
+@pytest.fixture(scope="session")
+def single_tenant_env(lab_env):
+    """Ensure tenant1 running at 14GB + worker running."""
+    if lab_env.vm_memory_gb("sno-tenant") != 14:
+        lab_env.set_memory("sno-tenant", 14)
+        lab_env.start_vm("sno-tenant")
+    else:
+        lab_env.ensure_running("sno-tenant")
+    lab_env.ensure_running("sno-worker")
+    yield lab_env
+
+
+@pytest.fixture(scope="session")
+def high_memory_env(lab_env):
+    """Shut down tenant2, resize tenant1 to 28GB, wait for OCP."""
+    original_memory = lab_env.vm_memory_gb("sno-tenant")
+    lab_env.ensure_shut_off("sno-tenant2")
+    if lab_env.vm_memory_gb("sno-tenant") != 28:
+        lab_env.set_memory("sno-tenant", 28)
+        lab_env.start_vm("sno-tenant")
+    else:
+        lab_env.ensure_running("sno-tenant")
+    lab_env.ensure_running("sno-worker")
+    yield lab_env
+    if original_memory != 28:
+        lab_env.set_memory("sno-tenant", original_memory)
+        lab_env.start_vm("sno-tenant")
+
+
+@pytest.fixture(scope="session")
+def dual_tenant_env(lab_env):
+    """Ensure both tenants + worker running at default memory."""
+    if lab_env.vm_memory_gb("sno-tenant") != 14:
+        lab_env.set_memory("sno-tenant", 14)
+        lab_env.start_vm("sno-tenant")
+    else:
+        lab_env.ensure_running("sno-tenant")
+    lab_env.ensure_running("sno-tenant2")
+    lab_env.ensure_running("sno-worker")
+    yield lab_env

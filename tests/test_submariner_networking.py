@@ -24,6 +24,11 @@ from conftest import worker_pod_name
 VK_NODE_NAME = "gpu-worker"
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _ensure_lab_env(single_tenant_env):
+    pass
+
+
 def force_delete_pod(core_api, name, namespace, timeout=60):
     """Delete a pod with grace_period=0 and wait for it to disappear."""
     try:
@@ -45,7 +50,7 @@ def force_delete_pod(core_api, name, namespace, timeout=60):
 
 @pytest.mark.networking
 def test_gpu_service_via_submariner(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Deploy a GPU HTTP server on the worker via VK, create a Service on
@@ -119,6 +124,7 @@ def test_gpu_service_via_submariner(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
 
     # Create Service selecting the pod
     svc = client.V1Service(
@@ -131,6 +137,7 @@ def test_gpu_service_via_submariner(
         ),
     )
     tenant_core.create_namespaced_service(namespace=ns, body=svc)
+    cleanup(tenant_core.delete_namespaced_service, name=svc_name, namespace=ns)
 
     # Wait for pod to be Running with a PodIP (synced from worker)
     deadline = time.time() + 120
@@ -198,6 +205,7 @@ def test_gpu_service_via_submariner(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=curl_pod)
+    cleanup(force_delete_pod, tenant_core, curl_pod_name, ns)
 
     # Wait for curl pod to complete
     deadline = time.time() + 60
@@ -230,23 +238,10 @@ def test_gpu_service_via_submariner(
         f"GPU response does not mention RTX 5090: {response}"
     )
 
-    # Cleanup
-    force_delete_pod(tenant_core, curl_pod_name, ns)
-    try:
-        tenant_core.delete_namespaced_service(name=svc_name, namespace=ns)
-    except client.exceptions.ApiException:
-        pass
-    try:
-        tenant_core.delete_namespaced_pod(
-            name=pod_name, namespace=ns, grace_period_seconds=0,
-        )
-    except client.exceptions.ApiException:
-        pass
-
 
 @pytest.mark.networking
 def test_notebook_workbench_via_submariner(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Deploy a long-running GPU notebook-like HTTP server on the worker
@@ -323,6 +318,7 @@ def test_notebook_workbench_via_submariner(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
 
     # Create Service
     svc = client.V1Service(
@@ -333,6 +329,7 @@ def test_notebook_workbench_via_submariner(
         ),
     )
     tenant_core.create_namespaced_service(namespace=ns, body=svc)
+    cleanup(tenant_core.delete_namespaced_service, name=svc_name, namespace=ns)
 
     # Wait for pod Running with PodIP
     deadline = time.time() + 120
@@ -375,6 +372,7 @@ def test_notebook_workbench_via_submariner(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=curl_pod)
+    cleanup(force_delete_pod, tenant_core, curl_pod_name, ns)
 
     deadline = time.time() + 60
     curl_phase = None
@@ -399,23 +397,10 @@ def test_notebook_workbench_via_submariner(
         f"Response does not mention RTX 5090. Got: {logs}"
     )
 
-    # Cleanup
-    force_delete_pod(tenant_core, curl_pod_name, ns)
-    try:
-        tenant_core.delete_namespaced_service(name=svc_name, namespace=ns)
-    except client.exceptions.ApiException:
-        pass
-    try:
-        tenant_core.delete_namespaced_pod(
-            name=pod_name, namespace=ns, grace_period_seconds=0,
-        )
-    except client.exceptions.ApiException:
-        pass
-
 
 @pytest.mark.networking
 def test_submariner_tunnel_failure_recovery(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Verify Submariner tunnel resilience: deploy a GPU service, kill the
@@ -488,6 +473,7 @@ def test_submariner_tunnel_failure_recovery(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
 
     svc = client.V1Service(
         metadata=client.V1ObjectMeta(name=svc_name, namespace=ns),
@@ -497,6 +483,7 @@ def test_submariner_tunnel_failure_recovery(
         ),
     )
     tenant_core.create_namespaced_service(namespace=ns, body=svc)
+    cleanup(tenant_core.delete_namespaced_service, name=svc_name, namespace=ns)
 
     # Wait for pod Running
     deadline = time.time() + 120
@@ -514,6 +501,7 @@ def test_submariner_tunnel_failure_recovery(
     pre_result = _curl_service(
         tenant_core, ns, f"{curl_prefix}-pre", svc_name
     )
+    cleanup(force_delete_pod, tenant_core, f"{curl_prefix}-pre", ns)
     assert pre_result == "Succeeded", (
         f"Pre-disruption curl failed (phase={pre_result}). "
         "Cannot test tunnel recovery without baseline connectivity."
@@ -540,6 +528,7 @@ def test_submariner_tunnel_failure_recovery(
         tenant_core, ns, f"{curl_prefix}-during", svc_name,
         connect_timeout=5,
     )
+    cleanup(force_delete_pod, tenant_core, f"{curl_prefix}-during", ns)
     # We don't assert failure here — the tunnel might still have cached
     # routes. We just record the result.
     tunnel_was_disrupted = during_result != "Succeeded"
@@ -576,6 +565,7 @@ def test_submariner_tunnel_failure_recovery(
     post_result = _curl_service(
         tenant_core, ns, f"{curl_prefix}-post", svc_name
     )
+    cleanup(force_delete_pod, tenant_core, f"{curl_prefix}-post", ns)
     assert post_result == "Succeeded", (
         f"Post-recovery curl failed (phase={post_result}). "
         "Submariner tunnel did not recover."
@@ -587,20 +577,6 @@ def test_submariner_tunnel_failure_recovery(
     assert '"status": "ok"' in post_logs or "'status': 'ok'" in post_logs, (
         f"Post-recovery response unexpected: {post_logs}"
     )
-
-    # Cleanup
-    for suffix in ["pre", "during", "post"]:
-        force_delete_pod(tenant_core, f"{curl_prefix}-{suffix}", ns)
-    try:
-        tenant_core.delete_namespaced_service(name=svc_name, namespace=ns)
-    except client.exceptions.ApiException:
-        pass
-    try:
-        tenant_core.delete_namespaced_pod(
-            name=pod_name, namespace=ns, grace_period_seconds=0,
-        )
-    except client.exceptions.ApiException:
-        pass
 
 
 def _curl_service(core_api, namespace, curl_pod_name, svc_name,
