@@ -31,6 +31,11 @@ from conftest import worker_pod_name, worker_namespace_for_prefix, execution_pvc
 VK_NODE_NAME = "gpu-worker"
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _ensure_lab_env(single_tenant_env):
+    pass
+
+
 def force_delete_pod(core_api, name, namespace, timeout=60):
     """Delete a pod with grace_period=0 and wait for it to disappear."""
     try:
@@ -75,8 +80,67 @@ def test_virtual_node_exists(tenant_clients):
 
 
 @pytest.mark.vk
+def test_virtual_node_reports_worker_resources(tenant_clients, worker_clients):
+    """Verify virtual node capacity matches the real worker cluster resources."""
+    tenant_core, _ = tenant_clients
+    worker_core, _ = worker_clients
+
+    vk_node = tenant_core.read_node(name=VK_NODE_NAME)
+    vk_alloc = vk_node.status.allocatable or {}
+
+    worker_nodes = worker_core.list_node()
+    total_cpu = 0
+    total_memory = 0
+    total_gpu = 0
+    total_pods = 0
+    for n in worker_nodes.items:
+        if n.spec.unschedulable:
+            continue
+        alloc = n.status.allocatable or {}
+        if "cpu" in alloc:
+            total_cpu += int(alloc["cpu"].rstrip("m"))
+        if "memory" in alloc:
+            mem = alloc["memory"]
+            if mem.endswith("Ki"):
+                total_memory += int(mem.rstrip("Ki"))
+        if "nvidia.com/gpu" in alloc:
+            total_gpu += int(alloc["nvidia.com/gpu"])
+        if "pods" in alloc:
+            total_pods += int(alloc["pods"])
+
+    vk_cpu = vk_alloc.get("cpu", "0")
+    vk_cpu_m = int(vk_cpu.rstrip("m")) if "m" in vk_cpu else int(vk_cpu) * 1000
+    assert vk_cpu_m == total_cpu, (
+        f"VK CPU {vk_cpu_m}m != worker {total_cpu}m"
+    )
+
+    vk_mem = vk_alloc.get("memory", "0")
+    if vk_mem.endswith("Ki"):
+        vk_mem_ki = int(vk_mem.rstrip("Ki"))
+    else:
+        vk_mem_ki = int(vk_mem) // 1024
+    assert vk_mem_ki == total_memory, (
+        f"VK memory {vk_mem_ki}Ki != worker {total_memory}Ki"
+    )
+
+    vk_gpu = int(vk_alloc.get("nvidia.com/gpu", "0"))
+    assert vk_gpu == total_gpu, (
+        f"VK GPU {vk_gpu} != worker {total_gpu}"
+    )
+
+    vk_pods = int(vk_alloc.get("pods", "0"))
+    assert vk_pods == total_pods, (
+        f"VK pods {vk_pods} != worker {total_pods}"
+    )
+
+    print(f"\nVirtual node resources match worker: "
+          f"CPU={total_cpu}m, Memory={total_memory}Ki, "
+          f"GPU={total_gpu}, Pods={total_pods}")
+
+
+@pytest.mark.vk
 def test_gpu_pod_dispatched_via_vk(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Submit a GPU pod on the tenant targeting the virtual node.
@@ -125,6 +189,7 @@ def test_gpu_pod_dispatched_via_vk(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
 
     # Wait for pod to appear on worker
     deadline = time.time() + 60
@@ -186,16 +251,10 @@ def test_gpu_pod_dispatched_via_vk(
                 f"nvidia-smi exited with {cstatus.state.terminated.exit_code}"
             )
 
-    # Cleanup
-    try:
-        tenant_core.delete_namespaced_pod(name=pod_name, namespace=ns)
-    except client.exceptions.ApiException:
-        pass
-
 
 @pytest.mark.vk
 def test_resource_sync(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Create a Secret and ConfigMap on tenant, submit a pod that references
@@ -222,6 +281,7 @@ def test_resource_sync(
             string_data={"MY_SECRET": "hello-from-tenant"},
         ),
     )
+    cleanup(tenant_core.delete_namespaced_secret, name=secret_name, namespace=ns)
 
     # Create ConfigMap on tenant
     try:
@@ -235,6 +295,7 @@ def test_resource_sync(
             data={"config.txt": "value-from-tenant"},
         ),
     )
+    cleanup(tenant_core.delete_namespaced_config_map, name=cm_name, namespace=ns)
 
     # Cleanup pod from previous runs
     force_delete_pod(tenant_core, pod_name, ns)
@@ -284,6 +345,7 @@ def test_resource_sync(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
 
     # Wait for resources to appear on worker
     deadline = time.time() + 30
@@ -343,24 +405,10 @@ def test_resource_sync(
         f"The pod may have failed to read the synced secret/configmap."
     )
 
-    # Cleanup
-    try:
-        tenant_core.delete_namespaced_pod(name=pod_name, namespace=ns)
-    except client.exceptions.ApiException:
-        pass
-    try:
-        tenant_core.delete_namespaced_secret(name=secret_name, namespace=ns)
-    except client.exceptions.ApiException:
-        pass
-    try:
-        tenant_core.delete_namespaced_config_map(name=cm_name, namespace=ns)
-    except client.exceptions.ApiException:
-        pass
-
 
 @pytest.mark.vk
 def test_pod_deletion_cleans_up(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Submit a pod via VK, wait for completion, delete tenant pod,
@@ -386,6 +434,7 @@ def test_pod_deletion_cleans_up(
             string_data={"KEY": "value"},
         ),
     )
+    cleanup(tenant_core.delete_namespaced_secret, name=secret_name, namespace=ns)
 
     # Cleanup from previous runs
     force_delete_pod(tenant_core, pod_name, ns)
@@ -422,6 +471,7 @@ def test_pod_deletion_cleans_up(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
 
     # Wait for worker pod to exist
     deadline = time.time() + 60
@@ -474,16 +524,10 @@ def test_pod_deletion_cleans_up(
         f"Synced secret {secret_name} not cleaned up on worker after pod deletion"
     )
 
-    # Cleanup tenant secret
-    try:
-        tenant_core.delete_namespaced_secret(name=secret_name, namespace=ns)
-    except client.exceptions.ApiException:
-        pass
-
 
 @pytest.mark.vk
 def test_catapult_pvc_sync(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Create a PVC with storageClass=catapult on tenant, submit a pod that
@@ -529,6 +573,7 @@ def test_catapult_pvc_sync(
             ),
         ),
     )
+    cleanup(tenant_core.delete_namespaced_persistent_volume_claim, name=pvc_name, namespace=ns)
 
     # Create pod that mounts the PVC
     pod = client.V1Pod(
@@ -566,6 +611,7 @@ def test_catapult_pvc_sync(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
 
     # Wait for execution PVC to appear on worker (namespace-prefixed name)
     deadline = time.time() + 30
@@ -634,7 +680,7 @@ def test_catapult_pvc_sync(
 
 @pytest.mark.vk
 def test_non_catapult_pvc_rejected(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Submit a pod referencing a PVC without storageClass=catapult.
@@ -678,6 +724,7 @@ def test_non_catapult_pvc_rejected(
             ),
         ),
     )
+    cleanup(tenant_core.delete_namespaced_persistent_volume_claim, name=pvc_name, namespace=ns)
 
     # Create pod that mounts the non-catapult PVC
     pod = client.V1Pod(
@@ -715,6 +762,7 @@ def test_non_catapult_pvc_rejected(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
 
     # Wait for pod to be marked Failed with InvalidPVCStorageClass
     deadline = time.time() + 30
@@ -746,24 +794,10 @@ def test_non_catapult_pvc_rejected(
     except client.exceptions.ApiException as e:
         assert e.status == 404
 
-    # Cleanup
-    try:
-        tenant_core.delete_namespaced_pod(
-            name=pod_name, namespace=ns, grace_period_seconds=0
-        )
-    except client.exceptions.ApiException:
-        pass
-    try:
-        tenant_core.delete_namespaced_persistent_volume_claim(
-            name=pvc_name, namespace=ns
-        )
-    except client.exceptions.ApiException:
-        pass
-
 
 @pytest.mark.vk
 def test_multitenant_namespace_isolation(
-    tenant_clients, worker_clients, worker_namespace_prefix,
+    cleanup, tenant_clients, worker_clients, worker_namespace_prefix,
 ):
     """
     Prove that per-tenant worker namespaces isolate resources.
@@ -797,6 +831,8 @@ def test_multitenant_namespace_isolation(
         except client.exceptions.ApiException as e:
             if e.status != 409:
                 raise
+    cleanup(tenant_core.delete_namespace, name=ns_a)
+    cleanup(tenant_core.delete_namespace, name=ns_b)
 
     # Cleanup from previous runs
     for core, name, target_ns in [
@@ -831,6 +867,7 @@ def test_multitenant_namespace_isolation(
             string_data={"team": "alpha"},
         ),
     )
+    cleanup(tenant_core.delete_namespaced_secret, name=secret_name, namespace=ns_a)
     tenant_core.create_namespaced_secret(
         namespace=ns_b,
         body=client.V1Secret(
@@ -838,6 +875,7 @@ def test_multitenant_namespace_isolation(
             string_data={"team": "bravo"},
         ),
     )
+    cleanup(tenant_core.delete_namespaced_secret, name=secret_name, namespace=ns_b)
 
     # Dispatch pods from both namespaces — both read the same secret name
     for pod_name, ns in [(pod_a_name, ns_a), (pod_b_name, ns_b)]:
@@ -873,6 +911,8 @@ def test_multitenant_namespace_isolation(
         )
         tenant_core.create_namespaced_pod(namespace=ns, body=pod)
         time.sleep(2)
+    cleanup(force_delete_pod, tenant_core, pod_a_name, ns_a)
+    cleanup(force_delete_pod, tenant_core, pod_b_name, ns_b)
 
     # Wait for both worker pods to exist in their respective namespaces
     deadline = time.time() + 90
@@ -915,37 +955,10 @@ def test_multitenant_namespace_isolation(
     assert val_a == "alpha", f"Expected 'alpha' in {wns_a}, got {val_a!r}"
     assert val_b == "bravo", f"Expected 'bravo' in {wns_b}, got {val_b!r}"
 
-    # Cleanup
-    for core, name, target_ns in [
-        (tenant_core, pod_a_name, ns_a),
-        (tenant_core, pod_b_name, ns_b),
-    ]:
-        try:
-            core.delete_namespaced_pod(
-                name=name, namespace=target_ns, grace_period_seconds=0
-            )
-        except client.exceptions.ApiException:
-            pass
-
-    for ns in [ns_a, ns_b]:
-        try:
-            tenant_core.delete_namespaced_secret(
-                name=secret_name, namespace=ns
-            )
-        except client.exceptions.ApiException:
-            pass
-
-    time.sleep(5)
-    for ns in [ns_a, ns_b]:
-        try:
-            tenant_core.delete_namespace(name=ns)
-        except client.exceptions.ApiException:
-            pass
-
 
 @pytest.mark.vk
 def test_pod_logs_proxied_from_worker(
-    tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
 ):
     """
     Submit a pod on the virtual node that prints a known message.
@@ -984,6 +997,7 @@ def test_pod_logs_proxied_from_worker(
         ),
     )
     tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
 
     # Wait for pod to succeed
     deadline = time.time() + 120
@@ -1018,6 +1032,3 @@ def test_pod_logs_proxied_from_worker(
         name=w_pod_name, namespace=vk_worker_namespace, container="echo"
     )
     assert marker in worker_logs, "Worker logs should contain marker"
-
-    # Cleanup
-    force_delete_pod(tenant_core, pod_name, ns)

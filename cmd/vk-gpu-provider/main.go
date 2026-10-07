@@ -33,9 +33,9 @@ func main() {
 
 	var (
 		nodeName                  string
+		providerID                string
 		workerKubeconfig          string
 		workerNamespacePrefix     string
-		gpuCount                  int
 		tenantKubeconfig          string
 		defaultRemoteStorageClass string
 		taintValue                string
@@ -45,9 +45,10 @@ func main() {
 	)
 
 	flag.StringVar(&nodeName, "nodename", "gpu-worker", "Name of the virtual node")
+	flag.StringVar(&providerID, "provider-id", "",
+		"Unique identifier for this VK instance. Scopes the managed-by label and config ConfigMap to avoid collisions when multiple VK instances share a tenant cluster. Defaults to --nodename value.")
 	flag.StringVar(&workerKubeconfig, "worker-kubeconfig", "", "Path to worker cluster kubeconfig")
 	flag.StringVar(&workerNamespacePrefix, "worker-namespace-prefix", "", "Prefix for per-tenant worker namespaces (e.g. vk-tenant1-). Auto-generated if empty.")
-	flag.IntVar(&gpuCount, "gpu-count", 1, "Number of GPUs to advertise")
 	flag.StringVar(&tenantKubeconfig, "kubeconfig", "", "Path to tenant cluster kubeconfig (empty = in-cluster)")
 	flag.StringVar(&defaultRemoteStorageClass, "default-remote-storage-class", "lvms-vg1",
 		"Default StorageClass for execution PVCs on the GPU cluster")
@@ -60,6 +61,10 @@ func main() {
 	flag.StringVar(&kubeletCertPath, "kubelet-cert", "",
 		"Path to PEM file with cert+key for the kubelet API TLS (e.g. node's kubelet-server-current.pem)")
 	flag.Parse()
+
+	if providerID == "" {
+		providerID = nodeName
+	}
 
 	if workerKubeconfig == "" {
 		klog.Fatal("--worker-kubeconfig is required")
@@ -79,7 +84,8 @@ func main() {
 	}
 
 	if workerNamespacePrefix == "" {
-		resolved, err := resolveNamespacePrefix(ctx, tenantClient)
+		configMapName := "vk-gpu-provider-config-" + providerID
+		resolved, err := resolveNamespacePrefix(ctx, tenantClient, configMapName)
 		if err != nil {
 			klog.Fatalf("Failed to resolve worker namespace prefix: %v", err)
 		}
@@ -142,8 +148,8 @@ func main() {
 		func(cfg nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
 			provider := NewGPUProvider(GPUProviderConfig{
 				NodeName:                  nodeName,
+				ProviderID:                providerID,
 				WorkerNamespacePrefix:     workerNamespacePrefix,
-				GPUCount:                  gpuCount,
 				DefaultRemoteStorageClass: defaultRemoteStorageClass,
 				TaintValue:                taintValue,
 				NodeIP:                    nodeIP,
@@ -205,17 +211,16 @@ func buildClient(kubeconfig string, insecure bool) (kubernetes.Interface, error)
 	return kubernetes.NewForConfig(cfg)
 }
 
-const prefixConfigMapName = "vk-gpu-provider-config"
 const prefixConfigMapNS = "kube-system"
 
-func resolveNamespacePrefix(ctx context.Context, client kubernetes.Interface) (string, error) {
-	cm, err := client.CoreV1().ConfigMaps(prefixConfigMapNS).Get(ctx, prefixConfigMapName, metav1.GetOptions{})
+func resolveNamespacePrefix(ctx context.Context, client kubernetes.Interface, configMapName string) (string, error) {
+	cm, err := client.CoreV1().ConfigMaps(prefixConfigMapNS).Get(ctx, configMapName, metav1.GetOptions{})
 	if err == nil {
 		if p := cm.Data["worker-namespace-prefix"]; p != "" {
 			return p, nil
 		}
 	} else if !errors.IsNotFound(err) {
-		return "", fmt.Errorf("get configmap %s/%s: %w", prefixConfigMapNS, prefixConfigMapName, err)
+		return "", fmt.Errorf("get configmap %s/%s: %w", prefixConfigMapNS, configMapName, err)
 	}
 
 	existingCM := cm
@@ -235,7 +240,7 @@ func resolveNamespacePrefix(ctx context.Context, client kubernetes.Interface) (s
 	} else {
 		cmObj := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      prefixConfigMapName,
+				Name:      configMapName,
 				Namespace: prefixConfigMapNS,
 			},
 			Data: map[string]string{"worker-namespace-prefix": prefix},

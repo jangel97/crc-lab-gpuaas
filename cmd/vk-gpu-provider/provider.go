@@ -25,7 +25,6 @@ import (
 
 const (
 	labelManagedBy       = "app.kubernetes.io/managed-by"
-	labelManagedByValue  = "vk-gpu-provider"
 	labelSourceNamespace = "vk.gpuaas.io/source-namespace"
 	labelSourceName      = "vk.gpuaas.io/source-name"
 	labelSourcePod       = "vk.gpuaas.io/source-pod"
@@ -33,8 +32,8 @@ const (
 
 type GPUProviderConfig struct {
 	NodeName                  string
+	ProviderID                string
 	WorkerNamespacePrefix     string
-	GPUCount                  int
 	DefaultRemoteStorageClass string
 	TaintValue                string
 	NodeIP                    string
@@ -47,16 +46,23 @@ type GPUProvider struct {
 	cfg    GPUProviderConfig
 	syncer *ResourceSyncer
 
-	mu          sync.Mutex
-	managedPods map[string]string      // tenant "namespace/name" -> worker pod name
-	podCache    map[string]*corev1.Pod // tenant "namespace/name" -> tenant-view pod with worker status
-	notifyCb    func(*corev1.Pod)
+	mu           sync.Mutex
+	managedPods  map[string]string      // tenant "namespace/name" -> worker pod name
+	podCache     map[string]*corev1.Pod // tenant "namespace/name" -> tenant-view pod with worker status
+	notifyCb      func(*corev1.Pod)
+	nodeNotifyCb  func(*corev1.Node)
+	lastResources corev1.ResourceList
+}
+
+func (p *GPUProvider) managedByValue() string {
+	return "vk-gpu-provider-" + p.cfg.ProviderID
 }
 
 func NewGPUProvider(cfg GPUProviderConfig) *GPUProvider {
+	managedBy := "vk-gpu-provider-" + cfg.ProviderID
 	return &GPUProvider{
 		cfg:         cfg,
-		syncer:      NewResourceSyncer(cfg.TenantClient, cfg.WorkerClient, cfg.WorkerNamespacePrefix, cfg.DefaultRemoteStorageClass),
+		syncer:      NewResourceSyncer(cfg.TenantClient, cfg.WorkerClient, cfg.WorkerNamespacePrefix, cfg.DefaultRemoteStorageClass, managedBy),
 		managedPods: make(map[string]string),
 		podCache:    make(map[string]*corev1.Pod),
 	}
@@ -237,6 +243,10 @@ func (p *GPUProvider) Ping(ctx context.Context) error {
 }
 
 func (p *GPUProvider) NotifyNodeStatus(ctx context.Context, cb func(*corev1.Node)) {
+	p.mu.Lock()
+	p.nodeNotifyCb = cb
+	p.mu.Unlock()
+	go p.nodeStatusUpdater(ctx)
 }
 
 // --- nodeutil.Provider stubs (not used — no kubelet API server) ---
@@ -309,13 +319,14 @@ func (p *GPUProvider) startWorkerInformer(ctx context.Context) error {
 		"pods",
 		metav1.NamespaceAll,
 		func(options *metav1.ListOptions) {
-			options.LabelSelector = labelManagedBy + "=" + labelManagedByValue
+			options.LabelSelector = labelManagedBy + "=" + p.managedByValue()
 		},
 	)
 	_, workerInformer := cache.NewInformer(workerLW, &corev1.Pod{}, 30*time.Second,
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    func(obj interface{}) { p.handleWorkerPodEvent(obj) },
 			UpdateFunc: func(_, obj interface{}) { p.handleWorkerPodEvent(obj) },
+			DeleteFunc: func(obj interface{}) { p.handleWorkerPodDelete(obj) },
 		},
 	)
 
@@ -423,6 +434,60 @@ func (p *GPUProvider) handleWorkerPodEvent(obj interface{}) {
 	}
 }
 
+func (p *GPUProvider) handleWorkerPodDelete(obj interface{}) {
+	workerPod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		workerPod, ok = tombstone.Obj.(*corev1.Pod)
+		if !ok {
+			return
+		}
+	}
+
+	sourceNS := workerPod.Labels[labelSourceNamespace]
+	sourceName := workerPod.Labels[labelSourceName]
+	if sourceNS == "" || sourceName == "" {
+		return
+	}
+
+	key := sourceNS + "/" + sourceName
+
+	p.mu.Lock()
+	_, managed := p.managedPods[key]
+	cached := p.podCache[key]
+	p.mu.Unlock()
+
+	if !managed {
+		return
+	}
+
+	klog.Infof("Worker pod deleted externally: %s/%s (tenant pod %s)", workerPod.Namespace, workerPod.Name, key)
+
+	var tenantPod *corev1.Pod
+	if cached != nil {
+		tenantPod = cached.DeepCopy()
+	} else {
+		tenantPod = &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: sourceName, Namespace: sourceNS},
+		}
+	}
+	tenantPod.Status.Phase = corev1.PodFailed
+	tenantPod.Status.Reason = "WorkerPodPreempted"
+	tenantPod.Status.Message = fmt.Sprintf("Worker pod %s/%s was deleted (likely preempted by Kueue)", workerPod.Namespace, workerPod.Name)
+
+	p.mu.Lock()
+	p.podCache[key] = tenantPod
+	cb := p.notifyCb
+	p.mu.Unlock()
+
+	if cb != nil {
+		cb(tenantPod)
+	}
+}
+
 func (p *GPUProvider) storeAndNotify(pod *corev1.Pod, phase corev1.PodPhase, reason, message string) {
 	failedPod := pod.DeepCopy()
 	failedPod.Status.Phase = phase
@@ -440,43 +505,74 @@ func (p *GPUProvider) storeAndNotify(pod *corev1.Pod, phase corev1.PodPhase, rea
 	}
 }
 
-// ConfigureNode sets up the virtual node spec with GPU capacity and VK taints.
-func (p *GPUProvider) ConfigureNode(n *corev1.Node) {
-	if n.Labels == nil {
-		n.Labels = make(map[string]string)
-	}
-	n.Labels["kubernetes.io/os"] = "linux"
-	n.Labels["kubernetes.io/arch"] = "amd64"
-	n.Labels["node.kubernetes.io/gpu"] = "true"
-
-	n.Spec.Taints = []corev1.Taint{
-		{Key: "virtual-kubelet.io/provider", Value: p.cfg.TaintValue, Effect: corev1.TaintEffectNoSchedule},
-		{Key: "virtual-kubelet.io/provider", Value: p.cfg.TaintValue, Effect: corev1.TaintEffectNoExecute},
+// fetchWorkerResources queries all schedulable nodes on the worker cluster and
+// aggregates their Allocatable resources into a single ResourceList.
+func (p *GPUProvider) fetchWorkerResources(ctx context.Context) (corev1.ResourceList, error) {
+	nodeList, err := p.cfg.WorkerClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list worker nodes: %w", err)
 	}
 
-	gpuQty := resource.MustParse(fmt.Sprintf("%d", p.cfg.GPUCount))
+	totalCPU := resource.Quantity{}
+	totalMemory := resource.Quantity{}
+	totalPods := resource.Quantity{}
+	totalGPU := resource.Quantity{}
+	totalEphemeral := resource.Quantity{}
+
+	for _, n := range nodeList.Items {
+		if n.Spec.Unschedulable {
+			continue
+		}
+		if hasBlockingTaints(n.Spec.Taints) {
+			continue
+		}
+		alloc := n.Status.Allocatable
+		if alloc == nil {
+			continue
+		}
+		if v, ok := alloc[corev1.ResourceCPU]; ok {
+			totalCPU.Add(v)
+		}
+		if v, ok := alloc[corev1.ResourceMemory]; ok {
+			totalMemory.Add(v)
+		}
+		if v, ok := alloc[corev1.ResourcePods]; ok {
+			totalPods.Add(v)
+		}
+		if v, ok := alloc[corev1.ResourceName("nvidia.com/gpu")]; ok {
+			totalGPU.Add(v)
+		}
+		if v, ok := alloc[corev1.ResourceEphemeralStorage]; ok {
+			totalEphemeral.Add(v)
+		}
+	}
+
+	result := corev1.ResourceList{
+		corev1.ResourceCPU:    totalCPU,
+		corev1.ResourceMemory: totalMemory,
+		corev1.ResourcePods:   totalPods,
+	}
+	if !totalGPU.IsZero() {
+		result[corev1.ResourceName("nvidia.com/gpu")] = totalGPU
+	}
+	if !totalEphemeral.IsZero() {
+		result[corev1.ResourceEphemeralStorage] = totalEphemeral
+	}
+	return result, nil
+}
+
+func (p *GPUProvider) buildNodeStatus(resources corev1.ResourceList) corev1.NodeStatus {
 	nodeIP := p.cfg.NodeIP
 	if nodeIP == "" {
 		nodeIP = "127.0.0.1"
 	}
-
-	n.Status = corev1.NodeStatus{
+	return corev1.NodeStatus{
 		Phase: corev1.NodeRunning,
 		DaemonEndpoints: corev1.NodeDaemonEndpoints{
 			KubeletEndpoint: corev1.DaemonEndpoint{Port: p.cfg.KubeletPort},
 		},
-		Capacity: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("8"),
-			corev1.ResourceMemory: resource.MustParse("24Gi"),
-			corev1.ResourcePods:   resource.MustParse("20"),
-			"nvidia.com/gpu":      gpuQty,
-		},
-		Allocatable: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("8"),
-			corev1.ResourceMemory: resource.MustParse("24Gi"),
-			corev1.ResourcePods:   resource.MustParse("20"),
-			"nvidia.com/gpu":      gpuQty,
-		},
+		Capacity:    resources.DeepCopy(),
+		Allocatable: resources.DeepCopy(),
 		Conditions: []corev1.NodeCondition{
 			{
 				Type: corev1.NodeReady, Status: corev1.ConditionTrue,
@@ -498,6 +594,86 @@ func (p *GPUProvider) ConfigureNode(n *corev1.Node) {
 	}
 }
 
+func (p *GPUProvider) updateNodeStatus(ctx context.Context) {
+	resources, err := p.fetchWorkerResources(ctx)
+	if err != nil {
+		klog.Warningf("Failed to fetch worker resources: %v", err)
+		return
+	}
+
+	p.mu.Lock()
+	changed := !resourceListsEqual(p.lastResources, resources)
+	if changed {
+		p.lastResources = resources.DeepCopy()
+	}
+	cb := p.nodeNotifyCb
+	p.mu.Unlock()
+
+	if !changed || cb == nil {
+		return
+	}
+
+	cb(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: p.cfg.NodeName,
+			Labels: map[string]string{
+				"type":                   "virtual-kubelet",
+				"kubernetes.io/role":     "agent",
+				"kubernetes.io/hostname": p.cfg.NodeName,
+				"kubernetes.io/os":       "linux",
+				"kubernetes.io/arch":     "amd64",
+				"node.kubernetes.io/gpu": "true",
+			},
+		},
+		Status: p.buildNodeStatus(resources),
+	})
+}
+
+func (p *GPUProvider) nodeStatusUpdater(ctx context.Context) {
+	p.updateNodeStatus(ctx)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.updateNodeStatus(ctx)
+		}
+	}
+}
+
+// ConfigureNode sets up the virtual node spec with GPU capacity and VK taints.
+// Fetches real resources from the worker cluster; falls back to defaults if unavailable.
+func (p *GPUProvider) ConfigureNode(n *corev1.Node) {
+	if n.Labels == nil {
+		n.Labels = make(map[string]string)
+	}
+	n.Labels["kubernetes.io/os"] = "linux"
+	n.Labels["kubernetes.io/arch"] = "amd64"
+	n.Labels["node.kubernetes.io/gpu"] = "true"
+
+	n.Spec.Taints = []corev1.Taint{
+		{Key: "virtual-kubelet.io/provider", Value: p.cfg.TaintValue, Effect: corev1.TaintEffectNoSchedule},
+		{Key: "virtual-kubelet.io/provider", Value: p.cfg.TaintValue, Effect: corev1.TaintEffectNoExecute},
+	}
+
+	resources, err := p.fetchWorkerResources(context.TODO())
+	if err != nil {
+		klog.Warningf("Could not fetch worker resources at startup, using defaults: %v", err)
+		resources = corev1.ResourceList{
+			corev1.ResourceCPU:                     resource.MustParse("8"),
+			corev1.ResourceMemory:                  resource.MustParse("24Gi"),
+			corev1.ResourcePods:                    resource.MustParse("20"),
+			corev1.ResourceName("nvidia.com/gpu"):  resource.MustParse("1"),
+		}
+	} else {
+		klog.Infof("Virtual node resources from worker cluster: %v", resources)
+	}
+
+	n.Status = p.buildNodeStatus(resources)
+}
+
 // --- Pod transformation (unchanged) ---
 
 func (p *GPUProvider) ensureNamespace(ctx context.Context, ns string) error {
@@ -512,7 +688,7 @@ func (p *GPUProvider) ensureNamespace(ctx context.Context, ns string) error {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: ns,
 			Labels: map[string]string{
-				labelManagedBy: labelManagedByValue,
+				labelManagedBy: p.managedByValue(),
 			},
 		},
 	}
@@ -539,6 +715,32 @@ func isSystemNamespace(ns string) bool {
 		ns == "kueue-system"
 }
 
+func resourceListsEqual(a, b corev1.ResourceList) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		bv, ok := b[k]
+		if !ok || v.Cmp(bv) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func hasBlockingTaints(taints []corev1.Taint) bool {
+	for _, t := range taints {
+		if t.Effect != corev1.TaintEffectNoSchedule && t.Effect != corev1.TaintEffectNoExecute {
+			continue
+		}
+		if t.Key == "nvidia.com/gpu" || t.Key == "node-role.kubernetes.io/worker" {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func isDaemonSetPod(pod *corev1.Pod) bool {
 	for _, ref := range pod.OwnerReferences {
 		if ref.Kind == "DaemonSet" {
@@ -549,8 +751,7 @@ func isDaemonSetPod(pod *corev1.Pod) bool {
 }
 
 var labelSkipSet = map[string]bool{
-	"kueue.x-k8s.io/queue-name": true,
-	labelManagedBy:               true,
+	labelManagedBy: true,
 }
 
 var labelSkipPrefixes = []string{
@@ -579,7 +780,7 @@ func (p *GPUProvider) transformPod(pod *corev1.Pod, workerNS string, pvcNameMap 
 			Name:      workerPodName(pod.Namespace, pod.Name),
 			Namespace: workerNS,
 			Labels: map[string]string{
-				labelManagedBy:       labelManagedByValue,
+				labelManagedBy:       p.managedByValue(),
 				labelSourceNamespace: pod.Namespace,
 				labelSourceName:      pod.Name,
 			},
