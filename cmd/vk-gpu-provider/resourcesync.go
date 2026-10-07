@@ -27,14 +27,16 @@ type ResourceSyncer struct {
 	workerClient              kubernetes.Interface
 	workerNamespacePrefix     string
 	defaultRemoteStorageClass string
+	managedByValue            string
 }
 
-func NewResourceSyncer(tenant, worker kubernetes.Interface, workerNSPrefix, defaultRemoteSC string) *ResourceSyncer {
+func NewResourceSyncer(tenant, worker kubernetes.Interface, workerNSPrefix, defaultRemoteSC, managedByValue string) *ResourceSyncer {
 	return &ResourceSyncer{
 		tenantClient:              tenant,
 		workerClient:              worker,
 		workerNamespacePrefix:     workerNSPrefix,
 		defaultRemoteStorageClass: defaultRemoteSC,
+		managedByValue:            managedByValue,
 	}
 }
 
@@ -74,7 +76,9 @@ func discoverReferences(pod *corev1.Pod) (secrets, configmaps []string) {
 	secretSet := make(map[string]bool)
 	cmSet := make(map[string]bool)
 
-	allContainers := append(pod.Spec.Containers, pod.Spec.InitContainers...)
+	allContainers := make([]corev1.Container, 0, len(pod.Spec.Containers)+len(pod.Spec.InitContainers))
+	allContainers = append(allContainers, pod.Spec.Containers...)
+	allContainers = append(allContainers, pod.Spec.InitContainers...)
 	for _, c := range allContainers {
 		for _, env := range c.Env {
 			if env.ValueFrom != nil {
@@ -139,7 +143,7 @@ func (s *ResourceSyncer) syncSecret(ctx context.Context, sourceNS, podName, name
 			Name:      name,
 			Namespace: wns,
 			Labels: map[string]string{
-				labelManagedBy:       labelManagedByValue,
+				labelManagedBy:       s.managedByValue,
 				labelSourceNamespace: sourceNS,
 				labelSourcePod:       podName,
 			},
@@ -181,7 +185,7 @@ func (s *ResourceSyncer) syncConfigMap(ctx context.Context, sourceNS, podName, n
 			Name:      name,
 			Namespace: wns,
 			Labels: map[string]string{
-				labelManagedBy:       labelManagedByValue,
+				labelManagedBy:       s.managedByValue,
 				labelSourceNamespace: sourceNS,
 				labelSourcePod:       podName,
 			},
@@ -229,7 +233,7 @@ func (s *ResourceSyncer) syncServiceAccount(ctx context.Context, sourceNS, podNa
 			Name:      name,
 			Namespace: wns,
 			Labels: map[string]string{
-				labelManagedBy:       labelManagedByValue,
+				labelManagedBy:       s.managedByValue,
 				labelSourceNamespace: sourceNS,
 				labelSourcePod:       podName,
 			},
@@ -293,7 +297,7 @@ func (s *ResourceSyncer) syncService(ctx context.Context, sourceNS, podName stri
 			Name:      svc.Name,
 			Namespace: wns,
 			Labels: map[string]string{
-				labelManagedBy:       labelManagedByValue,
+				labelManagedBy:       s.managedByValue,
 				labelSourceNamespace: sourceNS,
 				labelSourcePod:       podName,
 			},
@@ -380,7 +384,7 @@ func (s *ResourceSyncer) syncCatapultPVC(ctx context.Context, sourceNS, pvcName 
 			Name:      execName,
 			Namespace: wns,
 			Labels: map[string]string{
-				labelManagedBy:       labelManagedByValue,
+				labelManagedBy:       s.managedByValue,
 				labelSourceNamespace: sourceNS,
 				labelSourcePVC:       pvcName,
 			},
@@ -416,7 +420,7 @@ func (s *ResourceSyncer) CleanupExecutionPVC(ctx context.Context, sourceNS, pvcN
 
 func (s *ResourceSyncer) CleanupResources(ctx context.Context, sourceNS, podName string) error {
 	labelSelector := fmt.Sprintf("%s=%s,%s=%s,%s=%s",
-		labelManagedBy, labelManagedByValue,
+		labelManagedBy, s.managedByValue,
 		labelSourceNamespace, sourceNS,
 		labelSourcePod, podName,
 	)
