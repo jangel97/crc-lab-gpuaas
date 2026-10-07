@@ -358,7 +358,7 @@ def test_resource_sync(
             )
             if s.metadata.labels and s.metadata.labels.get(
                 "app.kubernetes.io/managed-by"
-            ) == "vk-gpu-provider":
+            ) == "vk-gpu-provider-gpu-worker":
                 secret_synced = True
         except client.exceptions.ApiException:
             pass
@@ -369,7 +369,7 @@ def test_resource_sync(
             )
             if c.metadata.labels and c.metadata.labels.get(
                 "app.kubernetes.io/managed-by"
-            ) == "vk-gpu-provider":
+            ) == "vk-gpu-provider-gpu-worker":
                 cm_synced = True
         except client.exceptions.ApiException:
             pass
@@ -622,7 +622,7 @@ def test_catapult_pvc_sync(
                 name=exec_pvc, namespace=vk_worker_namespace
             )
             labels = wpvc.metadata.labels or {}
-            if labels.get("app.kubernetes.io/managed-by") == "vk-gpu-provider":
+            if labels.get("app.kubernetes.io/managed-by") == "vk-gpu-provider-gpu-worker":
                 pvc_synced = True
                 break
         except client.exceptions.ApiException:

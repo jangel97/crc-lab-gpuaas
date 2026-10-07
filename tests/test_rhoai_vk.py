@@ -781,7 +781,7 @@ def test_pytorchjob_checkpoint_with_pvc(
         wpvc = worker_core.read_namespaced_persistent_volume_claim(
             name=exec_pvc, namespace=vk_worker_namespace,
         )
-        assert wpvc.metadata.labels.get("app.kubernetes.io/managed-by") == "vk-gpu-provider"
+        assert wpvc.metadata.labels.get("app.kubernetes.io/managed-by") == "vk-gpu-provider-gpu-worker"
     except client.exceptions.ApiException:
         pytest.fail(f"Execution PVC {exec_pvc} not found in {vk_worker_namespace}")
 
