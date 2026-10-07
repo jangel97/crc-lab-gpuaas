@@ -11,7 +11,7 @@ Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 +----- sno-tenant VM --------+    +----- sno-worker VM --------+
 |  12 vCPU, 16 GB RAM        |    |  8 vCPU, 24 GB RAM         |
 |                            |    |  GPU Operator (RTX 5090)   |
-|  VK Deployment             |    |  Kueue (local quota mgmt)  |
+|  VK Deployment             |    |  Kueue + Kyverno (quota)  |
 |    registers virtual node  |    |  LVMS (local storage)      |
 |    "gpu-worker" (1 GPU)    |    |                             |
 |                            |    |  per-tenant namespaces     |
@@ -192,22 +192,25 @@ python -m pytest tests/ -v -m rhoai
 
 # Run only networking tests (Submariner)
 python -m pytest tests/ -v -m networking
+
+# Run Kueue multi-tenant tests (requires both tenants + Kueue + Kyverno)
+TENANT_KUBECONFIG=~/.kube/tenant TENANT2_KUBECONFIG=~/.kube/tenant2 \
+  WORKER_KUBECONFIG=~/.kube/worker \
+  python -m pytest tests/ -v -m kueue
 ```
 
-### Test Results (2026-10-06)
+### Test Results (2026-10-07)
 
 8 core VK tests pass from both tenants (OCP 4.22 and OCP 4.18).
-14 total tests pass from tenant (VK + RHOAI + networking).
+19 total tests pass from tenant (VK + RHOAI + networking).
+3 Kueue multi-tenant tests pass (admission, quota, cross-tenant preemption).
 
 ```
-tests/test_vk_gpu.py::test_virtual_node_exists                                PASSED
-tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk                          PASSED
-tests/test_vk_gpu.py::test_resource_sync                                      PASSED
-tests/test_vk_gpu.py::test_pod_deletion_cleans_up                             PASSED
-tests/test_vk_gpu.py::test_catapult_pvc_sync                                  PASSED
-tests/test_vk_gpu.py::test_non_catapult_pvc_rejected                          PASSED
-tests/test_vk_gpu.py::test_multitenant_namespace_isolation                    PASSED
-tests/test_vk_gpu.py::test_pod_logs_proxied_from_worker                       PASSED
+tests/test_vk_gpu.py                 8 passed   (core dispatch, resource sync, logs)
+tests/test_rhoai_vk.py               7 passed   (PyTorchJob, Notebook, KServe)
+tests/test_submariner_networking.py   3 passed   (Service, Route, tunnel recovery)
+tests/test_distributed_training.py    1 passed   (headless Service DNS)
+tests/test_kueue_vk.py                3 passed   (admission, quota, preemption)
 ```
 
 ### Test Descriptions
@@ -228,6 +231,9 @@ tests/test_vk_gpu.py::test_pod_logs_proxied_from_worker                       PA
 | `test_multitenant_namespace_isolation` | vk | Two namespaces create same-named Secret → VK syncs each to its own per-tenant worker namespace → both exist with correct data → isolation proven |
 | `test_pod_logs_proxied_from_worker` | vk | Pod echoes known marker → `kubectl logs` on tenant proxied to worker pod → full output matches → `tail_lines=1` returns only last line |
 | `test_headless_service_dns_resolution` | networking | Two pods with hostname/subdomain + headless Service → VK syncs Service to worker → Pod B resolves Pod A via DNS → inter-pod DNS works for distributed training |
+| `test_kueue_admits_gpu_workload` | kueue | GPU pod dispatched via VK → Kyverno adds queue+priority labels → Kueue gates then admits → pod runs → VK syncs Succeeded |
+| `test_kueue_queues_when_full` | kueue | Two GPU pods when 1 GPU available → first admitted → second gated → first deleted → second admitted → Succeeded |
+| `test_kueue_preemption_cross_tenant` | kueue | Tenant1 (low priority) holds GPU → tenant2 (high priority) submits → Kueue preempts tenant1 → tenant2 runs |
 
 ### What the Tests Prove
 
@@ -257,6 +263,12 @@ tests/test_vk_gpu.py::test_pod_logs_proxied_from_worker                       PA
 11. **OCP/RHOAI version decoupling proven**: two tenants at different OCP
     versions (4.22 and 4.18) share the same GPU worker. The AI platform
     layer is fully decoupled from the GPU compute layer.
+12. **Kueue admission works with VK**: Kyverno adds queue/priority labels,
+    Kueue gates and admits pods, quota is enforced, all without any VK
+    Kueue awareness.
+13. **Cross-tenant GPU preemption works**: higher-priority tenant preempts
+    lower-priority tenant through Kueue. Priority is admin-controlled via
+    namespace labels — tenants cannot escalate.
 
 For the full spike assessment with all scenarios, results, and gaps, see
 [docs/spike-assessment.md](docs/spike-assessment.md).

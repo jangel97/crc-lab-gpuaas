@@ -16,7 +16,7 @@ Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 |  12 vCPU, 14 GB RAM        |  |  10 vCPU, 16 GB RAM        |  |  8 vCPU, 24 GB RAM         |
 |  OCP 4.22, RHOAI           |  |  OCP 4.18, RHOAI           |  |  OCP 4.22                  |
 |  VK → virtual node         |  |  VK → virtual node         |  |  GPU Operator (RTX 5090)   |
-|   "gpu-worker" (1 GPU)     |  |   "gpu-worker" (1 GPU)     |  |  Kueue, LVMS               |
+|   "gpu-worker" (1 GPU)     |  |   "gpu-worker" (1 GPU)     |  |  Kueue, Kyverno, LVMS      |
 +-----------------------------+  +-----------------------------+  +-----------------------------+
          \                                    |                               /
           +------- Submariner v0.24 (Libreswan IPsec) --------+--------------+
@@ -27,7 +27,7 @@ Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 | OpenShift | 4.22 | 4.18 | 4.22 |
 | vCPU / RAM | 12 / 14 GB | 10 / 16 GB | 8 / 24 GB |
 | GPU | — | — | RTX 5090 (32 GB VRAM) |
-| Operators | RHOAI | RHOAI | GPU Operator, Kueue, LVMS |
+| Operators | RHOAI | RHOAI | GPU Operator, Kueue, Kyverno, LVMS |
 | Pod CIDR | 10.128.0.0/14 | 10.136.0.0/14 | 10.132.0.0/14 |
 | Service CIDR | 172.30.0.0/16 | 172.32.0.0/16 | 172.31.0.0/16 |
 | Networking | Submariner v0.24 | Submariner v0.24 | Submariner v0.24 |
@@ -61,7 +61,20 @@ python -m pytest tests/ -v
 python -m pytest tests/ -v -m vk            # Core dispatch + resource sync + storage + logs
 python -m pytest tests/ -v -m rhoai         # RHOAI integration
 python -m pytest tests/ -v -m networking    # Cross-cluster networking (Submariner)
+python -m pytest tests/ -v -m kueue         # Kueue admission + preemption (needs both tenants)
 ```
+
+### Run Kueue tests (requires both tenants + Kueue + Kyverno on worker)
+
+```bash
+TENANT_KUBECONFIG=~/.kube/tenant TENANT2_KUBECONFIG=~/.kube/tenant2 \
+  WORKER_KUBECONFIG=~/.kube/worker \
+  python -m pytest tests/test_kueue_vk.py -v
+```
+
+The `kueue_setup` fixture auto-installs Kueue and Kyverno on the worker if
+missing, applies policies and RBAC, creates the ClusterQueue, and patches
+the Kueue webhook for reinvocation.
 
 ### Run against second tenant (OCP 4.18)
 
@@ -615,6 +628,96 @@ oc --kubeconfig=~/.kube/tenant2 get csv -n redhat-ods-operator | grep rhods
 
 ---
 
+### 10. Kueue Admission Control
+
+#### S21. Kueue admits GPU workload via Kyverno labels
+
+| | |
+|---|---|
+| **Test** | `test_kueue_vk.py::test_kueue_admits_gpu_workload` |
+| **What** | GPU pod submitted on tenant → VK dispatches to worker → Kyverno adds `kueue.x-k8s.io/queue-name` and `kueue.x-k8s.io/priority-class` labels → Kueue adds scheduling gate → Kueue admits → pod runs → VK syncs Succeeded back to tenant |
+| **Result** | PASS |
+| **Proves** | The full Kyverno + Kueue admission pipeline works with VK-dispatched pods. VK is completely Kueue-unaware — all admission logic is worker-side. |
+
+**How to run:**
+```bash
+TENANT_KUBECONFIG=~/.kube/tenant WORKER_KUBECONFIG=~/.kube/worker \
+  python -m pytest tests/test_kueue_vk.py::test_kueue_admits_gpu_workload -v
+```
+
+**What to look for:** The test:
+1. Labels the worker namespace with `gpuaas.redhat.com/default-priority: gpuaas-standard` and creates a LocalQueue
+2. Creates a tenant pod (`nvidia-smi`, 1 GPU, `nodeName: gpu-worker`)
+3. Verifies the worker pod has Kyverno-added labels: `kueue.x-k8s.io/queue-name=default` and `kueue.x-k8s.io/priority-class=gpuaas-standard`
+4. Waits for Kueue to remove the scheduling gate (admission)
+5. Verifies pod succeeds and tenant status syncs to Succeeded
+
+**How priority is assigned:** Kyverno's `mutate-priority` policy reads the namespace label `gpuaas.redhat.com/default-priority` and sets the pod's `kueue.x-k8s.io/priority-class` label accordingly. Tenants cannot set their own priority — VK clears `PriorityClassName` from worker pods, and Kyverno enforces a ceiling via `gpuaas.redhat.com/allowed-priorities`.
+
+---
+
+#### S22. Kueue queues second GPU pod when quota is exhausted
+
+| | |
+|---|---|
+| **Test** | `test_kueue_vk.py::test_kueue_queues_when_full` |
+| **What** | Two GPU pods submitted when only 1 GPU is available → first pod admitted and Running → second pod gated by Kueue (scheduling gate present, Pending) → first pod deleted → Kueue admits second pod → Succeeded |
+| **Result** | PASS |
+| **Proves** | Kueue quota enforcement works with VK-dispatched pods. The scheduling gate mechanism correctly queues excess workloads. |
+
+**How to run:**
+```bash
+TENANT_KUBECONFIG=~/.kube/tenant WORKER_KUBECONFIG=~/.kube/worker \
+  python -m pytest tests/test_kueue_vk.py::test_kueue_queues_when_full -v
+```
+
+**What to look for:** The test:
+1. Creates pod A (`sleep 300`, 1 GPU) — waits for Running
+2. Creates pod B (`nvidia-smi`, 1 GPU) — verifies it has the `kueue.x-k8s.io/admission` scheduling gate (queued)
+3. Verifies tenant pod B shows Pending (VK syncs the gated status)
+4. Deletes pod A → frees GPU quota → Kueue removes pod B's gate
+5. Pod B runs and succeeds
+
+---
+
+#### S23. Cross-tenant priority preemption via Kueue
+
+| | |
+|---|---|
+| **Test** | `test_kueue_vk.py::test_kueue_preemption_cross_tenant` |
+| **What** | Tenant1 (priority `gpuaas-opportunistic`, value 0) holds the GPU → Tenant2 (priority `gpuaas-production`, value 1000) submits → Kueue preempts tenant1's worker pod → tenant2's pod admitted and succeeds → VK detects deletion and transitions tenant1's pod to Failed |
+| **Result** | PASS |
+| **Proves** | Cross-tenant priority preemption through a shared ClusterQueue. Priority is namespace-scoped (admin labels), not tenant-controlled. Higher-priority tenants can reclaim GPU resources from lower-priority tenants. |
+
+**How to run:**
+```bash
+TENANT_KUBECONFIG=~/.kube/tenant TENANT2_KUBECONFIG=~/.kube/tenant2 \
+  WORKER_KUBECONFIG=~/.kube/worker \
+  python -m pytest tests/test_kueue_vk.py::test_kueue_preemption_cross_tenant -v
+```
+
+**What to look for:** The test:
+1. Labels tenant1's worker namespace as `gpuaas-opportunistic` (priority 0) and tenant2's as `gpuaas-production` (priority 1000)
+2. Tenant1 submits a long-running GPU pod → admitted → Running
+3. Tenant2 submits a GPU pod → Kueue preempts tenant1's worker pod (deletes it)
+4. Tenant2's pod is admitted → runs `nvidia-smi` → Succeeded
+5. Tenant1's pod transitions to `Failed` with reason `WorkerPodPreempted` (VK's worker informer `DeleteFunc` detects the worker pod deletion)
+
+**Architecture:** The preemption flow requires one VK change (the `DeleteFunc` handler). All admission/priority logic is worker-side:
+- **Kyverno** sets priority from namespace labels (admin-controlled, not tenant-controlled)
+- **Kueue** manages admission via scheduling gates and preempts via `withinClusterQueue: LowerPriority`
+- **VK** is purely pass-through — it dispatches pods and syncs status
+
+**Prerequisites (automated by `kueue_setup` fixture):**
+- Kueue v0.10+ on worker (pod integration mode)
+- Kyverno v1.14+ on worker (MutatingPolicy CEL support, privileged SCC on OpenShift)
+- WorkloadPriorityClasses: `gpuaas-production` (1000), `gpuaas-critical` (500), `gpuaas-standard` (100), `gpuaas-opportunistic` (0)
+- Kyverno policies: `mutate-queue-name`, `mutate-priority`, RBAC
+- ClusterQueue with `preemption.withinClusterQueue: LowerPriority`
+- Kueue webhook patched with `reinvocationPolicy: IfNeeded` (so Kueue re-processes pods after Kyverno adds labels)
+
+---
+
 ## Test Results Summary
 
 ### From tenant (OCP 4.22)
@@ -643,6 +746,16 @@ tests/test_distributed_training.py::test_headless_service_dns_resolution     PAS
 19 passed
 ```
 
+### From tenant + tenant2 (Kueue multi-tenant)
+
+```
+tests/test_kueue_vk.py::test_kueue_admits_gpu_workload                       PASSED
+tests/test_kueue_vk.py::test_kueue_queues_when_full                          PASSED
+tests/test_kueue_vk.py::test_kueue_preemption_cross_tenant                   PASSED
+
+3 passed
+```
+
 ### From tenant2 (OCP 4.18)
 
 ```
@@ -667,7 +780,7 @@ tests/test_vk_gpu.py::test_pod_logs_proxied_from_worker                       PA
 | **KServe inference (Knative serverless with Istio)** | Networking | Knative dispatch works (S20) but Istio sidecar is disabled because the sidecar would fail on the worker (no Istio control plane). Full Istio service mesh integration (mTLS, telemetry) across clusters not validated. | Low |
 | **Multi-pod PyTorchJob (full distributed)** | Training | Headless Service sync is proven (S13), single-pod real training proven (S16), but actual multi-GPU distributed training needs >1 GPU. Lab has 1 GPU. Mechanism is validated; full end-to-end deferred to multi-GPU environment. | Medium |
 | **Overlapping CIDRs (Globalnet)** | Networking | Lab uses non-overlapping CIDRs by design. Overlapping CIDRs require Globalnet which changes the PodIP sync model. Not PoC scope. | Low |
-| **Kueue admission control** | Quota | Worker has Kueue installed but VK does not submit AdmissionChecks or interact with LocalQueue. GPU quota enforcement across tenants not validated. | High |
+| ~~Kueue admission control~~ | ~~Quota~~ | Validated in S21-S23. Kueue admission, quota enforcement, and cross-tenant preemption all work with VK-dispatched pods. | ~~High~~ |
 
 ---
 
@@ -684,9 +797,10 @@ cluster's security policy, the pod fails visibly on the worker.
 
 ### Single GPU quota
 
-The lab has 1 GPU. When both tenants try to dispatch a GPU pod simultaneously,
-only one runs — the other waits. Kueue on the worker could manage fair-sharing,
-but VK does not interact with Kueue's admission system yet.
+The lab has 1 GPU. Kueue enforces quota and preemption (S21-S23), but
+fair-sharing policies (`borrowWithinCohort`, multiple ClusterQueues) are
+not tested. Multi-GPU scheduling behavior is deferred to a multi-GPU
+environment.
 
 ### RTX 5090 (Blackwell) CUDA compatibility
 
@@ -788,6 +902,25 @@ This cannot be fixed without an upstream Submariner change (e.g., a
 `routeAgentNodeSelector` field in the CR) or a mutating admission webhook
 that injects a nodeAffinity anti-rule for `type=virtual-kubelet`.
 
+### Worker RBAC is cluster-wide
+
+The `vk-remote-sa` service account on the worker cluster has a
+ClusterRoleBinding granting full CRUD on secrets, configmaps, PVCs,
+services, and service accounts across all namespaces — not just
+VK-managed ones. In a shared worker cluster this would allow VK's SA
+to read secrets from unrelated namespaces (monitoring, GPU Operator,
+Kueue).
+
+Kubernetes RBAC does not support namespace wildcards, and per-tenant
+worker namespaces are created dynamically, so namespaced RoleBindings
+cannot be pre-provisioned. The production fix is to extend
+`ensureNamespace` to also create a RoleBinding in each new per-tenant
+namespace and reduce the ClusterRole to just namespace creation and
+node reads.
+
+Risk in the spike is low — the worker cluster is single-purpose and
+has no sensitive workloads outside VK-managed namespaces.
+
 ### Kubelet API server requires privileged SCC
 
 The VK Deployment needs `hostNetwork: true` and a `hostPath` volume for the
@@ -870,6 +1003,23 @@ to the VK service account.
     queue-proxy. Istio sidecar is disabled (no control plane on worker).
     TODO: contribute `status.podIP`/`hostIP` support upstream (S20).
 
+17. **Kueue admission control works with VK-dispatched pods.** Kyverno
+    adds queue and priority labels, Kueue adds a scheduling gate, admits
+    or queues based on quota, and preempts lower-priority workloads when
+    higher-priority ones arrive. VK is completely Kueue-unaware — all
+    admission logic is worker-side (S21, S22, S23).
+
+18. **Cross-tenant GPU preemption works.** A higher-priority tenant
+    (production, value 1000) preempts a lower-priority tenant
+    (opportunistic, value 0) through Kueue's `withinClusterQueue:
+    LowerPriority` policy. Priority is admin-controlled via namespace
+    labels — tenants cannot escalate (S23).
+
+19. **GPU quota enforcement works across tenants.** When the single GPU
+    is occupied, additional GPU pods are queued via scheduling gates.
+    When the GPU is freed (pod completes or is deleted), the next pod
+    in the queue is admitted (S22).
+
 ## What This Spike Does Not Prove
 
 1. **Full multi-pod distributed training.** The DNS mechanism is proven
@@ -887,8 +1037,9 @@ to the VK service account.
    A proper fix would be Istio multi-cluster mesh (primary-remote), which
    is a separate effort. See `vk-architecture.md` § KServe / Knative.
 
-3. **Kueue quota enforcement.** Worker has Kueue but VK does not interact
-   with it. Fair-sharing between tenants is not validated.
+3. **Kueue fair-sharing policies.** Kueue admission and preemption are
+   validated (S21-S23), but `borrowWithinCohort` and multi-ClusterQueue
+   fair-sharing policies are not tested.
 
 4. **Production readiness.** No HA, no Globalnet for overlapping CIDRs,
    no performance benchmarks, no worker namespace garbage collection.

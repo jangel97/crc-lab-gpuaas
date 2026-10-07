@@ -12,10 +12,8 @@ package main
 // pod from the API server, so the worker pod retains the original fieldRefs
 // and the worker kubelet resolves them normally.
 //
-// Upstream fix: add cases for status.podIP, status.hostIP, status.podIPs,
-// status.phase (and spec.restartPolicy, spec.schedulerName) to
-// podFieldSelectorRuntimeValue in internal/podutils/env.go. Once fixed,
-// delete this file and remove the wrapper from main.go.
+// Upstream fix: https://github.com/virtual-kubelet/virtual-kubelet/pull/1451
+// Once merged, delete this file and remove the wrapper from main.go.
 
 import (
 	"context"

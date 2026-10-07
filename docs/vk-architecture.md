@@ -29,8 +29,13 @@ provider implements `PodLifecycleHandler`, `PodNotifier`, and `NodeProvider`.
    `PodController` and `NodeController`. The library creates or updates the
    Node object, manages the Lease in `kube-node-lease`, and calls
    `ConfigureNode` to set labels (`node.kubernetes.io/gpu: true`), taints
-   (NoSchedule + NoExecute for `virtual-kubelet.io/provider`), capacity
-   (GPU count, CPU, memory), and the node's InternalIP + kubelet port.
+   (NoSchedule + NoExecute for `virtual-kubelet.io/provider`), and the
+   node's InternalIP + kubelet port. **Node capacity and allocatable
+   resources (CPU, memory, GPU, pods, ephemeral-storage) are fetched
+   dynamically from the worker cluster** by aggregating allocatable
+   resources across all schedulable worker nodes. `NotifyNodeStatus`
+   starts a background goroutine that re-fetches every 30s and pushes
+   updates to the tenant only when values change.
 
 2. **Starts the worker pod informer** (our own, not managed by the library).
    Filtered `ListWatch` across **all namespaces** for pods with label
@@ -112,7 +117,7 @@ transformPod
     │  Deep-copy the pod spec and rewrite it for the worker cluster:
     │    - Name: {namespace}--{name}
     │    - Namespace: {prefix}{tenant-namespace}
-    │    - Labels: copy user labels (skip openshift.io/*, kueue queue, managed-by)
+    │    - Labels: copy user labels (skip openshift.io/*, managed-by)
     │              add: managed-by, source-namespace, source-name
     │    - Annotations: copy user annotations (skip openshift.io/*, kubernetes.io/*, k8s.ovn.org/*)
     │    - Clear: nodeName, nodeSelector, affinity, tolerations, schedulerName, priority
@@ -223,7 +228,7 @@ by the control PVC informer via `CleanupExecutionPVC`).
 | kube-api-access volumes | injected by kubelet | *(stripped)* |
 | SA token projected volumes | injected by kubelet | *(stripped)* |
 | PVC claim names | `checkpoint` | `my-namespace--checkpoint` |
-| Labels | user labels | user labels + managed-by + source labels |
+| Labels | user labels | user labels + managed-by + source labels (skip `openshift.io/*`, `pod-security.kubernetes.io/*`, `managed-by`) |
 
 ## Management Labels
 
@@ -310,6 +315,29 @@ incompatible with the worker cluster's security policy, the pod fails visibly
 See [security-context-handling.md](security-context-handling.md) for the full
 field classification and design rationale.
 
+## RHOAI Kueue Compatibility
+
+RHOAI installs Kueue on the tenant cluster by default (`managementState:
+Managed` in the DataScienceCluster). Kueue adds a mutating webhook that
+intercepts every pod creation. VK is fully compatible — **Kueue does not
+gate or mutate VK-bound pods.**
+
+Validated in `test_rhoai_kueue_compat.py` (28GB tenant, RHOAI Kueue Managed):
+
+- No scheduling gates added to VK pods
+- No Kueue labels or annotations injected
+- GPU and CPU pods dispatched and completed normally
+
+Kueue skips VK pods because they have `nodeName: gpu-worker` set (already
+assigned to a node). Since Kueue operates on unscheduled pods, pre-assigned
+pods are outside its scope. No LocalQueue or ClusterQueue configuration is
+needed on the tenant for VK to work.
+
+**Note:** The tenant SNO requires ~28GB RAM to run RHOAI + Kueue together.
+At 14GB, the Kueue controller stays Pending (insufficient memory) and its
+webhook blocks all pod creation with 500 errors. The `high_memory_env` test
+fixture handles this automatically.
+
 ## Limitations
 
 ### Headless Service sync
@@ -324,6 +352,25 @@ PyTorchJob compatibility: the training operator creates headless Services
 with selector `training.kubeflow.org/job-name`. `transformPod` preserves
 these labels and the `hostname`/`subdomain` fields. The worker-side endpoint
 controller creates EndpointSlices matching the synced Service's selector.
+
+### Worker RBAC is cluster-wide
+
+The `vk-remote-sa` service account has a ClusterRoleBinding granting full
+CRUD on secrets, configmaps, PVCs, services, and service accounts across
+all namespaces on the worker cluster. This means if any non-VK workload
+runs on the worker (Kueue, monitoring, GPU Operator), VK's SA can read
+and modify its secrets.
+
+**Why it's hard to scope:** Kubernetes RBAC has no namespace wildcards.
+Per-tenant worker namespaces are created dynamically (`{prefix}{tenant-ns}`),
+so namespaced RoleBindings can't be pre-provisioned. The fix is to have
+`ensureNamespace` also create a RoleBinding in each new namespace, binding
+`vk-remote-sa` to a namespaced Role. The ClusterRole would then be reduced
+to just namespace creation (`get`, `list`, `create` on namespaces) and
+node reads.
+
+**Current risk:** Low in the spike (worker cluster is single-purpose GPU
+node with no sensitive workloads). In production, this must be scoped.
 
 ### KServe / Knative support
 
@@ -372,6 +419,31 @@ This is untested and likely complex. For cross-cluster Istio, a
 multi-cluster mesh (Istio multi-primary or primary-remote) would be the
 proper solution, but that is a separate effort from VK.
 
+### Hardcoded namespace references in workloads
+
+Pods run on the worker in a prefixed namespace (`{prefix}{tenant-ns}`), not
+the original tenant namespace. The Kubernetes downward API (`fieldRef:
+metadata.namespace`) resolves correctly — it reads from the pod's actual
+metadata on the worker, so it returns the worker namespace.
+
+However, `transformPod` does not rewrite hardcoded namespace strings inside
+container env values, commands, or arguments. A container with
+`env: [{name: NS, value: "vk-test"}]` or
+`command: ["kubectl", "get", "pods", "-n", "vk-test"]` will reference the
+wrong namespace on the worker. Reliably detecting which strings are namespace
+references in arbitrary container specs is not feasible without false positives.
+
+**Recommendation:** Workloads should use the downward API for namespace
+discovery, which is already a Kubernetes best practice:
+
+```yaml
+env:
+  - name: POD_NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+```
+
 ## Kubelet API Server (Log Proxying)
 
 When `--kubelet-cert` is provided, the VK starts an HTTPS server that
@@ -416,9 +488,9 @@ and `PortForward` return "not supported".
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--nodename` | `gpu-worker` | Virtual node name on tenant |
+| `--provider-id` | *(--nodename)* | Unique ID for this VK instance. Scopes the `managed-by` label and config ConfigMap to avoid collisions when multiple VK instances share a tenant. Defaults to `--nodename` value. |
 | `--worker-kubeconfig` | *(required)* | Path to worker cluster kubeconfig |
-| `--worker-namespace-prefix` | *(auto-generated)* | Prefix for per-tenant worker namespaces. Auto-generated and persisted in ConfigMap if empty. |
-| `--gpu-count` | `1` | GPUs advertised in node capacity |
+| `--worker-namespace-prefix` | *(auto-generated)* | Prefix for per-tenant worker namespaces. Auto-generated and persisted in ConfigMap `vk-gpu-provider-config-{provider-id}` if empty. |
 | `--kubeconfig` | in-cluster | Tenant cluster kubeconfig (empty = in-cluster) |
 | `--default-remote-storage-class` | `lvms-vg1` | Default StorageClass for execution PVCs |
 | `--taint-value` | `catapult` | Value for the `virtual-kubelet.io/provider` taint |
