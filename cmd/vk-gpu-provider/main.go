@@ -21,12 +21,15 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
+	"github.com/virtual-kubelet/virtual-kubelet/log"
+	logklogv2 "github.com/virtual-kubelet/virtual-kubelet/log/klogv2"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 )
 
 func main() {
 	klog.InitFlags(nil)
+	log.L = logklogv2.New(nil)
 
 	var (
 		nodeName                  string
@@ -86,6 +89,9 @@ func main() {
 
 	nodeIP := os.Getenv("NODE_IP")
 
+	// Wrap tenant client for the VK library's informer — see clientwrap.go
+	vkClient := &fieldRefSafeClient{Interface: tenantClient}
+
 	var nodeOpts []nodeutil.NodeOpt
 
 	if kubeletCertPath != "" {
@@ -116,7 +122,7 @@ func main() {
 					},
 				},
 			}),
-			nodeutil.WithClient(tenantClient),
+			nodeutil.WithClient(vkClient),
 			nodeutil.AttachProviderRoutes(mux),
 			nodeutil.WithTLSConfig(func(cfg *tls.Config) error {
 				cert, err := tls.LoadX509KeyPair(kubeletCertPath, kubeletCertPath)
@@ -129,7 +135,7 @@ func main() {
 		)
 		klog.Infof("Kubelet API server will listen on :%d with cert from %s", kubeletPort, kubeletCertPath)
 	} else {
-		nodeOpts = append(nodeOpts, nodeutil.WithClient(tenantClient))
+		nodeOpts = append(nodeOpts, nodeutil.WithClient(vkClient))
 	}
 
 	vkNode, err := nodeutil.NewNode(nodeName,

@@ -92,8 +92,13 @@ func (p *GPUProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// TODO(upstream): VK library calls PopulateEnvironmentVariables before
 	// CreatePod, resolving secretKeyRef/configMapKeyRef to literal values.
 	// This breaks cross-cluster providers that need the original refs for
-	// resource sync. Propose an opt-out in virtual-kubelet/virtual-kubelet.
-	// Workaround: re-read the pod from the API server.
+	// resource sync. It also fails on status.podIP/hostIP fieldRefs (used by
+	// Istio sidecar's INSTANCE_IP env var) because podFieldSelectorRuntimeValue
+	// doesn't handle status fields. Propose fixes in virtual-kubelet/virtual-kubelet:
+	//   1. Support status.podIP/hostIP/podIPs in internal/podutils/env.go
+	//   2. Opt-out mechanism for PopulateEnvironmentVariables
+	// Workaround: re-read the pod from the API server (for ref resolution);
+	// disable Istio sidecar injection on VK-bound pods (for fieldRef issue).
 	freshPod, err := p.cfg.TenantClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("re-read pod %s: %w", key, err)

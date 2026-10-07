@@ -257,6 +257,160 @@ python -m pytest tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker -v
 
 ---
 
+#### S16. Real PyTorch GPU training
+
+| | |
+|---|---|
+| **Test** | `test_rhoai_vk.py::test_pytorchjob_real_training` |
+| **What** | PyTorchJob with inline training script (5-epoch MLP: forward pass, backward pass, optimizer step) runs on RTX 5090 via VK → training uses CUDA → all epochs complete → Succeeded |
+| **Result** | PASS |
+| **Proves** | Actual CUDA compute works end-to-end through VK, not just `nvidia-smi` device enumeration. PyTorch forward/backward passes, gradient computation, and optimizer steps all execute on the remote GPU. |
+
+**How to run:**
+```bash
+python -m pytest tests/test_rhoai_vk.py::test_pytorchjob_real_training -v
+```
+
+**What to look for:** The test:
+1. Creates a PyTorchJob with an inline training script: `nn.Sequential(Linear(784,128), ReLU(), Linear(128,10))` trained for 5 epochs on random data
+2. Waits for master pod, worker pod dispatch, and completion
+3. Verifies logs contain `Training on: cuda` (GPU was used)
+4. Verifies logs contain `Training complete` and `Epoch 5` (all epochs ran)
+5. Verifies tenant pod status synced to `Succeeded`
+6. Verifies PyTorchJob CR condition `Succeeded=True`
+
+**Note:** RTX 5090 (Blackwell, compute capability sm_120) requires PyTorch 2.7+
+built against CUDA 12.8+. Image: `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime`.
+Earlier CUDA builds (12.6 and below) fail with `cudaErrorNoKernelImageForDevice`.
+
+---
+
+#### S17. Training checkpoint persistence with catapult PVC
+
+| | |
+|---|---|
+| **Test** | `test_rhoai_vk.py::test_pytorchjob_checkpoint_with_pvc` |
+| **What** | PyTorchJob trains on GPU → saves model checkpoint to catapult PVC (`torch.save`) → verification pod loads checkpoint (`torch.load`) from same PVC → checkpoint is valid |
+| **Result** | PASS |
+| **Proves** | The core data pipeline for long-running training works: train → checkpoint → persist. Catapult PVCs survive pod completion and can be re-mounted by subsequent pods. |
+
+**How to run:**
+```bash
+python -m pytest tests/test_rhoai_vk.py::test_pytorchjob_checkpoint_with_pvc -v
+```
+
+**What to look for:** The test:
+1. Creates a catapult PVC `training-checkpoint` on the tenant
+2. Creates a PyTorchJob that trains a model and saves `torch.save(model.state_dict(), '/data/checkpoint.pt')`
+3. Waits for training to complete (`Succeeded`)
+4. Verifies execution PVC exists on worker with management labels
+5. Creates a verification pod (also via VK) that mounts the same PVC and runs `torch.load('/data/checkpoint.pt', weights_only=True)` — prints number of keys and `Checkpoint valid`
+6. Waits for verification pod `Succeeded`
+7. Reads logs — verifies `Checkpoint valid` and key count > 0
+8. Cleanup: deletes pods and control PVC (triggers execution PVC cleanup)
+
+---
+
+#### S18. RHOAI Notebook CR via VK
+
+| | |
+|---|---|
+| **Test** | `test_rhoai_vk.py::test_notebook_cr_via_vk` |
+| **What** | Notebook CR on tenant → Kubeflow notebook controller creates StatefulSet → StatefulSet creates pod → VK dispatches to worker → GPU HTTP server runs on RTX 5090 → Notebook CR status shows Ready |
+| **Result** | PASS |
+| **Proves** | The full Dashboard → Notebook → GPU workflow works via VK. Data scientists can create Notebooks from the RHOAI Dashboard and get GPU access on the remote worker cluster transparently. |
+
+**How to run:**
+```bash
+python -m pytest tests/test_rhoai_vk.py::test_notebook_cr_via_vk -v
+```
+
+**What to look for:** The test:
+1. Creates a Notebook CR targeting the virtual node with VK tolerations
+2. Waits for the notebook controller to create a StatefulSet
+3. Waits for the StatefulSet to create a pod (`vk-gpu-notebook-0`)
+4. Waits for VK to dispatch the pod to the worker
+5. Verifies the container is Running on the worker (GPU HTTP server)
+6. Verifies tenant pod status synced to Running
+7. Verifies Notebook CR status shows Ready condition or running containerState
+
+**Lab note:** Requires ~28GB RAM on the tenant SNO so the notebook controller
+can schedule. With default 14GB, RHOAI components cause memory pressure and
+the controller stays Pending. See test docstring for VM memory adjustment steps.
+
+---
+
+#### S19. KServe raw inference via VK
+
+| | |
+|---|---|
+| **Test** | `test_rhoai_vk.py::test_kserve_inference_via_vk` |
+| **What** | KServe InferenceService CR (raw deployment mode) → KServe controller creates Deployment → Deployment creates pod → VK dispatches to worker → inference server runs on RTX 5090 GPU |
+| **Result** | PASS |
+| **Proves** | The RHOAI-native model serving API works through VK. KServe creates a Deployment from the InferenceService CR, the pod gets dispatched to the worker GPU, and the inference server runs. The full operator stack (ServiceMesh + Serverless + KServe) is installed and managed automatically by RHOAI. |
+
+**How to run:**
+```bash
+python -m pytest tests/test_rhoai_vk.py::test_kserve_inference_via_vk -v
+```
+
+**What to look for:** The test:
+1. Enables OperatorHub default catalog sources if disabled (`disableAllDefaultSources: false`)
+2. Installs ServiceMesh operator Subscription if not present (redhat-operators catalog)
+3. Installs Serverless operator Subscription + OperatorGroup if not present
+4. Waits for both operator CSVs to reach `Succeeded` phase
+5. Waits for RHOAI to automatically create the KServe infrastructure (SMCP `data-science-smcp`, KnativeServing, KServe controller) — detects readiness via InferenceService CRD appearing
+6. Creates an InferenceService CR with `serving.kserve.io/deploymentMode: RawDeployment` targeting the VK node
+7. Waits for KServe controller to create a Deployment
+8. Waits for the Deployment to create a pod (via ReplicaSet)
+9. Verifies the pod is dispatched to the worker (worker pod appears)
+10. Verifies the worker pod reaches Running (inference server on GPU)
+11. Checks InferenceService Ready condition (non-fatal warning if not Ready — status sync lag)
+
+**Note:** First run takes 5-10 minutes for operator installs + CRD propagation.
+Subsequent runs with operators already installed take ~30 seconds. Requires
+~28GB RAM on the tenant SNO (ServiceMesh + Serverless + RHOAI components).
+RHOAI DSCInitialization has `serviceMesh.managementState: Managed` — it
+automatically creates SMCP, ServiceMeshMember, and KnativeServing when the
+prerequisite operators are installed.
+
+---
+
+#### S20. KServe serverless inference via VK (Knative)
+
+| | |
+|---|---|
+| **Test** | `test_rhoai_vk.py::test_kserve_serverless_inference_via_vk` |
+| **What** | KServe InferenceService CR (serverless mode — no RawDeployment annotation) → KServe creates Knative Service → Revision → Deployment → Pod with queue-proxy → VK dispatches to worker → inference server runs on RTX 5090 GPU |
+| **Result** | PASS |
+| **Proves** | The default KServe serving path (Knative) works end-to-end through VK. Knative creates the full revision/deployment chain, the pod (with queue-proxy sidecar) is dispatched to the worker GPU, and the inference server runs and responds to HTTP requests from the tenant via Submariner. Istio sidecar is disabled because it would fail on the worker (no Istio control plane). |
+
+**How to run:**
+```bash
+python -m pytest tests/test_rhoai_vk.py::test_kserve_serverless_inference_via_vk -v
+```
+
+**What to look for:** The test:
+1. Ensures InferenceService CRD exists (skips if not — run S19 first to install operators)
+2. Creates a ServiceMeshMember to add the test namespace to the Istio mesh
+3. Creates an InferenceService CR WITHOUT the `RawDeployment` annotation (serverless mode) with `sidecar.istio.io/inject: "false"`
+4. Verifies KServe creates a Knative Service (ksvc)
+5. Waits for Knative to create a pod (Revision → Deployment → Pod)
+6. Verifies the pod is dispatched to the worker (worker pod appears)
+7. Verifies the worker pod reaches Running
+8. Waits for tenant pod PodIP (synced from worker), verifies it's a worker CIDR IP
+9. Curls the inference endpoint from a tenant pod via Submariner — asserts HTTP 200 with RTX 5090 GPU data
+10. Checks InferenceService Ready condition (non-fatal warning if not Ready)
+
+**VK library workaround:** Knative's queue-proxy container uses `status.podIP`
+and `status.hostIP` fieldRef env vars that the VK library v1.11.0 does not
+support. The `fieldRefSafeClient` wrapper in `clientwrap.go` strips these
+unsupported fieldRefs from the VK library's informer responses. The provider's
+`CreatePod` re-reads the original pod from the API server, so the worker pod
+retains the original fieldRefs and the worker kubelet resolves them normally.
+
+---
+
 ### 5. Cross-Cluster Networking
 
 #### S9. GPU inference service via Submariner
@@ -466,6 +620,13 @@ oc --kubeconfig=~/.kube/tenant2 get csv -n redhat-ods-operator | grep rhods
 ### From tenant (OCP 4.22)
 
 ```
+tests/test_rhoai_vk.py::test_pytorchjob_via_vk                               PASSED
+tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker                         PASSED
+tests/test_rhoai_vk.py::test_notebook_cr_via_vk                              PASSED
+tests/test_rhoai_vk.py::test_pytorchjob_real_training                        PASSED
+tests/test_rhoai_vk.py::test_pytorchjob_checkpoint_with_pvc                  PASSED
+tests/test_rhoai_vk.py::test_kserve_inference_via_vk                         PASSED
+tests/test_rhoai_vk.py::test_kserve_serverless_inference_via_vk              PASSED
 tests/test_vk_gpu.py::test_virtual_node_exists                                PASSED
 tests/test_vk_gpu.py::test_gpu_pod_dispatched_via_vk                          PASSED
 tests/test_vk_gpu.py::test_resource_sync                                      PASSED
@@ -474,14 +635,12 @@ tests/test_vk_gpu.py::test_catapult_pvc_sync                                  PA
 tests/test_vk_gpu.py::test_non_catapult_pvc_rejected                          PASSED
 tests/test_vk_gpu.py::test_multitenant_namespace_isolation                    PASSED
 tests/test_vk_gpu.py::test_pod_logs_proxied_from_worker                       PASSED
-tests/test_rhoai_vk.py::test_pytorchjob_via_vk                               PASSED
-tests/test_rhoai_vk.py::test_no_rhoai_crds_on_worker                         PASSED
 tests/test_submariner_networking.py::test_gpu_service_via_submariner          PASSED
 tests/test_submariner_networking.py::test_notebook_workbench_via_submariner   PASSED
 tests/test_submariner_networking.py::test_submariner_tunnel_failure_recovery  PASSED
 tests/test_distributed_training.py::test_headless_service_dns_resolution     PASSED
 
-14 passed
+19 passed
 ```
 
 ### From tenant2 (OCP 4.18)
@@ -505,10 +664,9 @@ tests/test_vk_gpu.py::test_pod_logs_proxied_from_worker                       PA
 
 | Scenario | Category | Why not assessed | Priority |
 |----------|----------|-----------------|----------|
-| **KServe inference (Knative-managed)** | Networking | Knative autoscaler, activator, queue-proxy, scale-to-zero need investigation. No Serverless operator installed in lab. Raw Deployment inference works (S9 proves the path). | Medium |
-| **Multi-pod PyTorchJob (full distributed)** | Training | Headless Service sync is proven (S13), but actual multi-GPU training needs >1 GPU. Lab has 1 GPU. Mechanism is validated; full end-to-end deferred to multi-GPU environment. | Medium |
+| **KServe inference (Knative serverless with Istio)** | Networking | Knative dispatch works (S20) but Istio sidecar is disabled because the sidecar would fail on the worker (no Istio control plane). Full Istio service mesh integration (mTLS, telemetry) across clusters not validated. | Low |
+| **Multi-pod PyTorchJob (full distributed)** | Training | Headless Service sync is proven (S13), single-pod real training proven (S16), but actual multi-GPU distributed training needs >1 GPU. Lab has 1 GPU. Mechanism is validated; full end-to-end deferred to multi-GPU environment. | Medium |
 | **Overlapping CIDRs (Globalnet)** | Networking | Lab uses non-overlapping CIDRs by design. Overlapping CIDRs require Globalnet which changes the PodIP sync model. Not PoC scope. | Low |
-| **RHOAI dashboard → Notebook CRD** | Integration | S10 proves the networking path for notebooks. Full RHOAI Notebook CRD creates StatefulSets (not bare Pods), which requires VK awareness of StatefulSet ownership. Deferred. | Medium |
 | **Kueue admission control** | Quota | Worker has Kueue installed but VK does not submit AdmissionChecks or interact with LocalQueue. GPU quota enforcement across tenants not validated. | High |
 
 ---
@@ -529,6 +687,19 @@ cluster's security policy, the pod fails visibly on the worker.
 The lab has 1 GPU. When both tenants try to dispatch a GPU pod simultaneously,
 only one runs — the other waits. Kueue on the worker could manage fair-sharing,
 but VK does not interact with Kueue's admission system yet.
+
+### RTX 5090 (Blackwell) CUDA compatibility
+
+The RTX 5090 uses NVIDIA Blackwell architecture (compute capability sm_120).
+PyTorch images must be built against CUDA 12.8+ to include sm_120 kernels.
+Earlier CUDA builds (12.6 and below) detect the GPU but fail at runtime with
+`cudaErrorNoKernelImageForDevice` when executing any CUDA kernel.
+
+Minimum working image: `pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime`.
+Lab uses `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime`.
+
+This only affects compute operations (training, inference). Device enumeration
+(`nvidia-smi`, `torch.cuda.is_available()`) works with any CUDA version.
 
 ### Submariner routeagent on virtual node
 
@@ -635,59 +806,91 @@ to the VK service account.
    VK dispatches them, status syncs back, and the operator sees Succeeded.
    No RHOAI code changes or CRDs needed on the worker (S7, S8).
 
-3. **Resource isolation works.** Secrets, ConfigMaps, ServiceAccounts, and
+3. **Real GPU training works through VK.** PyTorch forward pass, backward
+   pass, gradient computation, and optimizer steps all execute on the remote
+   GPU via CUDA. Not just `nvidia-smi` — actual neural network training
+   runs end-to-end (S16).
+
+4. **Training checkpoint persistence works.** Train → save checkpoint to
+   catapult PVC → pod completes → new pod loads checkpoint from same PVC.
+   The core data pipeline for long-running training is validated (S17).
+
+5. **Resource isolation works.** Secrets, ConfigMaps, ServiceAccounts, and
    PVCs are synced on-demand to per-tenant worker namespaces, labeled for
    tracking, and cleaned up on pod deletion. No data leaks or name collisions
    between tenants (S3, S4, S12).
 
-4. **Cross-cluster networking works via Submariner.** Regular Kubernetes
+6. **Cross-cluster networking works via Submariner.** Regular Kubernetes
    Services and OpenShift Routes reach remote GPU pods transparently. VK
    syncs PodIP, Kubernetes creates EndpointSlices, Submariner provides L3
    routing. No Submariner-specific code in VK (S9).
 
-5. **The worker stays bare.** No RHOAI operators, no CRDs, no training
+7. **The worker stays bare.** No RHOAI operators, no CRDs, no training
    framework on the GPU cluster. Just GPU Operator + Kueue for quota (S8).
 
-6. **Interactive workloads (notebooks) work.** Long-running GPU pods stay
+8. **RHOAI Notebook CR works through VK.** Notebook CR → notebook controller
+   creates StatefulSet → pod dispatched via VK → GPU accessible on worker →
+   Notebook status shows Ready. The full Dashboard → Notebook → remote GPU
+   workflow works transparently (S18).
+
+9. **Interactive workloads (notebooks) work.** Long-running GPU pods stay
    Running and remain accessible through Service/Route via Submariner (S10).
 
-7. **Multi-tenant isolation works.** Per-tenant worker namespaces prevent
-   same-named resources from different tenant namespaces from colliding (S12).
+10. **Multi-tenant isolation works.** Per-tenant worker namespaces prevent
+    same-named resources from different tenant namespaces from colliding (S12).
 
-8. **Headless Service sync enables distributed training DNS.** Inter-pod
-   DNS resolution works via synced headless Services (S13). This is the
-   mechanism for multi-pod PyTorchJob.
+11. **Headless Service sync enables distributed training DNS.** Inter-pod
+    DNS resolution works via synced headless Services (S13). This is the
+    mechanism for multi-pod PyTorchJob.
 
-9. **Submariner tunnel self-heals.** Gateway pod failure → tunnel drops →
-   automatic restart → tunnel re-establishes → connectivity restored (S11).
+12. **Submariner tunnel self-heals.** Gateway pod failure → tunnel drops →
+    automatic restart → tunnel re-establishes → connectivity restored (S11).
 
-10. **kubectl logs / oc logs work transparently.** VK runs a kubelet API
+13. **kubectl logs / oc logs work transparently.** VK runs a kubelet API
     server using the node's TLS cert, proxying log requests to worker
     pods. Supports full logs, tail, and follow (S14).
 
-11. **OCP/RHOAI version decoupling is proven.** Two tenants at different
+14. **OCP/RHOAI version decoupling is proven.** Two tenants at different
     OCP versions (4.22 and 4.18) with independent RHOAI installations
     both dispatch GPU workloads to the same worker cluster. All tests
     pass from both tenants. The AI platform layer is fully decoupled
     from the GPU compute layer (S15).
 
+15. **KServe InferenceService (raw deployment) works through VK.** The
+    RHOAI-native model serving API creates a Deployment, the pod gets
+    dispatched to the worker GPU, and the inference server runs. The full
+    operator stack (ServiceMesh + Serverless + KServe) is managed
+    automatically by RHOAI (S19).
+
+16. **KServe serverless mode (Knative) works through VK.** The default
+    KServe serving path — InferenceService → Knative Service → Revision →
+    Deployment → Pod with queue-proxy — dispatches to the worker GPU.
+    Requires a client wrapper (`clientwrap.go`) to work around the VK
+    library not supporting `status.podIP` fieldRef used by Knative's
+    queue-proxy. Istio sidecar is disabled (no control plane on worker).
+    TODO: contribute `status.podIP`/`hostIP` support upstream (S20).
+
 ## What This Spike Does Not Prove
 
 1. **Full multi-pod distributed training.** The DNS mechanism is proven
-   (S13), but actual multi-GPU training needs >1 GPU. Single-GPU lab
-   validates the infrastructure, not the workload.
+   (S13) and single-pod real training proven (S16), but actual multi-GPU
+   distributed training needs >1 GPU. Single-GPU lab validates the
+   infrastructure, not the workload.
 
-2. **RHOAI Notebook CRD integration.** The networking path works (S10),
-   but RHOAI Notebook creates StatefulSets, which requires VK awareness
-   of StatefulSet pod ownership.
+2. **KServe with full Istio service mesh.** KServe serverless mode works via
+   Knative (S20), but Istio sidecar injection is disabled. The `istio-proxy`
+   sidecar cannot function on the worker: it needs `istiod` on the tenant
+   for config (xDS), mTLS certs, and routing rules — none of which are
+   reachable cross-cluster. This means no mTLS, no Istio telemetry, and
+   no traffic management (retries, circuit breaking, canary). Inference
+   traffic works without Istio via direct pod IP routing through Submariner.
+   A proper fix would be Istio multi-cluster mesh (primary-remote), which
+   is a separate effort. See `vk-architecture.md` § KServe / Knative.
 
-3. **KServe with Knative.** No Serverless operator installed. Raw
-   Deployment inference works (S9).
-
-4. **Kueue quota enforcement.** Worker has Kueue but VK does not interact
+3. **Kueue quota enforcement.** Worker has Kueue but VK does not interact
    with it. Fair-sharing between tenants is not validated.
 
-5. **Production readiness.** No HA, no Globalnet for overlapping CIDRs,
+4. **Production readiness.** No HA, no Globalnet for overlapping CIDRs,
    no performance benchmarks, no worker namespace garbage collection.
 
 ---

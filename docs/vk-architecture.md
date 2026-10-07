@@ -13,6 +13,7 @@ cmd/vk-gpu-provider/
 ├── provider.go        # Node registration, informers, dispatch loop, status sync
 ├── provider_test.go   # Unit tests for pod transformation (SecurityContext, labels)
 ├── resourcesync.go    # Secret/ConfigMap/SA/PVC discovery and cross-cluster sync
+├── clientwrap.go      # Workaround: strips unsupported fieldRef env vars for VK library
 └── Dockerfile
 ```
 
@@ -324,11 +325,52 @@ with selector `training.kubeflow.org/job-name`. `transformPod` preserves
 these labels and the `hostname`/`subdomain` fields. The worker-side endpoint
 controller creates EndpointSlices matching the synced Service's selector.
 
-### No Knative/KServe support
+### KServe / Knative support
 
-Knative-managed inference (autoscaling, scale-to-zero, queue-proxy) is not
-validated. Raw Deployment-based inference works. See
-submariner-architecture.md §7.
+KServe raw deployment mode works fully. KServe serverless mode (Knative)
+works with Istio sidecar injection disabled (`sidecar.istio.io/inject: "false"`).
+
+**VK library fieldRef workaround (`clientwrap.go`):** The VK library v1.11.0's
+`PopulateEnvironmentVariables` does not support `status.podIP`, `status.hostIP`,
+or `status.podIPs` fieldRef env vars. Knative's queue-proxy uses `SERVING_POD_IP`
+(`status.podIP`) and `HOST_IP` (`status.hostIP`); Istio's sidecar uses
+`INSTANCE_IP` (`status.podIP`). The `fieldRefSafeClient` wrapper strips these
+unsupported fieldRefs from pods in the VK library's informer List/Watch
+responses. The provider's `CreatePod` re-reads the original pod from the API
+server, so the worker pod retains the original fieldRefs and the worker kubelet
+resolves them normally.
+
+TODO(upstream): contribute `status.podIP`/`hostIP`/`podIPs` support to
+`virtual-kubelet/virtual-kubelet` `internal/podutils/env.go` function
+`podFieldSelectorRuntimeValue`. Once fixed, delete `clientwrap.go` and
+remove the wrapper from `main.go`.
+
+**Istio sidecar** is disabled on VK-dispatched pods via
+`sidecar.istio.io/inject: "false"`. The sidecar cannot function on the
+worker cluster because:
+
+1. **No control plane.** `istio-proxy` connects to
+   `istiod.istio-system.svc` at startup for config, mTLS certificates,
+   and routing rules. That service exists only on the tenant cluster.
+   From the worker, even with Submariner, the sidecar cannot resolve or
+   route to the tenant's `istiod`.
+2. **Cert trust.** Istio's CA issues short-lived mTLS certs scoped to
+   the tenant mesh. A sidecar on the worker would need cross-cluster
+   cert issuance, which is not configured.
+3. **Config sync.** Istio pushes VirtualService/DestinationRule config
+   to sidecars via xDS. A sidecar on the worker would receive no config
+   (it's not registered with the tenant's pilot).
+
+**What is lost:** mTLS between services, Istio telemetry/distributed
+tracing, and traffic management (retries, circuit breaking, canary
+routing). Inference traffic still works — the curl test proves
+tenant → Submariner → worker pod IP:8080 routes correctly without Istio.
+
+**Could it work?** Theoretically, if Submariner exported the `istiod`
+service cross-cluster and the mesh trusted the worker's service accounts.
+This is untested and likely complex. For cross-cluster Istio, a
+multi-cluster mesh (Istio multi-primary or primary-remote) would be the
+proper solution, but that is a separate effort from VK.
 
 ## Kubelet API Server (Log Proxying)
 
