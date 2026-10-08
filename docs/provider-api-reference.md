@@ -41,11 +41,14 @@ func (p *GPUProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error
 Dispatches a tenant pod to the worker cluster. This is the main entry point
 for cross-cluster pod lifecycle.
 
-**Guards (returns nil, no dispatch):**
+**Guards:**
+- Pod is owned by a DaemonSet (checked via `ownerReferences`) → returns
+  `errdefs.InvalidInput` error. The VK pod controller emits a
+  `ProviderCreateFailed` event and stops tracking the pod.
 - Pod is in a system namespace (`openshift-*`, `kube-*`, `redhat-ods-*`,
-  `default`, `kueue-system`)
-- Pod is owned by a DaemonSet (checked via `ownerReferences`)
-- Pod is already tracked in `managedPods` map
+  `default`, `kueue-system`) → returns `errdefs.InvalidInput` error (same
+  behavior as DaemonSet rejection).
+- Pod is already tracked in `managedPods` map → returns nil (no-op).
 
 **Steps:**
 1. Re-reads the pod from the tenant API server. The VK library's
@@ -102,8 +105,8 @@ func (p *GPUProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error
 
 Cleans up worker resources when a tenant pod is deleted.
 
-**Guards:** Silently returns nil for system namespaces and pods not in
-`managedPods`.
+**Guards:** Silently returns nil for pods not in `managedPods` (including
+previously rejected DaemonSet and system namespace pods).
 
 **Steps:**
 1. Removes the pod from `managedPods` and `podCache`.

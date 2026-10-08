@@ -8,6 +8,8 @@ metadata:
     app: vk-gpu-provider
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: vk-gpu-provider

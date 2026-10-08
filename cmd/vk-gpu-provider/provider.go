@@ -78,14 +78,19 @@ var (
 // --- PodLifecycleHandler ---
 
 func (p *GPUProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
-	if isSystemNamespace(pod.Namespace) {
-		return nil
-	}
+	// Returning an error causes the VK library to emit a ProviderCreateFailed event
+	// and requeue with exponential backoff (~1s → ~16min). The library controls the
+	// retry loop — we cannot stop it. Each retry is cheap (immediate return, no
+	// worker API calls). Returning nil instead would silently accept the pod as
+	// "created" even though nothing is dispatched, leaving it stuck with no status.
 	if isDaemonSetPod(pod) {
-		klog.V(2).Infof("Skipping DaemonSet-owned pod %s/%s", pod.Namespace, pod.Name)
-		return nil
+		klog.Infof("Rejecting DaemonSet-owned pod %s/%s — virtual nodes do not run DaemonSets", pod.Namespace, pod.Name)
+		return errdefs.InvalidInput("DaemonSet-owned pods are not supported on virtual nodes")
 	}
-
+	if isSystemNamespace(pod.Namespace) {
+		klog.Infof("Rejecting pod %s/%s from system namespace", pod.Namespace, pod.Name)
+		return errdefs.InvalidInput("pods from system namespaces are not dispatched to worker clusters")
+	}
 	key := pod.Namespace + "/" + pod.Name
 
 	p.mu.Lock()
@@ -164,10 +169,6 @@ func (p *GPUProvider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 }
 
 func (p *GPUProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
-	if isSystemNamespace(pod.Namespace) {
-		return nil
-	}
-
 	key := pod.Namespace + "/" + pod.Name
 
 	p.mu.Lock()
@@ -749,6 +750,7 @@ func isDaemonSetPod(pod *corev1.Pod) bool {
 	}
 	return false
 }
+
 
 var labelSkipSet = map[string]bool{
 	labelManagedBy: true,
