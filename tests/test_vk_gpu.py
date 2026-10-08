@@ -32,7 +32,7 @@ VK_NODE_NAME = "gpu-worker"
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _ensure_lab_env(single_tenant_env):
+def _ensure_lab_env(single_tenant_env, vk_node_ready):
     pass
 
 
@@ -820,7 +820,7 @@ def test_multitenant_namespace_isolation(
     w_pod_a = worker_pod_name(ns_a, pod_a_name)
     w_pod_b = worker_pod_name(ns_b, pod_b_name)
 
-    # Create test namespaces on tenant
+    # Create test namespaces on tenant and wait for OCP annotation
     for ns in [ns_a, ns_b]:
         try:
             tenant_core.create_namespace(
@@ -831,6 +831,15 @@ def test_multitenant_namespace_isolation(
         except client.exceptions.ApiException as e:
             if e.status != 409:
                 raise
+    for ns in [ns_a, ns_b]:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            obj = tenant_core.read_namespace(name=ns)
+            if (obj.metadata.annotations or {}).get(
+                "openshift.io/sa.scc.uid-range"
+            ):
+                break
+            time.sleep(1)
     cleanup(tenant_core.delete_namespace, name=ns_a)
     cleanup(tenant_core.delete_namespace, name=ns_b)
 

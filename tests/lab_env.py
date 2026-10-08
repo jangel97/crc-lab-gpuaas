@@ -39,6 +39,21 @@ class LabEnvironmentError(Exception):
     pass
 
 
+def _pod_is_stale(pod):
+    """True if the pod is a leftover from before a VM restart."""
+    if pod.status.reason in ("NodeShutdown", "NodeNotReady"):
+        return True
+    for cs in (pod.status.container_statuses or []):
+        if cs.state and cs.state.terminated:
+            if cs.state.terminated.reason == "ContainerStatusUnknown":
+                return True
+    for cs in (pod.status.init_container_statuses or []):
+        if cs.state and cs.state.terminated:
+            if cs.state.terminated.reason == "ContainerStatusUnknown":
+                return True
+    return False
+
+
 class LabEnvironment:
     """Manage libvirt VMs for test lab environments via virsh."""
 
@@ -94,6 +109,52 @@ class LabEnvironment:
             os.path.expanduser(info["kubeconfig_default"]),
         )
 
+    def wait_for_node_ready(self, kubeconfig, timeout=120):
+        """Wait until at least one node reports Ready condition."""
+        from kubernetes import client, config
+
+        deadline = time.time() + timeout
+        last_err = None
+        while time.time() < deadline:
+            try:
+                api_client = config.new_client_from_config(
+                    config_file=kubeconfig,
+                )
+                core = client.CoreV1Api(api_client)
+                nodes = core.list_node()
+                for node in nodes.items:
+                    for cond in (node.status.conditions or []):
+                        if cond.type == "Ready" and cond.status == "True":
+                            return
+            except Exception as e:
+                last_err = e
+            time.sleep(10)
+        raise LabEnvironmentError(
+            f"No node Ready at {kubeconfig} after {timeout}s: {last_err}"
+        )
+
+    def cleanup_stale_pods(self, kubeconfig):
+        """Delete pods stuck after a VM restart (ContainerStatusUnknown, NodeShutdown)."""
+        from kubernetes import client, config
+
+        try:
+            api_client = config.new_client_from_config(config_file=kubeconfig)
+            core = client.CoreV1Api(api_client)
+            pods = core.list_pod_for_all_namespaces()
+        except Exception:
+            return
+
+        for pod in pods.items:
+            if _pod_is_stale(pod):
+                try:
+                    core.delete_namespaced_pod(
+                        name=pod.metadata.name,
+                        namespace=pod.metadata.namespace,
+                        grace_period_seconds=0,
+                    )
+                except client.exceptions.ApiException:
+                    pass
+
     def wait_for_ocp(self, kubeconfig, timeout=300):
         """Poll Kubernetes API until it responds."""
         from kubernetes import client, config
@@ -115,7 +176,7 @@ class LabEnvironment:
         )
 
     def start_vm(self, vm_name, timeout=300):
-        """Start a VM and wait for its OCP API to respond."""
+        """Start a VM and wait for OCP API + node Ready + stale pod cleanup."""
         state = self.vm_state(vm_name)
         if state == "running":
             return
@@ -123,7 +184,10 @@ class LabEnvironment:
             self._run_virsh("resume", vm_name)
         else:
             self._run_virsh("start", vm_name)
-        self.wait_for_ocp(self._kubeconfig_path(vm_name), timeout)
+        kubeconfig = self._kubeconfig_path(vm_name)
+        self.wait_for_ocp(kubeconfig, timeout)
+        self.wait_for_node_ready(kubeconfig, timeout=120)
+        self.cleanup_stale_pods(kubeconfig)
 
     def shutdown_vm(self, vm_name, timeout=180):
         """Gracefully shut down a VM and wait for it to stop.

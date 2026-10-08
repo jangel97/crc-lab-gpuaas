@@ -26,7 +26,7 @@ VK_NODE_NAME = "gpu-worker"
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _ensure_lab_env(single_tenant_env):
+def _ensure_lab_env(single_tenant_env, vk_node_ready):
     pass
 
 

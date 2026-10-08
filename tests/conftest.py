@@ -1,4 +1,5 @@
 import os
+import time
 
 import pytest
 import urllib3
@@ -175,13 +176,13 @@ def vk_worker_namespace_t2(worker_namespace_prefix_t2):
 
 @pytest.fixture(scope="session")
 def lab_env():
-    """Lab VM manager. Starts tenant1 + worker as baseline."""
+    """Lab VM manager. Starts worker + tenant1 as baseline."""
     try:
         env = LabEnvironment()
     except LabEnvironmentError as e:
         pytest.skip(f"Lab environment unavailable: {e}")
-    env.ensure_running("sno-tenant")
     env.ensure_running("sno-worker")
+    env.ensure_running("sno-tenant")
     return env
 
 
@@ -225,3 +226,104 @@ def dual_tenant_env(lab_env):
     lab_env.ensure_running("sno-tenant2")
     lab_env.ensure_running("sno-worker")
     yield lab_env
+
+
+# ---------------------------------------------------------------------------
+# Cluster readiness helpers
+# ---------------------------------------------------------------------------
+
+
+VK_NODE_NAME = "gpu-worker"
+RHOAI_NAMESPACE = "redhat-ods-applications"
+
+
+def wait_for_deployment_ready(api_client, name, namespace, timeout=300):
+    """Wait for a deployment to have all replicas ready."""
+    apps_api = client.AppsV1Api(api_client)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            dep = apps_api.read_namespaced_deployment(name, namespace)
+            ready = dep.status.ready_replicas or 0
+            desired = dep.spec.replicas or 1
+            if ready >= desired:
+                return True
+        except client.exceptions.ApiException:
+            pass
+        time.sleep(10)
+    return False
+
+
+def wait_for_webhook_endpoints(api_client, webhook_config_name, timeout=120):
+    """Wait until all webhooks in a MutatingWebhookConfiguration have endpoints."""
+    adm_api = client.AdmissionregistrationV1Api(api_client)
+    core_api = client.CoreV1Api(api_client)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            cfg = adm_api.read_mutating_webhook_configuration(webhook_config_name)
+            all_have_endpoints = True
+            for wh in cfg.webhooks:
+                if wh.client_config.service:
+                    svc_name = wh.client_config.service.name
+                    svc_ns = wh.client_config.service.namespace
+                    endpoints = core_api.read_namespaced_endpoints(svc_name, svc_ns)
+                    has_addresses = any(
+                        subset.addresses
+                        for subset in (endpoints.subsets or [])
+                    )
+                    if not has_addresses:
+                        all_have_endpoints = False
+                        break
+            if all_have_endpoints:
+                return True
+        except client.exceptions.ApiException:
+            pass
+        time.sleep(10)
+    return False
+
+
+@pytest.fixture(scope="session")
+def vk_node_ready(tenant_clients):
+    """Wait for the VK virtual node to be registered and Ready."""
+    tenant_core, _ = tenant_clients
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            node = tenant_core.read_node(name=VK_NODE_NAME)
+            for cond in (node.status.conditions or []):
+                if cond.type == "Ready" and cond.status == "True":
+                    return True
+        except client.exceptions.ApiException:
+            pass
+        time.sleep(10)
+    pytest.fail(f"VK node {VK_NODE_NAME} not Ready within 120s")
+
+
+@pytest.fixture(scope="session")
+def rhoai_operators_ready(tenant_clients):
+    """Wait for RHOAI operator deployments and webhook endpoints to be healthy."""
+    tenant_core, _ = tenant_clients
+    api_client = tenant_core.api_client
+
+    for dep_name in (
+        "kubeflow-training-operator",
+        "kueue-controller-manager",
+        "kserve-controller-manager",
+    ):
+        assert wait_for_deployment_ready(
+            api_client, dep_name, RHOAI_NAMESPACE, timeout=300,
+        ), f"{dep_name} not ready in {RHOAI_NAMESPACE} within 300s"
+
+    for wh_name in (
+        "training-operator.kubeflow.org",
+        "kueue-mutating-webhook-configuration",
+    ):
+        try:
+            if not wait_for_webhook_endpoints(api_client, wh_name, timeout=120):
+                import warnings
+                warnings.warn(f"Webhook {wh_name} endpoints not ready after 120s")
+        except client.exceptions.ApiException:
+            pass
+
+    return True

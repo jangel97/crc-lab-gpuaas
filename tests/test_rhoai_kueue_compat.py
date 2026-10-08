@@ -28,7 +28,7 @@ KUEUE_NAMESPACE = "redhat-ods-applications"
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _ensure_lab_env(high_memory_env):
+def _ensure_lab_env(high_memory_env, vk_node_ready, rhoai_operators_ready):
     pass
 
 

@@ -45,7 +45,7 @@ VK_TOLERATIONS = [{"key": "virtual-kubelet.io/provider", "operator": "Exists"}]
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _ensure_lab_env(dual_tenant_env):
+def _ensure_lab_env(dual_tenant_env, vk_node_ready):
     pass
 CUDA_IMAGE = "nvcr.io/nvidia/cuda:12.8.1-base-ubi9"
 
@@ -478,8 +478,65 @@ def wait_pod_admitted(core_api, name, namespace, timeout=120):
     return False
 
 
+def assert_cluster_queue_active(custom_api, name="cluster-queue", timeout=60):
+    """Wait for ClusterQueue to report Active — fail the test if it doesn't."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            cq = custom_api.get_cluster_custom_object(
+                group=KUEUE_GROUP, version=KUEUE_VERSION,
+                plural="clusterqueues", name=name,
+            )
+            for cond in (cq.get("status", {}).get("conditions") or []):
+                if cond.get("type") == "Active" and cond.get("status") == "True":
+                    return
+        except client.exceptions.ApiException:
+            pass
+        time.sleep(5)
+    raise AssertionError(
+        f"ClusterQueue {name} not Active within {timeout}s. "
+        f"Kueue cannot admit workloads."
+    )
+
+
+def cleanup_stale_workloads(custom_api, namespace):
+    """Delete any leftover Kueue workloads in a namespace from previous runs."""
+    try:
+        wls = custom_api.list_namespaced_custom_object(
+            group=KUEUE_GROUP, version=KUEUE_VERSION,
+            namespace=namespace, plural="workloads",
+        )
+        for wl in wls.get("items", []):
+            name = wl["metadata"]["name"]
+            try:
+                custom_api.delete_namespaced_custom_object(
+                    group=KUEUE_GROUP, version=KUEUE_VERSION,
+                    namespace=namespace, plural="workloads", name=name,
+                )
+            except client.exceptions.ApiException:
+                pass
+    except client.exceptions.ApiException:
+        pass
+
+
+def ensure_namespace(core_api, namespace):
+    """Create the namespace if it does not already exist."""
+    try:
+        core_api.read_namespace(name=namespace)
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            core_api.create_namespace(
+                body=client.V1Namespace(
+                    metadata=client.V1ObjectMeta(name=namespace),
+                ),
+            )
+        else:
+            raise
+
+
 def ensure_namespace_labels(core_api, namespace, priority_class):
     """Patch worker namespace with labels required by Kyverno policies."""
+    ensure_namespace(core_api, namespace)
     allowed = ",".join([
         "gpuaas-production", "gpuaas-critical",
         "gpuaas-standard", "gpuaas-opportunistic",
@@ -577,6 +634,10 @@ def test_kueue_admits_gpu_workload(
     ns = test_namespace
     w_ns = vk_worker_namespace
 
+    # Pre-checks: ClusterQueue active, no stale workloads
+    assert_cluster_queue_active(worker_custom)
+    cleanup_stale_workloads(worker_custom, w_ns)
+
     # Setup: label worker namespace + create LocalQueue
     ensure_namespace_labels(worker_core, w_ns, "gpuaas-standard")
     ensure_local_queue(worker_custom, w_ns)
@@ -652,6 +713,10 @@ def test_kueue_queues_when_full(
     worker_core, worker_custom = worker_clients
     ns = test_namespace
     w_ns = vk_worker_namespace
+
+    # Pre-checks: ClusterQueue active, no stale workloads
+    assert_cluster_queue_active(worker_custom)
+    cleanup_stale_workloads(worker_custom, w_ns)
 
     ensure_namespace_labels(worker_core, w_ns, "gpuaas-standard")
     ensure_local_queue(worker_custom, w_ns)
@@ -768,6 +833,11 @@ def test_kueue_preemption_cross_tenant(
     ns = test_namespace
     w_ns_t1 = vk_worker_namespace
     w_ns_t2 = vk_worker_namespace_t2
+
+    # Pre-checks: ClusterQueue active, no stale workloads
+    assert_cluster_queue_active(worker_custom)
+    cleanup_stale_workloads(worker_custom, w_ns_t1)
+    cleanup_stale_workloads(worker_custom, w_ns_t2)
 
     # Setup: label tenant1's worker ns as low priority, tenant2's as high
     ensure_namespace_labels(worker_core, w_ns_t1, "gpuaas-opportunistic")
