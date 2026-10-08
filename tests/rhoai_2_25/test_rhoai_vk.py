@@ -13,7 +13,7 @@ import time
 import pytest
 from kubernetes import client
 
-from conftest import worker_pod_name, execution_pvc_name, CATAPULT_STORAGE_CLASS
+from helpers import worker_pod_name, execution_pvc_name, force_delete_pod, wait_pod_exists, CATAPULT_STORAGE_CLASS
 
 
 VK_NODE_NAME = "gpu-worker"
@@ -47,25 +47,6 @@ def _ensure_lab_env(high_memory_env, vk_node_ready, rhoai_operators_ready):
     pass
 
 
-def force_delete_pod(core_api, name, namespace, timeout=60):
-    """Delete a pod with grace_period=0 and wait for it to disappear."""
-    try:
-        core_api.delete_namespaced_pod(
-            name=name,
-            namespace=namespace,
-            grace_period_seconds=0,
-        )
-    except client.exceptions.ApiException:
-        return
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            core_api.read_namespaced_pod(name=name, namespace=namespace)
-        except client.exceptions.ApiException:
-            return
-        time.sleep(2)
-
-
 def wait_pod_phase(core_api, name, namespace, phases, timeout=600):
     """Wait for a pod to reach one of the given phases. Returns the phase."""
     deadline = time.time() + timeout
@@ -80,19 +61,6 @@ def wait_pod_phase(core_api, name, namespace, phases, timeout=600):
             pass
         time.sleep(5)
     return phase
-
-
-def wait_pod_exists(core_api, name, namespace, timeout=120):
-    """Wait for a pod to exist. Returns True if found."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            core_api.read_namespaced_pod(name=name, namespace=namespace)
-            return True
-        except client.exceptions.ApiException:
-            pass
-        time.sleep(3)
-    return False
 
 
 @pytest.mark.rhoai
@@ -1279,6 +1247,55 @@ SMM_GROUP = "maistra.io"
 SMM_VERSION = "v1"
 SMM_PLURAL = "servicemeshmembers"
 
+SMCP_NAME = "data-science-smcp"
+SMCP_NAMESPACE = "istio-system"
+
+
+def ensure_mesh_member(tenant_custom, namespace, cleanup):
+    """Add namespace to the ServiceMesh, return when Ready."""
+    try:
+        tenant_custom.get_namespaced_custom_object(
+            group=SMM_GROUP, version=SMM_VERSION,
+            namespace=namespace, plural=SMM_PLURAL, name="default",
+        )
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+        tenant_custom.create_namespaced_custom_object(
+            group=SMM_GROUP, version=SMM_VERSION,
+            namespace=namespace, plural=SMM_PLURAL,
+            body={
+                "apiVersion": f"{SMM_GROUP}/{SMM_VERSION}",
+                "kind": "ServiceMeshMember",
+                "metadata": {"name": "default", "namespace": namespace},
+                "spec": {
+                    "controlPlaneRef": {
+                        "name": SMCP_NAME,
+                        "namespace": SMCP_NAMESPACE,
+                    },
+                },
+            },
+        )
+    cleanup(
+        tenant_custom.delete_namespaced_custom_object,
+        group=SMM_GROUP, version=SMM_VERSION,
+        namespace=namespace, plural=SMM_PLURAL, name="default",
+    )
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        try:
+            smm = tenant_custom.get_namespaced_custom_object(
+                group=SMM_GROUP, version=SMM_VERSION,
+                namespace=namespace, plural=SMM_PLURAL, name="default",
+            )
+            for c in smm.get("status", {}).get("conditions", []):
+                if c.get("type") == "Ready" and c.get("status") == "True":
+                    return
+        except client.exceptions.ApiException:
+            pass
+        time.sleep(5)
+    pytest.fail(f"ServiceMeshMember for {namespace} not Ready within 60s")
+
 
 @pytest.mark.rhoai
 def test_kserve_serverless_inference_via_vk(
@@ -1445,10 +1462,6 @@ def test_kserve_serverless_inference_via_vk(
             "name": isvc_name,
             "namespace": ns,
             "annotations": {
-                # Disable Istio sidecar: VK library's PopulateEnvironmentVariables
-                # does not support status.podIP fieldRef used by istio-proxy's
-                # INSTANCE_IP env var, causing infinite requeue before CreatePod.
-                # The sidecar is also useless on the worker (no Istio control plane).
                 "sidecar.istio.io/inject": "false",
             },
         },
@@ -1724,3 +1737,208 @@ def test_kserve_serverless_inference_via_vk(
             f"Pod is Running on worker — Knative/Istio status propagation "
             f"may not work cross-cluster."
         )
+
+
+@pytest.mark.rhoai
+def test_istio_sidecar_injection_on_vk_pod(
+    cleanup, tenant_clients, worker_clients, test_namespace, vk_worker_namespace
+):
+    """
+    Test what happens when Istio sidecar injection is enabled on a
+    VK-dispatched pod. The namespace is added to the ServiceMesh and the
+    pod has sidecar.istio.io/inject: "true" (OSSM default policy is
+    "disabled" — requires explicit opt-in). We observe:
+      1. Whether the sidecar gets injected on the tenant side
+      2. Whether VK dispatches the pod with the sidecar to the worker
+      3. Whether the sidecar crashes on the worker (no istiod)
+      4. Whether istio-init iptables rules block the main container
+    """
+    tenant_core, tenant_custom = tenant_clients
+    worker_core, _ = worker_clients
+    ns = test_namespace
+
+    # ── Step 1: Ensure istiod is running ──
+
+    apps_api = client.AppsV1Api(tenant_core.api_client)
+    deadline = time.time() + 120
+    istiod_ready = False
+    while time.time() < deadline:
+        try:
+            dep = apps_api.read_namespaced_deployment(
+                name="istiod-data-science-smcp", namespace=SMCP_NAMESPACE,
+            )
+            if (dep.status.ready_replicas or 0) >= 1:
+                istiod_ready = True
+                break
+        except client.exceptions.ApiException:
+            pass
+        time.sleep(10)
+    if not istiod_ready:
+        pytest.skip("istiod not running — tenant may not have enough memory")
+
+    # ── Step 2: Add namespace to mesh ──
+
+    ensure_mesh_member(tenant_custom, ns, cleanup)
+
+    # Verify namespace got the mesh label
+    ns_obj = tenant_core.read_namespace(name=ns)
+    mesh_label = (ns_obj.metadata.labels or {}).get("maistra.io/member-of", "")
+    assert mesh_label == SMCP_NAMESPACE, (
+        f"Namespace {ns} not labeled as mesh member (labels: {ns_obj.metadata.labels})"
+    )
+    print(f"\n--- Namespace {ns} is a mesh member (maistra.io/member-of={mesh_label}) ---")
+
+    # ── Step 3: Create pod WITH sidecar.istio.io/inject: "true" ──
+    # OSSM default policy is "disabled" — injection requires explicit opt-in.
+
+    pod_name = "istio-sidecar-test"
+    w_pod_name = worker_pod_name(ns, pod_name)
+
+    force_delete_pod(tenant_core, pod_name, ns)
+    force_delete_pod(worker_core, w_pod_name, vk_worker_namespace)
+
+    pod = client.V1Pod(
+        metadata=client.V1ObjectMeta(
+            name=pod_name, namespace=ns,
+            annotations={"sidecar.istio.io/inject": "true"},
+        ),
+        spec=client.V1PodSpec(
+            node_name=VK_NODE_NAME,
+            restart_policy="Never",
+            tolerations=[
+                client.V1Toleration(
+                    key="virtual-kubelet.io/provider", operator="Exists",
+                ),
+            ],
+            containers=[
+                client.V1Container(
+                    name="main",
+                    image="registry.access.redhat.com/ubi9-micro:latest",
+                    command=["sleep", "60"],
+                    resources=client.V1ResourceRequirements(
+                        requests={"cpu": "100m", "memory": "64Mi"},
+                    ),
+                )
+            ],
+        ),
+    )
+    tenant_core.create_namespaced_pod(namespace=ns, body=pod)
+    cleanup(force_delete_pod, tenant_core, pod_name, ns)
+    cleanup(force_delete_pod, worker_core, w_pod_name, vk_worker_namespace)
+
+    # ── Step 4: Inspect what Istio injected ──
+
+    time.sleep(3)
+    created = tenant_core.read_namespaced_pod(name=pod_name, namespace=ns)
+
+    container_names = [c.name for c in created.spec.containers]
+    init_names = [c.name for c in (created.spec.init_containers or [])]
+    inject_annotation = (created.metadata.annotations or {}).get(
+        "sidecar.istio.io/inject", "not-set"
+    )
+    sidecar_status = (created.metadata.annotations or {}).get(
+        "sidecar.istio.io/status", "not-set"
+    )
+
+    print(f"--- Pod spec after admission ---")
+    print(f"Containers: {container_names}")
+    print(f"Init containers: {init_names}")
+    print(f"sidecar.istio.io/inject: {inject_annotation}")
+    print(f"sidecar.istio.io/status: {sidecar_status[:100] if sidecar_status != 'not-set' else 'not-set'}")
+
+    sidecar_injected = "istio-proxy" in container_names
+    print(f"Sidecar injected: {sidecar_injected}")
+
+    if not sidecar_injected:
+        print("Istio webhook did NOT inject sidecar — nothing to test.")
+        return
+
+    # ── Step 5: Wait for VK to dispatch and check worker pod ──
+
+    deadline = time.time() + 120
+    worker_pod = None
+    while time.time() < deadline:
+        try:
+            worker_pod = worker_core.read_namespaced_pod(
+                name=w_pod_name, namespace=vk_worker_namespace,
+            )
+            break
+        except client.exceptions.ApiException:
+            pass
+        time.sleep(5)
+
+    if worker_pod is None:
+        tenant_pod = tenant_core.read_namespaced_pod(name=pod_name, namespace=ns)
+        print(f"Tenant pod phase: {tenant_pod.status.phase}")
+        print(f"Tenant pod reason: {tenant_pod.status.reason}")
+        pytest.fail(
+            "Worker pod never created. VK may have failed to process the "
+            "pod due to injected sidecar fieldRefs (status.podIP)."
+        )
+
+    w_container_names = [c.name for c in worker_pod.spec.containers]
+    w_init_names = [c.name for c in (worker_pod.spec.init_containers or [])]
+    print(f"\n--- Worker pod spec ---")
+    print(f"Containers: {w_container_names}")
+    print(f"Init containers: {w_init_names}")
+
+    # ── Step 6: Observe container statuses on worker ──
+
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        worker_pod = worker_core.read_namespaced_pod(
+            name=w_pod_name, namespace=vk_worker_namespace,
+        )
+        if worker_pod.status.phase in ("Running", "Failed", "Succeeded"):
+            break
+        all_created = all(
+            cs.state and not (cs.state.waiting and cs.state.waiting.reason == "ContainerCreating")
+            for cs in (worker_pod.status.container_statuses or [])
+        ) if worker_pod.status.container_statuses else False
+        if all_created:
+            break
+        time.sleep(5)
+
+    print(f"\n--- Worker pod status ---")
+    print(f"Phase: {worker_pod.status.phase}")
+    for cs in (worker_pod.status.container_statuses or []):
+        state = "unknown"
+        if cs.state.running:
+            state = "running"
+        elif cs.state.waiting:
+            state = f"waiting: {cs.state.waiting.reason}"
+        elif cs.state.terminated:
+            state = f"terminated: {cs.state.terminated.reason} (exit {cs.state.terminated.exit_code})"
+        print(f"  {cs.name}: ready={cs.ready}, restarts={cs.restart_count}, state={state}")
+
+    for cs in (worker_pod.status.init_container_statuses or []):
+        state = "unknown"
+        if cs.state.running:
+            state = "running"
+        elif cs.state.waiting:
+            state = f"waiting: {cs.state.waiting.reason}"
+        elif cs.state.terminated:
+            state = f"terminated: {cs.state.terminated.reason} (exit {cs.state.terminated.exit_code})"
+        print(f"  init/{cs.name}: ready={cs.ready}, state={state}")
+
+    # ── Step 7: Report findings ──
+
+    proxy_status = None
+    main_status = None
+    for cs in (worker_pod.status.container_statuses or []):
+        if cs.name == "istio-proxy":
+            proxy_status = cs
+        if cs.name == "main":
+            main_status = cs
+
+    if proxy_status and proxy_status.restart_count > 0:
+        print(f"\nistio-proxy is crash-looping (restarts={proxy_status.restart_count})")
+
+    if main_status:
+        if main_status.ready:
+            print("\nmain container is running — sidecar crash does NOT block it")
+        elif main_status.state and main_status.state.waiting:
+            print(
+                f"\nmain container blocked: {main_status.state.waiting.reason} — "
+                "istio-init iptables rules may be blocking traffic"
+            )

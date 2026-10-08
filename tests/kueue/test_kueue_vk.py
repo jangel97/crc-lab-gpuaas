@@ -37,7 +37,7 @@ import pytest
 import yaml
 from kubernetes import client, utils
 
-from conftest import worker_pod_name
+from helpers import worker_pod_name, force_delete_pod, wait_pod_exists
 
 
 VK_NODE_NAME = "gpu-worker"
@@ -65,10 +65,10 @@ KYVERNO_MANIFEST_URL = os.environ.get(
 )
 
 POLICY_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "..", "kueue-gpu-policy", "deployment", "policies",
+    os.path.dirname(__file__), "..", "..", "..", "kueue-gpu-policy", "deployment", "policies",
 )
 
-KUEUE_DEPLOY_DIR = os.path.join(os.path.dirname(__file__), "..", "deploy")
+KUEUE_DEPLOY_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "deploy")
 
 
 # ---------------------------------------------------------------------------
@@ -406,34 +406,6 @@ def kueue_setup(worker_clients):
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
-
-
-def force_delete_pod(core_api, name, namespace, timeout=60):
-    try:
-        core_api.delete_namespaced_pod(
-            name=name, namespace=namespace, grace_period_seconds=0,
-        )
-    except client.exceptions.ApiException:
-        return
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            core_api.read_namespaced_pod(name=name, namespace=namespace)
-        except client.exceptions.ApiException:
-            return
-        time.sleep(2)
-
-
-def wait_pod_exists(core_api, name, namespace, timeout=120):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            core_api.read_namespaced_pod(name=name, namespace=namespace)
-            return True
-        except client.exceptions.ApiException:
-            pass
-        time.sleep(3)
-    return False
 
 
 def wait_pod_phase(core_api, name, namespace, phases, timeout=600):

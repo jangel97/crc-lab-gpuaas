@@ -19,7 +19,7 @@ import time
 import pytest
 from kubernetes import client
 
-from conftest import worker_pod_name
+from helpers import worker_pod_name, force_delete_pod
 
 
 VK_NODE_NAME = "gpu-worker"
@@ -34,23 +34,7 @@ def _suffix():
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
 
 
-def force_delete_pod(core_api, name, namespace, timeout=60):
-    """Delete a pod with grace_period=0 and wait for it to disappear."""
-    try:
-        core_api.delete_namespaced_pod(
-            name=name,
-            namespace=namespace,
-            grace_period_seconds=0,
-        )
-    except client.exceptions.ApiException:
-        return
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            core_api.read_namespaced_pod(name=name, namespace=namespace)
-        except client.exceptions.ApiException:
-            return
-        time.sleep(2)
+
 
 
 @pytest.mark.networking

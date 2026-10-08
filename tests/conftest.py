@@ -5,35 +5,15 @@ import pytest
 import urllib3
 from kubernetes import client, config
 
+from helpers import (
+    VK_TEST_NAMESPACE,
+    CATAPULT_STORAGE_CLASS,
+    worker_namespace_for_prefix,
+    safe_delete,
+)
 from lab_env import LabEnvironment, LabEnvironmentError
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-VK_TEST_NAMESPACE = "vk-test"
-
-
-def _safe_delete(fn, *args, **kwargs):
-    try:
-        fn(*args, **kwargs)
-    except Exception:
-        pass
-
-
-def _force_delete_pod(core_api, name, namespace, timeout=30):
-    import time
-    try:
-        core_api.delete_namespaced_pod(
-            name=name, namespace=namespace, grace_period_seconds=0,
-        )
-    except client.exceptions.ApiException:
-        return
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            core_api.read_namespaced_pod(name=name, namespace=namespace)
-        except client.exceptions.ApiException:
-            return
-        time.sleep(2)
 
 
 @pytest.fixture
@@ -56,21 +36,10 @@ def cleanup():
     yield register
 
     for fn, args, kwargs in reversed(_callbacks):
-        _safe_delete(fn, *args, **kwargs)
-CATAPULT_STORAGE_CLASS = "catapult"
+        safe_delete(fn, *args, **kwargs)
 
 VK_PREFIX_CONFIGMAP = "vk-gpu-provider-config-gpu-worker"
 VK_PREFIX_CONFIGMAP_NS = "kube-system"
-
-
-def worker_pod_name(tenant_namespace, pod_name):
-    """Compute the namespaced worker pod name that VK creates."""
-    return f"{tenant_namespace}--{pod_name}"
-
-
-def execution_pvc_name(tenant_namespace, pvc_name):
-    """Compute the namespace-prefixed execution PVC name."""
-    return f"{tenant_namespace}--{pvc_name}"
 
 
 def _load_clients(kubeconfig_path):
@@ -127,11 +96,6 @@ def worker_namespace_prefix(tenant_clients):
         f"worker-namespace-prefix key — is the VK running?"
     )
     return prefix
-
-
-def worker_namespace_for_prefix(prefix, tenant_namespace):
-    """Compute the per-tenant worker namespace given a prefix."""
-    return f"{prefix}{tenant_namespace}"
 
 
 @pytest.fixture(scope="session")
