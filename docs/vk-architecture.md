@@ -69,8 +69,8 @@ When a pod is assigned to the virtual node, `handleTenantPod` runs:
 ```
 tenant pod event (Add/Update)
     │
-    ├── skip if system namespace (openshift-*, kube-*, redhat-ods-*, default, kueue-system)
-    ├── skip if DaemonSet-owned (ownerReferences contains Kind=DaemonSet)
+    ├── reject if DaemonSet-owned (ownerReferences contains Kind=DaemonSet) → ProviderCreateFailed
+    ├── reject if system namespace (openshift-*, kube-*, redhat-ods-*, default, kueue-system) → ProviderCreateFailed
     ├── skip if already managed (in managedPods map)
     ├── skip if DeletionTimestamp set → route to deletion handler
     ├── skip if already terminal (Succeeded/Failed)
@@ -277,10 +277,19 @@ Worker namespaces are created on-demand by `ensureNamespace` with label
 
 ## DaemonSet Pod Exclusion
 
-`CreatePod` skips any pod with a DaemonSet `ownerReference`. DaemonSet pods
-are node-level infrastructure (routeagents, log collectors, monitoring agents)
-that must run on the actual host — dispatching them cross-cluster breaks them
-because:
+`CreatePod` rejects any pod with a DaemonSet `ownerReference` by returning
+`errdefs.InvalidInput`. This causes the VK pod controller to emit a
+`ProviderCreateFailed` warning event on the pod and stop tracking it.
+The pod displays as `ProviderFailed` in `kubectl get pods` (the status
+reason from the event), but the actual pod phase remains `Pending` — the
+VK pod controller never transitions it to `Failed`. This means the
+DaemonSet controller sees an existing pod for the node and does not
+create a replacement, and ClusterOperator health impact is identical to
+the previous behavior where rejected pods sat in silent `Pending`.
+
+DaemonSet pods are node-level infrastructure (routeagents, log collectors,
+monitoring agents, CNI plugins) that must run on the actual host —
+dispatching them cross-cluster breaks them because:
 
 1. They typically need host-level access (iptables, network stack, filesystem)
    that a remote cluster can't provide.
@@ -289,19 +298,19 @@ because:
 3. They retry failed operations in tight loops, generating sustained API
    traffic against the worker API server.
 
-This was discovered with Submariner's routeagent DaemonSet, which uses
-`tolerations: [{operator: Exists}]` and no `nodeSelector`. The DaemonSet
-controller schedules it on every node including the virtual one. Without this
-check, VK dispatched it to the worker where its init container
-(`await-node-ready`) looped forever with RBAC errors (~1 req/sec).
+Many OpenShift DaemonSets (Istio CNI, Submariner routeagent, OVN, multus,
+node-exporter) use `tolerations: [{operator: Exists}]`, which tolerates all
+taints including `virtual-kubelet.io/provider`. Taints alone cannot prevent
+these pods from being scheduled on the virtual node — the `CreatePod`
+rejection is the necessary safety net.
 
-The routeagent pod still shows as `Pending` on the virtual node (the
-DaemonSet controller keeps creating it, but with no real kubelet it can't
-run). This is stable and has no functional impact: no container runs, no
-resources are consumed, no API calls are generated. Submariner routing
-works fully — the real routeagent on the tenant SNO node handles all
-iptables rules and cross-cluster routes. The only consequence is a visible
-`Pending` pod that may trigger monitoring alerts.
+The VK pod controller retries with exponential backoff (1s, 2s, 4s, ...
+up to ~16 minutes), so rejected pods are re-attempted infrequently but
+indefinitely. Each retry is a single `CreatePod` call that returns
+immediately — no worker API traffic, no resources created. The rejected
+pods are visible in `kubectl get pods` with a clear `ProviderFailed`
+display status and a `ProviderCreateFailed` event explaining the reason
+in `kubectl describe pod`.
 
 ## SecurityContext Handling
 
@@ -392,9 +401,33 @@ TODO(upstream): contribute `status.podIP`/`hostIP`/`podIPs` support to
 `podFieldSelectorRuntimeValue`. Once fixed, delete `clientwrap.go` and
 remove the wrapper from `main.go`.
 
-**Istio sidecar** is disabled on VK-dispatched pods via
-`sidecar.istio.io/inject: "false"`. The sidecar cannot function on the
-worker cluster because:
+**Istio sidecar** must be disabled on VK-dispatched pods via
+`sidecar.istio.io/inject: "false"`. OSSM 2.x uses `policy: disabled` at
+the global mesh level, but namespaces that are ServiceMeshMembers get
+automatic sidecar injection. KServe serverless requires mesh membership,
+so the annotation is required to prevent the `istio-proxy` sidecar from
+being injected. Without it, the pod gets stuck in `Pending` on the worker.
+
+**Tested failure mode (`test_istio_sidecar_injection_on_vk_pod`):** When
+sidecar injection is enabled on a VK-dispatched pod, the failure is worse
+than a sidecar crash — the pod sandbox cannot be created at all:
+
+1. The Istio webhook injects the `istio-proxy` container and adds a
+   `k8s.v1.cni.cncf.io/networks: v2-6-istio-cni` annotation.
+2. VK copies both to the worker pod (annotations pass through
+   `transformPod`).
+3. On the worker, Multus reads the annotation and looks for a
+   `NetworkAttachmentDefinition` named `v2-6-istio-cni` in the worker
+   namespace. It does not exist (the worker has no OSSM).
+4. `FailedCreatePodSandBox` — the kubelet retries indefinitely but no
+   containers ever start, not even the main one.
+
+This is not a graceful degradation — the pod is permanently stuck in
+`ContainerCreating` with an opaque CNI error. The `sidecar.istio.io/inject:
+"false"` annotation prevents this entirely by telling the webhook to skip
+the pod.
+
+**Why the sidecar would not work even without the CNI issue:**
 
 1. **No control plane.** `istio-proxy` connects to
    `istiod.istio-system.svc` at startup for config, mTLS certificates,

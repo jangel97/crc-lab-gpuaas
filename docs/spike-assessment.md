@@ -27,7 +27,8 @@ Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 | OpenShift | 4.22 | 4.18 | 4.22 |
 | vCPU / RAM | 12 / 14 GB | 10 / 16 GB | 8 / 24 GB |
 | GPU | — | — | RTX 5090 (32 GB VRAM) |
-| Operators | RHOAI | RHOAI | GPU Operator, Kueue, Kyverno, LVMS |
+| RHOAI | 2.25.8 | 2.25.8 | — |
+| Operators | RHOAI, OSSM 2.x, Serverless | RHOAI, OSSM 2.x, Serverless | GPU Operator, Kueue, Kyverno, LVMS |
 | Pod CIDR | 10.128.0.0/14 | 10.136.0.0/14 | 10.132.0.0/14 |
 | Service CIDR | 172.30.0.0/16 | 172.32.0.0/16 | 172.31.0.0/16 |
 | Networking | Submariner v0.24 | Submariner v0.24 | Submariner v0.24 |
@@ -1028,11 +1029,16 @@ to the VK service account.
    infrastructure, not the workload.
 
 2. **KServe with full Istio service mesh.** KServe serverless mode works via
-   Knative (S20), but Istio sidecar injection is disabled. The `istio-proxy`
-   sidecar cannot function on the worker: it needs `istiod` on the tenant
-   for config (xDS), mTLS certs, and routing rules — none of which are
-   reachable cross-cluster. This means no mTLS, no Istio telemetry, and
-   no traffic management (retries, circuit breaking, canary). Inference
+   Knative (S20), but Istio sidecar injection must be disabled. Tested with
+   `test_istio_sidecar_injection_on_vk_pod`: when sidecar injection is
+   enabled (`sidecar.istio.io/inject: "true"`), the Istio webhook adds a
+   `k8s.v1.cni.cncf.io/networks: v2-6-istio-cni` annotation. VK copies
+   this to the worker pod, where Multus fails to find the
+   `NetworkAttachmentDefinition` (worker has no OSSM). The pod is
+   permanently stuck in `ContainerCreating` — no containers ever start.
+   This is not a graceful degradation; it is a hard failure. OSSM's
+   default injection policy is `disabled` (per-pod opt-in required), so
+   this only affects pods that explicitly request injection. Inference
    traffic works without Istio via direct pod IP routing through Submariner.
    A proper fix would be Istio multi-cluster mesh (primary-remote), which
    is a separate effort. See `vk-architecture.md` § KServe / Knative.
@@ -1055,4 +1061,6 @@ to the VK service account.
 | [submariner-architecture.md](submariner-architecture.md) | Cross-cluster networking: topology, traffic flows, failure modes, deployment log |
 | [pvc-architecture.md](pvc-architecture.md) | Catapult PVC lifecycle and design |
 | [security-context-handling.md](security-context-handling.md) | SecurityContext field classification and SCC ambiguity |
+| [istio-cross-cluster-analysis.md](istio-cross-cluster-analysis.md) | Istio sidecar on VK pods: blockers, alternatives, validation steps |
+| [risks.md](risks.md) | Architectural risks and known limitations (webhook-injected dependencies) |
 | [00-prerequisites.md](../00-prerequisites.md) | Hardware setup, VFIO, QEMU 9.2, RTX 5090 XML tweaks |
