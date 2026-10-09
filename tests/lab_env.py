@@ -5,9 +5,11 @@ Manages libvirt VMs via virsh subprocess calls. Requires passwordless sudo
 for virsh commands (configure NOPASSWD in sudoers).
 
 VM inventory:
-  sno-tenant:  14GB default, tenant cluster
-  sno-tenant2: 16GB default, second tenant for multi-tenant tests
+  sno-tenant:  14GB default, tenant cluster (RHOAI 2.x)
+  sno-tenant2: 16GB default, second tenant for multi-tenant tests (RHOAI 2.x)
   sno-worker:  24GB, GPU worker cluster (never touched by this module)
+  sno-tenant-rhoai3:  16GB default, tenant cluster (RHOAI 3.x)
+  sno-tenant2-rhoai3: 16GB default, second tenant for multi-tenant tests (RHOAI 3.x)
 """
 
 import os
@@ -31,6 +33,16 @@ VM_INVENTORY = {
         "default_memory_gb": 24,
         "kubeconfig_env": "WORKER_KUBECONFIG",
         "kubeconfig_default": "~/.kube/worker",
+    },
+    "sno-tenant-rhoai3": {
+        "default_memory_gb": 16,
+        "kubeconfig_env": "RHOAI3_KUBECONFIG",
+        "kubeconfig_default": "~/.kube/tenant-rhoai3",
+    },
+    "sno-tenant2-rhoai3": {
+        "default_memory_gb": 16,
+        "kubeconfig_env": "RHOAI3_TENANT2_KUBECONFIG",
+        "kubeconfig_default": "~/.kube/tenant2-rhoai3",
     },
 }
 

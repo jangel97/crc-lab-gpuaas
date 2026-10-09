@@ -7,6 +7,7 @@ all:
     pull_secret_path: "{{ playbook_dir }}/../pull-secret.json"
     work_dir: "{{ playbook_dir }}/../.workdir"
     kubeconfig_dir: "{{ lookup('env', 'HOME') }}/.kube"
+    kubeconfig: "{{ kubeconfig_dir }}/{{ inventory_hostname }}"
     local_bin: "{{ lookup('env', 'HOME') }}/.local/bin"
     libvirt_pool: /var/lib/libvirt/images
     libvirt_network: default
@@ -30,6 +31,7 @@ all:
         tenant:
           ocp_version: "4.22"
           role: tenant
+          profile: rhoai2
           vm_name: sno-tenant
           vm_cpus: 12
           vm_ram_mb: 14336
@@ -41,11 +43,13 @@ all:
           cluster_network_cidr: "10.128.0.0/14"
           cluster_network_prefix: 23
           service_network_cidr: "172.30.0.0/16"
+          rhoai_channel: stable-2.25
           components:
             rhoai: true
         tenant2:
           ocp_version: "4.18"
           role: tenant
+          profile: rhoai2
           vm_name: sno-tenant2
           vm_cpus: 10
           vm_ram_mb: 16384
@@ -57,10 +61,48 @@ all:
           cluster_network_cidr: "10.136.0.0/14"
           cluster_network_prefix: 23
           service_network_cidr: "172.32.0.0/16"
+          rhoai_channel: stable-2.25
+          components:
+            rhoai: true
+        tenant-rhoai3:
+          ocp_version: "4.19"
+          role: tenant
+          profile: rhoai3
+          vm_name: sno-tenant-rhoai3
+          vm_cpus: 12
+          vm_ram_mb: 16384
+          vm_disk_gb: 120
+          vm_mac: "52:54:00:aa:bb:04"
+          vm_ip: "192.168.122.13"
+          gpu_passthrough: false
+          data_disk_gb: 50
+          cluster_network_cidr: "10.140.0.0/14"
+          cluster_network_prefix: 23
+          service_network_cidr: "172.33.0.0/16"
+          rhoai_channel: stable-3.5
+          components:
+            rhoai: true
+        tenant2-rhoai3:
+          ocp_version: "4.19"
+          role: tenant
+          profile: rhoai3
+          vm_name: sno-tenant2-rhoai3
+          vm_cpus: 10
+          vm_ram_mb: 16384
+          vm_disk_gb: 120
+          vm_mac: "52:54:00:aa:bb:05"
+          vm_ip: "192.168.122.14"
+          gpu_passthrough: false
+          data_disk_gb: 50
+          cluster_network_cidr: "10.144.0.0/14"
+          cluster_network_prefix: 23
+          service_network_cidr: "172.34.0.0/16"
+          rhoai_channel: stable-3.5
           components:
             rhoai: true
         worker:
           role: worker
+          profile: always
           ocp_version: "4.22"
           vm_name: sno-worker
           vm_cpus: 8

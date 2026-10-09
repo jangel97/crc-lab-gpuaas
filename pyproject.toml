@@ -18,4 +18,6 @@ markers = [
     "rhoai: RHOAI workload dispatch via Virtual Kubelet",
     "networking: Cross-cluster networking via Submariner (Service/Route to remote GPU pod)",
     "kueue: Kueue admission control and cross-tenant preemption via VK",
+    "rhoai3: RHOAI 3.x single-tenant e2e workload tests via VK",
+    "rhoai3_mt: RHOAI 3.x multi-tenant concurrent access and Kueue tests via VK",
 ]

@@ -772,6 +772,101 @@ tests/test_vk_gpu.py::test_pod_logs_proxied_from_worker                       PA
 8 passed
 ```
 
+### RHOAI 3.x e2e (tenant-rhoai3, OCP 4.19.49)
+
+Environment: sno-tenant-rhoai3 (24 GiB, OCP 4.19.49, RHOAI 3.x) + sno-worker (24 GiB, GPU).
+All DSC components set to Managed (kserve, trainingoperator, workbenches, dashboard, ray, kueue, etc.).
+No OSSM/Istio, no Serverless/Knative — RHOAI 3.x uses cert-manager + jobset as prerequisites.
+KServe runs in RawDeployment mode only.
+
+```
+tests/rhoai_3/e2e/test_smoke.py::test_no_rhoai_crds_on_worker                PASSED
+tests/rhoai_3/e2e/test_smoke.py::test_rhoai3_components_running               PASSED
+tests/rhoai_3/e2e/test_smoke.py::test_no_ossm_on_rhoai3                       PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_pytorchjob_via_vk                   PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_kserve_raw_inference_via_vk         PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_notebook_cr_via_vk                  PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_pytorchjob_checkpoint_with_pvc      PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_rayjob_via_vk                     WIP (head pod Running, submitter needs Submariner)
+tests/rhoai_3/e2e/test_workloads.py::test_raycluster_via_vk                  PASSED
+
+7 passed, 2 in progress
+```
+
+#### RHOAI 3.x VK compatibility matrix
+
+| RHOAI Object | VK Compatible | Test | Notes |
+|--------------|:---:|--------|-------|
+| **PyTorchJob** | Yes | `test_pytorchjob_via_vk` | Training operator creates pods, VK dispatches, status syncs back. Requires emptyDir for `/tmp` (PyTorch 2.11.0 + restricted SCC). |
+| **PyTorchJob + PVC** | Yes | `test_pytorchjob_checkpoint_with_pvc` | Checkpoint save/load via catapult PVC works end-to-end. |
+| **KServe InferenceService** | Yes | `test_kserve_raw_inference_via_vk` | RawDeployment mode (only mode in 3.x). cert-manager injects a `proxy-tls` volume from an async-created secret — VK provider polls up to 30s for the secret to appear before syncing. |
+| **Notebook CR** | Yes | `test_notebook_cr_via_vk` | Notebook controller creates StatefulSet, pod dispatched via VK. kube-rbac-proxy replaces oauth-proxy in 3.x. |
+| **RayCluster** | Yes | `test_raycluster_via_vk` | Head pod dispatched via VK, reaches Running on worker. cert-manager TLS secret synced via informer. |
+| **RayJob** | Partial | `test_rayjob_via_vk` | Head pod dispatches and runs GPU workload on worker. Job submission fails: kuberay's submitter pod runs on tenant real node and cannot reach Ray dashboard on worker without Submariner. Needs cross-cluster networking. |
+| **DataSciencePipelines** | ? | — | Not yet tested. Pipeline runner pods may be dispatchable. |
+| **ModelMeshServing** | ? | — | Alternative multi-model serving runtime. Not yet tested. |
+| **ModelRegistry** | N/A | — | Metadata service, does not create GPU workload pods. |
+| **TrustyAI / LMEval** | ? | — | Model evaluation jobs. Not yet tested. |
+| **Dashboard** | N/A | — | UI component, does not create workload pods. |
+| **CodeFlare** | ? | — | Orchestrates RayCluster creation. Not yet tested. |
+
+#### VK provider fix: non-blocking secret sync with informer
+
+The RHOAI 3.x KServe and Ray tests exposed a race condition with cert-manager:
+cert-manager creates TLS secrets asynchronously after Certificate CRs are issued.
+When CreatePod runs before the secret exists, the original approach (polling for 30s)
+blocked the entire CreatePod call and caused kuberay to thrash — it replaced the head
+pod faster than VK could complete resource sync, creating a runaway create/delete cycle
+(dozens of pods per minute, none reaching Running).
+
+**Root cause analysis (RayJob thrashing cycle):**
+
+1. kuberay creates head pod → VK's `CreatePod` starts syncing resources
+2. `syncSecret` blocks polling for the cert-manager TLS secret (up to 30s)
+3. kuberay's reconciler fires again, sees `HeadPodReady=False`, deletes the pod
+4. VK's `DeletePod` cleans up the worker pod that was just created
+5. kuberay creates a replacement pod → cert-manager deletes the old Certificate's
+   secret → new pod's `syncSecret` can't find it → `ProviderCreateFailed`
+6. Cycle repeats indefinitely
+
+Even pods where `CreatePod` succeeded were deleted within 12ms by kuberay's reconciler
+because VK couldn't reflect Running status in time.
+
+**Fix (two parts):**
+
+1. `resourcesync.go`: `syncSecret()` returns nil for NotFound secrets instead of blocking.
+   The worker pod is created immediately; its kubelet retries the volume mount until the
+   secret appears.
+
+2. `provider.go`: Added `AddFunc` handler to the tenant secret informer (previously only
+   had `UpdateFunc`). When cert-manager creates the secret, the informer detects it and
+   syncs it to the worker namespace. The worker kubelet picks it up and the container starts.
+
+**Additional fix — `handleWorkerPodEvent` DeletionTimestamp guard:**
+
+When a tenant pod is being deleted, the VK library's `UpdateStatus` fails with
+`deletionGracePeriodSeconds: Invalid value: 30: field is immutable`. This happened
+because `handleWorkerPodEvent` read the tenant pod from the API (cache miss after
+DeletePod) and passed the deletion metadata through to the VK library.
+
+Fix: skip status updates for tenant pods with `DeletionTimestamp` set, and always
+strip `DeletionTimestamp`/`DeletionGracePeriodSeconds` before calling `notifyCb`.
+
+**Result:** Head pod now reaches Running in a single attempt with no thrashing.
+CreatePod completes in ~60ms (vs 4+ seconds with the polling approach).
+
+#### RayJob limitation: submitter needs cross-cluster networking
+
+kuberay's RayJob creates a submitter pod that runs on the tenant's real node (not
+through VK). The submitter calls `ray job submit --address <dashboard-url>` to reach
+the Ray dashboard on the head pod. Since the head pod runs on the worker cluster, the
+dashboard IP is a worker-cluster pod IP — unreachable from the tenant without Submariner
+or equivalent cross-cluster networking.
+
+The `test_rayjob_via_vk` test works around this by exec'ing into the worker head pod
+directly to verify GPU access, rather than waiting for the submitter to succeed.
+Submariner is not deployed on tenant-rhoai3 (it is on sno-tenant/sno-tenant2).
+
 ---
 
 ## Scenarios Not Yet Assessed

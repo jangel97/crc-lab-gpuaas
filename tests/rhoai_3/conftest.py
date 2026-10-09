@@ -1,264 +1,215 @@
 """
-RHOAI 3.x environment setup — runs once per test session.
+Shared fixtures for RHOAI 3.x test suites (e2e and multi_tenant).
 
-Ensures Cert Manager, JobSet, and RHOAI 3.x operators are installed
-and the DataScienceCluster is ready before any rhoai_3 test runs.
-Every step is idempotent.
-
-Prerequisite: OCP 4.19+ (one-time upgrade via scripts/setup-rhoai3-env.sh)
+Provides:
+  - rhoai3_environment: health-check fixture (skips if RHOAI 3.x not ready)
+  - rhoai3_tenant_clients / rhoai3_worker_clients / rhoai3_tenant2_clients
+  - rhoai3_vk_node_ready: waits for VK virtual node on tenant-rhoai3
+  - rhoai3_lab_env: LabEnvironment with worker running
+  - rhoai3_test_namespace / rhoai3_vk_worker_namespace
+  - cleanup: per-test cleanup callbacks
 """
 
 import os
 import time
 
 import pytest
+import urllib3
 from kubernetes import client, config
+
+from helpers import (
+    VK_TEST_NAMESPACE,
+    CATAPULT_STORAGE_CLASS,
+    safe_delete,
+    worker_namespace_for_prefix,
+)
+from lab_env import LabEnvironment, LabEnvironmentError
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 RHOAI_OPERATOR_NS = "redhat-ods-operator"
 RHOAI_APPS_NS = "redhat-ods-applications"
-CERT_MANAGER_NS = "cert-manager-operator"
-JOBSET_NS = "jobset-system"
-MARKETPLACE_NS = "openshift-marketplace"
-
-RHOAI_CHANNEL = "stable-3.5"
+VK_NODE_NAME = "gpu-worker"
+VK_PREFIX_CONFIGMAP = "vk-gpu-provider-config-gpu-worker"
+VK_PREFIX_CONFIGMAP_NS = "kube-system"
 
 
-def _api_client():
-    path = os.environ.get("TENANT2_KUBECONFIG", os.path.expanduser("~/.kube/tenant2"))
-    return config.new_client_from_config(config_file=path)
+def _load_clients(kubeconfig_path):
+    api_client = config.new_client_from_config(config_file=kubeconfig_path)
+    return client.CoreV1Api(api_client), client.CustomObjectsApi(api_client)
 
 
-def _ensure_namespace(core, name):
+def _deployment_ready(apps, name, namespace):
     try:
-        core.create_namespace(
-            body=client.V1Namespace(metadata=client.V1ObjectMeta(name=name))
-        )
-    except client.exceptions.ApiException as e:
-        if e.status != 409:
-            raise
-
-
-def _ensure_operator_group(custom, namespace, name, target_namespaces=None):
-    body = {
-        "apiVersion": "operators.coreos.com/v1",
-        "kind": "OperatorGroup",
-        "metadata": {"name": name, "namespace": namespace},
-    }
-    if target_namespaces:
-        body["spec"] = {"targetNamespaces": target_namespaces}
-    try:
-        custom.create_namespaced_custom_object(
-            group="operators.coreos.com", version="v1",
-            namespace=namespace, plural="operatorgroups", body=body,
-        )
-    except client.exceptions.ApiException as e:
-        if e.status != 409:
-            raise
-
-
-def _ensure_subscription(custom, namespace, name, channel, operator_name, source="redhat-operators"):
-    body = {
-        "apiVersion": "operators.coreos.com/v1alpha1",
-        "kind": "Subscription",
-        "metadata": {"name": name, "namespace": namespace},
-        "spec": {
-            "channel": channel,
-            "name": operator_name,
-            "source": source,
-            "sourceNamespace": MARKETPLACE_NS,
-        },
-    }
-    try:
-        custom.create_namespaced_custom_object(
-            group="operators.coreos.com", version="v1alpha1",
-            namespace=namespace, plural="subscriptions", body=body,
-        )
-    except client.exceptions.ApiException as e:
-        if e.status == 409:
-            existing = custom.get_namespaced_custom_object(
-                group="operators.coreos.com", version="v1alpha1",
-                namespace=namespace, plural="subscriptions", name=name,
-            )
-            if existing.get("spec", {}).get("channel") != channel:
-                custom.patch_namespaced_custom_object(
-                    group="operators.coreos.com", version="v1alpha1",
-                    namespace=namespace, plural="subscriptions", name=name,
-                    body={"spec": {"channel": channel}},
-                )
-        else:
-            raise
-
-
-def _wait_deployment(apps, name, namespace, timeout=600):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            dep = apps.read_namespaced_deployment(name, namespace)
-            ready = dep.status.ready_replicas or 0
-            desired = dep.spec.replicas or 1
-            if ready >= desired:
-                return True
-        except client.exceptions.ApiException:
-            pass
-        time.sleep(15)
-    return False
-
-
-def _wait_csv_succeeded(custom, namespace, timeout=600):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            csvs = custom.list_namespaced_custom_object(
-                group="operators.coreos.com", version="v1alpha1",
-                namespace=namespace, plural="clusterserviceversions",
-            )
-            for csv in csvs.get("items", []):
-                phase = csv.get("status", {}).get("phase", "")
-                if phase == "Succeeded":
-                    return csv["metadata"]["name"]
-        except client.exceptions.ApiException:
-            pass
-        time.sleep(15)
-    return None
-
-
-def _ensure_catalog_sources_enabled(custom):
-    """Re-enable default catalog sources if disabled by the provisioning playbook."""
-    try:
-        hub = custom.get_cluster_custom_object(
-            group="config.openshift.io", version="v1",
-            plural="operatorhubs", name="cluster",
-        )
-        if hub.get("spec", {}).get("disableAllDefaultSources", False):
-            custom.patch_cluster_custom_object(
-                group="config.openshift.io", version="v1",
-                plural="operatorhubs", name="cluster",
-                body={"spec": {"disableAllDefaultSources": False}},
-            )
-            time.sleep(20)
+        dep = apps.read_namespaced_deployment(name, namespace)
+        ready = dep.status.ready_replicas or 0
+        desired = dep.spec.replicas or 1
+        return ready >= desired
     except client.exceptions.ApiException:
-        pass
+        return False
 
 
-@pytest.fixture(scope="session", autouse=True)
+# ---------------------------------------------------------------------------
+# Environment health check
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
 def rhoai3_environment():
-    """Install Cert Manager, JobSet, and RHOAI 3.x operators. Idempotent."""
-    api = _api_client()
-    core = client.CoreV1Api(api)
+    """Verify RHOAI 3.x environment is ready. Skips if not provisioned."""
+    path = os.environ.get("RHOAI3_KUBECONFIG", os.path.expanduser("~/.kube/tenant-rhoai3"))
+    api = config.new_client_from_config(config_file=path)
     custom = client.CustomObjectsApi(api)
     apps = client.AppsV1Api(api)
 
-    # Verify OCP >= 4.19
-    version_api = client.VersionApi(api)
-    info = version_api.get_code()
     try:
         cv = custom.get_cluster_custom_object(
             "config.openshift.io", "v1", "clusterversions", "version",
         )
         ocp_version = cv.get("status", {}).get("desired", {}).get("version", "unknown")
     except client.exceptions.ApiException:
-        ocp_version = info.git_version
+        pytest.skip("Cannot reach cluster -- check RHOAI3_KUBECONFIG")
 
     major_minor = ".".join(ocp_version.split(".")[:2])
     if major_minor < "4.19":
+        pytest.skip(f"OCP {ocp_version} < 4.19 -- RHOAI 3.x requires 4.19+")
+
+    required = [
+        ("rhods-operator", RHOAI_OPERATOR_NS),
+        ("kubeflow-training-operator", RHOAI_APPS_NS),
+        ("cert-manager", "cert-manager"),
+        ("jobset-operator", "jobset-system"),
+    ]
+    missing = [
+        f"{name} in {ns}"
+        for name, ns in required
+        if not _deployment_ready(apps, name, ns)
+    ]
+    if missing:
         pytest.skip(
-            f"OCP {ocp_version} < 4.19 — run scripts/setup-rhoai3-env.sh first"
+            f"RHOAI 3.x not ready -- missing deployments: {', '.join(missing)}. "
+            "Run: ansible-playbook playbooks/03-configure-clusters.yml -l tenant-rhoai3"
         )
 
-    _ensure_catalog_sources_enabled(custom)
-
-    # ── Cert Manager ──
-    print("\n==> Installing Cert Manager operator...")
-    _ensure_namespace(core, CERT_MANAGER_NS)
-    _ensure_operator_group(custom, CERT_MANAGER_NS, "cert-manager-operator",
-                           target_namespaces=[CERT_MANAGER_NS])
-    _ensure_subscription(custom, CERT_MANAGER_NS, "openshift-cert-manager-operator",
-                         "stable-v1", "openshift-cert-manager-operator")
-
-    csv = _wait_csv_succeeded(custom, CERT_MANAGER_NS, timeout=300)
-    assert csv, "Cert Manager CSV did not reach Succeeded within 300s"
-    print(f"    Cert Manager: {csv}")
-
-    assert _wait_deployment(apps, "cert-manager", "cert-manager", timeout=300), \
-        "cert-manager deployment not ready within 300s"
-
-    # ── JobSet ──
-    print("\n==> Installing JobSet operator...")
-    _ensure_namespace(core, JOBSET_NS)
-    _ensure_operator_group(custom, JOBSET_NS, "jobset-operator")
-    _ensure_subscription(custom, JOBSET_NS, "jobset-operator",
-                         "stable", "jobset-operator")
-
-    csv = _wait_csv_succeeded(custom, JOBSET_NS, timeout=300)
-    assert csv, "JobSet CSV did not reach Succeeded within 300s"
-    print(f"    JobSet: {csv}")
-
-    assert _wait_deployment(apps, "jobset-controller-manager", JOBSET_NS, timeout=300), \
-        "jobset-controller-manager deployment not ready within 300s"
-
-    # ── RHOAI 3.x ──
-    print(f"\n==> Installing RHOAI 3.x operator (channel: {RHOAI_CHANNEL})...")
-    _ensure_namespace(core, RHOAI_OPERATOR_NS)
-    _ensure_operator_group(custom, RHOAI_OPERATOR_NS, "rhods-operator")
-    _ensure_subscription(custom, RHOAI_OPERATOR_NS, "rhods-operator",
-                         RHOAI_CHANNEL, "rhods-operator")
-
-    csv = _wait_csv_succeeded(custom, RHOAI_OPERATOR_NS, timeout=600)
-    assert csv, "RHOAI CSV did not reach Succeeded within 600s"
-    print(f"    RHOAI: {csv}")
-
-    assert _wait_deployment(apps, "rhods-operator", RHOAI_OPERATOR_NS, timeout=600), \
-        "rhods-operator deployment not ready within 600s"
-
-    # ── DSCInitialization + DataScienceCluster ──
-    print("\n==> Creating DSCInitialization and DataScienceCluster...")
-
-    dsci = {
-        "apiVersion": "dscinitialization.opendatahub.io/v1",
-        "kind": "DSCInitialization",
-        "metadata": {"name": "default-dsci"},
-        "spec": {"applicationsNamespace": RHOAI_APPS_NS},
-    }
-    try:
-        custom.create_cluster_custom_object(
-            group="dscinitialization.opendatahub.io", version="v1",
-            plural="dscinitializations", body=dsci,
-        )
-    except client.exceptions.ApiException as e:
-        if e.status != 409:
-            raise
-
-    dsc = {
-        "apiVersion": "datasciencecluster.opendatahub.io/v1",
-        "kind": "DataScienceCluster",
-        "metadata": {"name": "default-dsc"},
-        "spec": {
-            "components": {
-                "trainingoperator": {"managementState": "Managed"},
-                "ray": {"managementState": "Managed"},
-                "kserve": {"managementState": "Managed"},
-                "dashboard": {"managementState": "Managed"},
-                "workbenches": {"managementState": "Managed"},
-            },
-        },
-    }
-    try:
-        custom.create_cluster_custom_object(
-            group="datasciencecluster.opendatahub.io", version="v1",
-            plural="datascienceclusters", body=dsc,
-        )
-    except client.exceptions.ApiException as e:
-        if e.status != 409:
-            raise
-
-    # Wait for key RHOAI deployments
-    print("\n==> Waiting for RHOAI components...")
-    for dep_name in ("kubeflow-training-operator", "kserve-controller-manager"):
-        ok = _wait_deployment(apps, dep_name, RHOAI_APPS_NS, timeout=600)
-        status = "ready" if ok else "NOT READY"
-        print(f"    {dep_name}: {status}")
-        assert ok, f"{dep_name} not ready in {RHOAI_APPS_NS} within 600s"
-
-    print("\n==> RHOAI 3.x environment ready")
+    print(f"\n==> RHOAI 3.x environment ready (OCP {ocp_version})")
     return api
+
+
+# ---------------------------------------------------------------------------
+# Lab environment
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def rhoai3_lab_env():
+    """Lab VM manager. Ensures the worker is running."""
+    try:
+        env = LabEnvironment()
+    except LabEnvironmentError as e:
+        pytest.skip(f"Lab environment unavailable: {e}")
+    env.ensure_running("sno-worker")
+    return env
+
+
+# ---------------------------------------------------------------------------
+# Client fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def rhoai3_tenant_clients():
+    path = os.environ.get("RHOAI3_KUBECONFIG", os.path.expanduser("~/.kube/tenant-rhoai3"))
+    return _load_clients(path)
+
+
+@pytest.fixture(scope="session")
+def rhoai3_worker_clients():
+    path = os.environ.get("WORKER_KUBECONFIG", os.path.expanduser("~/.kube/worker"))
+    return _load_clients(path)
+
+
+@pytest.fixture(scope="session")
+def rhoai3_tenant2_clients():
+    path = os.environ.get("RHOAI3_TENANT2_KUBECONFIG", os.path.expanduser("~/.kube/tenant2-rhoai3"))
+    return _load_clients(path)
+
+
+# ---------------------------------------------------------------------------
+# VK readiness and namespace fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def rhoai3_vk_node_ready(rhoai3_tenant_clients):
+    """Wait for the VK virtual node to be registered and Ready."""
+    tenant_core, _ = rhoai3_tenant_clients
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            node = tenant_core.read_node(name=VK_NODE_NAME)
+            for cond in (node.status.conditions or []):
+                if cond.type == "Ready" and cond.status == "True":
+                    return True
+        except client.exceptions.ApiException:
+            pass
+        time.sleep(10)
+    pytest.fail(f"VK node {VK_NODE_NAME} not Ready within 120s")
+
+
+@pytest.fixture(scope="session")
+def rhoai3_worker_namespace_prefix(rhoai3_tenant_clients):
+    tenant_core, _ = rhoai3_tenant_clients
+    cm = tenant_core.read_namespaced_config_map(
+        name=VK_PREFIX_CONFIGMAP, namespace=VK_PREFIX_CONFIGMAP_NS,
+    )
+    prefix = cm.data.get("worker-namespace-prefix", "")
+    assert prefix, (
+        f"ConfigMap {VK_PREFIX_CONFIGMAP_NS}/{VK_PREFIX_CONFIGMAP} has no "
+        f"worker-namespace-prefix key"
+    )
+    return prefix
+
+
+@pytest.fixture(scope="session")
+def rhoai3_worker_namespace_prefix_t2(rhoai3_tenant2_clients):
+    tenant2_core, _ = rhoai3_tenant2_clients
+    cm = tenant2_core.read_namespaced_config_map(
+        name=VK_PREFIX_CONFIGMAP, namespace=VK_PREFIX_CONFIGMAP_NS,
+    )
+    prefix = cm.data.get("worker-namespace-prefix", "")
+    assert prefix, "tenant2-rhoai3 VK ConfigMap has no worker-namespace-prefix key"
+    return prefix
+
+
+@pytest.fixture(scope="session")
+def rhoai3_test_namespace():
+    return VK_TEST_NAMESPACE
+
+
+@pytest.fixture(scope="session")
+def rhoai3_vk_worker_namespace(rhoai3_worker_namespace_prefix):
+    return worker_namespace_for_prefix(rhoai3_worker_namespace_prefix, VK_TEST_NAMESPACE)
+
+
+@pytest.fixture(scope="session")
+def rhoai3_vk_worker_namespace_t2(rhoai3_worker_namespace_prefix_t2):
+    return worker_namespace_for_prefix(rhoai3_worker_namespace_prefix_t2, VK_TEST_NAMESPACE)
+
+
+# ---------------------------------------------------------------------------
+# Per-test cleanup
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cleanup():
+    _callbacks = []
+
+    def register(fn, *args, **kwargs):
+        _callbacks.append((fn, args, kwargs))
+
+    yield register
+
+    for fn, args, kwargs in reversed(_callbacks):
+        safe_delete(fn, *args, **kwargs)

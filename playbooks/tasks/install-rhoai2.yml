@@ -29,7 +29,7 @@
         name: rhods-operator
         namespace: redhat-ods-operator
       spec:
-        channel: stable
+        channel: {{ rhoai_channel }}
         name: rhods-operator
         source: redhat-operators
         sourceNamespace: openshift-marketplace
@@ -62,34 +62,17 @@
         name: default-dsc
       spec:
         components:
-          trainingoperator:
+          dashboard:
             managementState: Managed
-          ray:
+          workbenches:
             managementState: Managed
           kserve:
             managementState: Managed
             serving:
               managementState: Managed
-          dashboard:
-            managementState: Managed
-          workbenches:
-            managementState: Managed
   environment:
     KUBECONFIG: "{{ kubeconfig }}"
 
-- name: Wait for training operator deployment
-  command: >
-    oc wait deployment -n redhat-ods-applications
-    kubeflow-training-operator
-    --for=condition=Available --timeout=600s
-  environment:
-    KUBECONFIG: "{{ kubeconfig }}"
-  retries: 3
-  delay: 30
-  register: training_op_wait
-  until: training_op_wait.rc == 0
-  failed_when: false
-
-- name: Report RHOAI status
+- name: Report RHOAI 2.x status
   debug:
-    msg: "RHOAI installed on {{ inventory_hostname }} with training operator, Ray, KServe, dashboard, workbenches"
+    msg: "RHOAI 2.x installed on {{ inventory_hostname }} (channel: {{ rhoai_channel }})"

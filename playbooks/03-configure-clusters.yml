@@ -39,10 +39,18 @@
     include_tasks: tasks/install-lvms.yml
     when: components.lvms | default(false) | bool
 
-  # RHOAI (tenant only — training operator, dashboard, workbenches, kserve)
-  - name: Install RHOAI
-    include_tasks: tasks/install-rhoai.yml
-    when: components.rhoai | default(false) | bool
+  # RHOAI — dispatch to version-specific task file based on rhoai_channel
+  - name: Install RHOAI 3.x
+    include_tasks: tasks/install-rhoai3.yml
+    when:
+    - components.rhoai | default(false) | bool
+    - "'3' in (rhoai_channel | default(''))"
+
+  - name: Install RHOAI 2.x
+    include_tasks: tasks/install-rhoai2.yml
+    when:
+    - components.rhoai | default(false) | bool
+    - "'2' in (rhoai_channel | default(''))"
 
   - name: Disable OperatorHub default catalog sources
     command: >

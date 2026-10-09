@@ -90,7 +90,7 @@
   tasks:
   - name: Create VMs from inventory
     include_tasks: tasks/create-vm.yml
-    loop: "{{ groups['clusters'] }}"
+    loop: "{{ target_clusters | default(groups['clusters']) }}"
     loop_control:
       loop_var: cluster
     vars:

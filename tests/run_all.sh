@@ -111,3 +111,11 @@ python3 -m pytest -m kueue -v "$@"
 echo ""
 echo "=== Networking tests (single tenant, 14GB) ==="
 python3 -m pytest -m networking -v "$@"
+
+echo ""
+echo "=== RHOAI 3.x e2e tests (single tenant, 24GB) ==="
+python3 -m pytest tests/rhoai_3/e2e/ -m rhoai3 -v "$@"
+
+echo ""
+echo "=== RHOAI 3.x multi-tenant tests (dual tenant, 16GB each) ==="
+python3 -m pytest tests/rhoai_3/multi_tenant/ -m rhoai3_mt -v "$@"
