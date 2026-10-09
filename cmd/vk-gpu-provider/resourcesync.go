@@ -126,7 +126,7 @@ func (s *ResourceSyncer) syncSecret(ctx context.Context, sourceNS, podName, name
 	secret, err := s.tenantClient.CoreV1().Secrets(sourceNS).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			klog.Warningf("Secret %s/%s not found on tenant, skipping", sourceNS, name)
+			klog.Infof("Secret %s/%s not found on tenant, deferring to informer", sourceNS, name)
 			return nil
 		}
 		return err

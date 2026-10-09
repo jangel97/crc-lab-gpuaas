@@ -163,6 +163,7 @@ func main() {
 				return nil, nil, fmt.Errorf("start worker informer: %w", err)
 			}
 			provider.startPVCInformer(ctx)
+			provider.startSecretInformer(ctx)
 
 			return provider, provider, nil
 		},

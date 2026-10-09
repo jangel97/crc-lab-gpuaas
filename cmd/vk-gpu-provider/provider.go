@@ -374,6 +374,65 @@ func (p *GPUProvider) startPVCInformer(ctx context.Context) {
 	klog.Info("Control PVC deletion informer started")
 }
 
+func (p *GPUProvider) startSecretInformer(ctx context.Context) {
+	secretLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.TenantClient.CoreV1().RESTClient(),
+		"secrets",
+		metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {},
+	)
+	_, secretInformer := cache.NewInformer(secretLW, &corev1.Secret{}, 30*time.Second,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				secret, ok := obj.(*corev1.Secret)
+				if !ok {
+					return
+				}
+				p.handleSecretUpdate(ctx, secret)
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				secret, ok := newObj.(*corev1.Secret)
+				if !ok {
+					return
+				}
+				p.handleSecretUpdate(ctx, secret)
+			},
+		},
+	)
+	go secretInformer.Run(ctx.Done())
+	klog.Info("Tenant secret update informer started")
+}
+
+func (p *GPUProvider) handleSecretUpdate(ctx context.Context, secret *corev1.Secret) {
+	p.mu.Lock()
+	var matchingPods []*corev1.Pod
+	for key, pod := range p.podCache {
+		if pod.Namespace != secret.Namespace {
+			continue
+		}
+		secrets, _ := discoverReferences(pod)
+		for _, name := range secrets {
+			if name == secret.Name {
+				matchingPods = append(matchingPods, pod)
+				klog.V(4).Infof("Secret %s/%s referenced by managed pod %s", secret.Namespace, secret.Name, key)
+				break
+			}
+		}
+	}
+	p.mu.Unlock()
+
+	if len(matchingPods) == 0 {
+		return
+	}
+
+	pod := matchingPods[0]
+	if err := p.syncer.syncSecret(ctx, secret.Namespace, pod.Name, secret.Name); err != nil {
+		klog.Errorf("Failed to re-sync updated secret %s/%s: %v", secret.Namespace, secret.Name, err)
+	} else {
+		klog.Infof("Re-synced updated secret %s/%s to worker", secret.Namespace, secret.Name)
+	}
+}
+
 // --- Internal ---
 
 func (p *GPUProvider) handleWorkerPodEvent(obj interface{}) {
@@ -420,10 +479,16 @@ func (p *GPUProvider) handleWorkerPodEvent(obj interface{}) {
 				},
 			}
 		} else {
+			if freshPod.DeletionTimestamp != nil {
+				klog.V(4).Infof("Skipping status update for deleting tenant pod %s", key)
+				return
+			}
 			tenantPod = freshPod
 		}
 	}
 	tenantPod.Status = *workerPod.Status.DeepCopy()
+	tenantPod.DeletionTimestamp = nil
+	tenantPod.DeletionGracePeriodSeconds = nil
 
 	p.mu.Lock()
 	p.podCache[key] = tenantPod
