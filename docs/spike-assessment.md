@@ -880,7 +880,7 @@ Submariner is not deployed on tenant-rhoai3 (it is on sno-tenant/sno-tenant2).
 
 ---
 
-## Limitations
+## Design Considerations
 
 ### Resource sync must be eventually-consistent
 
@@ -902,6 +902,10 @@ available, creating the worker pod immediately. The worker kubelet retries
 volume mounts for missing secrets. An informer watches the tenant cluster for
 new/updated resources and syncs them to the worker when they appear. This is
 the same eventually-consistent model a regular kubelet uses.
+
+---
+
+## Limitations
 
 ### SecurityContext pass-through
 
