@@ -52,19 +52,19 @@ func (s *ResourceSyncer) SyncResources(ctx context.Context, pod *corev1.Pod) err
 	secrets, configmaps := discoverReferences(pod)
 
 	for _, name := range secrets {
-		if err := s.syncSecret(ctx, pod.Namespace, pod.Name, name); err != nil {
+		if err := s.syncSecret(ctx, pod.Namespace, name); err != nil {
 			return fmt.Errorf("sync secret %q: %w", name, err)
 		}
 	}
 
 	for _, name := range configmaps {
-		if err := s.syncConfigMap(ctx, pod.Namespace, pod.Name, name); err != nil {
+		if err := s.syncConfigMap(ctx, pod.Namespace, name); err != nil {
 			return fmt.Errorf("sync configmap %q: %w", name, err)
 		}
 	}
 
 	if pod.Spec.ServiceAccountName != "" && pod.Spec.ServiceAccountName != "default" {
-		if err := s.syncServiceAccount(ctx, pod.Namespace, pod.Name, pod.Spec.ServiceAccountName); err != nil {
+		if err := s.syncServiceAccount(ctx, pod.Namespace, pod.Spec.ServiceAccountName); err != nil {
 			return fmt.Errorf("sync serviceaccount %q: %w", pod.Spec.ServiceAccountName, err)
 		}
 	}
@@ -123,13 +123,13 @@ func discoverReferences(pod *corev1.Pod) (secrets, configmaps []string) {
 }
 
 // syncSecret is non-blocking: if the secret doesn't exist yet (e.g. cert-manager
-// hasn't issued it), we return nil and let the tenant secret informer sync it later.
+// hasn't issued it), we return nil and let the reconciler retry later.
 // Blocking or failing here causes higher-level controllers to thrash pods.
-func (s *ResourceSyncer) syncSecret(ctx context.Context, sourceNS, podName, name string) error {
+func (s *ResourceSyncer) syncSecret(ctx context.Context, sourceNS, name string) error {
 	secret, err := s.tenantClient.CoreV1().Secrets(sourceNS).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			klog.Infof("Secret %s/%s not found on tenant, deferring to informer", sourceNS, name)
+			klog.Infof("Secret %s/%s not found on tenant, deferring to reconciler", sourceNS, name)
 			return nil
 		}
 		return err
@@ -148,7 +148,6 @@ func (s *ResourceSyncer) syncSecret(ctx context.Context, sourceNS, podName, name
 			Labels: map[string]string{
 				labelManagedBy:       s.managedByValue,
 				labelSourceNamespace: sourceNS,
-				labelSourcePod:       podName,
 			},
 		},
 		Type: secret.Type,
@@ -158,7 +157,7 @@ func (s *ResourceSyncer) syncSecret(ctx context.Context, sourceNS, podName, name
 	existing, err := s.workerClient.CoreV1().Secrets(wns).Get(ctx, name, metav1.GetOptions{})
 	if err == nil {
 		existing.Data = workerSecret.Data
-		existing.Labels = workerSecret.Labels
+		existing.Labels = mergeLabels(existing.Labels, workerSecret.Labels)
 		existing.Type = workerSecret.Type
 		_, err = s.workerClient.CoreV1().Secrets(wns).Update(ctx, existing, metav1.UpdateOptions{})
 	} else if errors.IsNotFound(err) {
@@ -172,11 +171,11 @@ func (s *ResourceSyncer) syncSecret(ctx context.Context, sourceNS, podName, name
 	return nil
 }
 
-func (s *ResourceSyncer) syncConfigMap(ctx context.Context, sourceNS, podName, name string) error {
+func (s *ResourceSyncer) syncConfigMap(ctx context.Context, sourceNS, name string) error {
 	cm, err := s.tenantClient.CoreV1().ConfigMaps(sourceNS).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			klog.Warningf("ConfigMap %s/%s not found on tenant, skipping", sourceNS, name)
+			klog.Infof("ConfigMap %s/%s not found on tenant, deferring to reconciler", sourceNS, name)
 			return nil
 		}
 		return err
@@ -190,7 +189,6 @@ func (s *ResourceSyncer) syncConfigMap(ctx context.Context, sourceNS, podName, n
 			Labels: map[string]string{
 				labelManagedBy:       s.managedByValue,
 				labelSourceNamespace: sourceNS,
-				labelSourcePod:       podName,
 			},
 		},
 		Data:       cm.Data,
@@ -201,7 +199,7 @@ func (s *ResourceSyncer) syncConfigMap(ctx context.Context, sourceNS, podName, n
 	if err == nil {
 		existing.Data = workerCM.Data
 		existing.BinaryData = workerCM.BinaryData
-		existing.Labels = workerCM.Labels
+		existing.Labels = mergeLabels(existing.Labels, workerCM.Labels)
 		_, err = s.workerClient.CoreV1().ConfigMaps(wns).Update(ctx, existing, metav1.UpdateOptions{})
 	} else if errors.IsNotFound(err) {
 		_, err = s.workerClient.CoreV1().ConfigMaps(wns).Create(ctx, workerCM, metav1.CreateOptions{})
@@ -214,18 +212,18 @@ func (s *ResourceSyncer) syncConfigMap(ctx context.Context, sourceNS, podName, n
 	return nil
 }
 
-func (s *ResourceSyncer) syncServiceAccount(ctx context.Context, sourceNS, podName, name string) error {
+func (s *ResourceSyncer) syncServiceAccount(ctx context.Context, sourceNS, name string) error {
 	sa, err := s.tenantClient.CoreV1().ServiceAccounts(sourceNS).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			klog.Warningf("ServiceAccount %s/%s not found on tenant, skipping", sourceNS, name)
+			klog.Infof("ServiceAccount %s/%s not found on tenant, deferring to reconciler", sourceNS, name)
 			return nil
 		}
 		return err
 	}
 
 	for _, ips := range sa.ImagePullSecrets {
-		if err := s.syncSecret(ctx, sourceNS, podName, ips.Name); err != nil {
+		if err := s.syncSecret(ctx, sourceNS, ips.Name); err != nil {
 			klog.Warningf("Failed to sync SA image pull secret %s: %v", ips.Name, err)
 		}
 	}
@@ -238,7 +236,6 @@ func (s *ResourceSyncer) syncServiceAccount(ctx context.Context, sourceNS, podNa
 			Labels: map[string]string{
 				labelManagedBy:       s.managedByValue,
 				labelSourceNamespace: sourceNS,
-				labelSourcePod:       podName,
 			},
 		},
 		ImagePullSecrets: sa.ImagePullSecrets,
@@ -246,7 +243,7 @@ func (s *ResourceSyncer) syncServiceAccount(ctx context.Context, sourceNS, podNa
 
 	existing, err := s.workerClient.CoreV1().ServiceAccounts(wns).Get(ctx, name, metav1.GetOptions{})
 	if err == nil {
-		existing.Labels = workerSA.Labels
+		existing.Labels = mergeLabels(existing.Labels, workerSA.Labels)
 		existing.ImagePullSecrets = workerSA.ImagePullSecrets
 		_, err = s.workerClient.CoreV1().ServiceAccounts(wns).Update(ctx, existing, metav1.UpdateOptions{})
 	} else if errors.IsNotFound(err) {
@@ -261,11 +258,25 @@ func (s *ResourceSyncer) syncServiceAccount(ctx context.Context, sourceNS, podNa
 }
 
 func (s *ResourceSyncer) SyncHeadlessServices(ctx context.Context, pod *corev1.Pod) error {
+	svcs, err := s.discoverHeadlessServices(ctx, pod)
+	if err != nil {
+		return err
+	}
+	for _, svc := range svcs {
+		if err := s.syncService(ctx, pod.Namespace, svc); err != nil {
+			return fmt.Errorf("sync headless service %q: %w", svc.Name, err)
+		}
+	}
+	return nil
+}
+
+func (s *ResourceSyncer) discoverHeadlessServices(ctx context.Context, pod *corev1.Pod) ([]*corev1.Service, error) {
 	services, err := s.tenantClient.CoreV1().Services(pod.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("list services in %s: %w", pod.Namespace, err)
+		return nil, fmt.Errorf("list services in %s: %w", pod.Namespace, err)
 	}
 
+	var result []*corev1.Service
 	for i := range services.Items {
 		svc := &services.Items[i]
 		if svc.Spec.ClusterIP != "None" {
@@ -274,11 +285,9 @@ func (s *ResourceSyncer) SyncHeadlessServices(ctx context.Context, pod *corev1.P
 		if !selectorMatchesPod(svc, pod) {
 			continue
 		}
-		if err := s.syncService(ctx, pod.Namespace, pod.Name, svc); err != nil {
-			return fmt.Errorf("sync headless service %q: %w", svc.Name, err)
-		}
+		result = append(result, svc)
 	}
-	return nil
+	return result, nil
 }
 
 func selectorMatchesPod(svc *corev1.Service, pod *corev1.Pod) bool {
@@ -293,7 +302,7 @@ func selectorMatchesPod(svc *corev1.Service, pod *corev1.Pod) bool {
 	return true
 }
 
-func (s *ResourceSyncer) syncService(ctx context.Context, sourceNS, podName string, svc *corev1.Service) error {
+func (s *ResourceSyncer) syncService(ctx context.Context, sourceNS string, svc *corev1.Service) error {
 	wns := s.workerNamespace(sourceNS)
 	workerSvc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -302,7 +311,6 @@ func (s *ResourceSyncer) syncService(ctx context.Context, sourceNS, podName stri
 			Labels: map[string]string{
 				labelManagedBy:       s.managedByValue,
 				labelSourceNamespace: sourceNS,
-				labelSourcePod:       podName,
 			},
 		},
 		Spec: corev1.ServiceSpec{
@@ -316,7 +324,7 @@ func (s *ResourceSyncer) syncService(ctx context.Context, sourceNS, podName stri
 	if err == nil {
 		existing.Spec.Selector = workerSvc.Spec.Selector
 		existing.Spec.Ports = workerSvc.Spec.Ports
-		existing.Labels = workerSvc.Labels
+		existing.Labels = mergeLabels(existing.Labels, workerSvc.Labels)
 		_, err = s.workerClient.CoreV1().Services(wns).Update(ctx, existing, metav1.UpdateOptions{})
 	} else if errors.IsNotFound(err) {
 		_, err = s.workerClient.CoreV1().Services(wns).Create(ctx, workerSvc, metav1.CreateOptions{})
@@ -421,59 +429,64 @@ func (s *ResourceSyncer) CleanupExecutionPVC(ctx context.Context, sourceNS, pvcN
 	return nil
 }
 
-func (s *ResourceSyncer) CleanupResources(ctx context.Context, sourceNS, podName string) error {
-	labelSelector := fmt.Sprintf("%s=%s,%s=%s,%s=%s",
+type managedResources struct {
+	secrets         []string
+	configMaps      []string
+	serviceAccounts []string
+	services        []string
+}
+
+func (s *ResourceSyncer) listManagedResources(ctx context.Context, tenantNS string) (*managedResources, error) {
+	labelSelector := fmt.Sprintf("%s=%s,%s=%s",
 		labelManagedBy, s.managedByValue,
-		labelSourceNamespace, sourceNS,
-		labelSourcePod, podName,
+		labelSourceNamespace, tenantNS,
 	)
 
-	wns := s.workerNamespace(sourceNS)
+	wns := s.workerNamespace(tenantNS)
+	result := &managedResources{}
 
-	secrets, err := s.workerClient.CoreV1().Secrets(wns).List(ctx, metav1.ListOptions{
-		LabelSelector: labelSelector,
-	})
-	if err == nil {
-		for _, secret := range secrets.Items {
-			if err := s.workerClient.CoreV1().Secrets(wns).Delete(ctx, secret.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
-				klog.Errorf("Failed to delete synced secret %s: %v", secret.Name, err)
-			}
-		}
+	secrets, err := s.workerClient.CoreV1().Secrets(wns).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return nil, fmt.Errorf("list secrets in %s: %w", wns, err)
+	}
+	for _, s := range secrets.Items {
+		result.secrets = append(result.secrets, s.Name)
 	}
 
-	configmaps, err := s.workerClient.CoreV1().ConfigMaps(wns).List(ctx, metav1.ListOptions{
-		LabelSelector: labelSelector,
-	})
-	if err == nil {
-		for _, cm := range configmaps.Items {
-			if err := s.workerClient.CoreV1().ConfigMaps(wns).Delete(ctx, cm.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
-				klog.Errorf("Failed to delete synced configmap %s: %v", cm.Name, err)
-			}
-		}
+	configmaps, err := s.workerClient.CoreV1().ConfigMaps(wns).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return nil, fmt.Errorf("list configmaps in %s: %w", wns, err)
+	}
+	for _, cm := range configmaps.Items {
+		result.configMaps = append(result.configMaps, cm.Name)
 	}
 
-	sas, err := s.workerClient.CoreV1().ServiceAccounts(wns).List(ctx, metav1.ListOptions{
-		LabelSelector: labelSelector,
-	})
-	if err == nil {
-		for _, sa := range sas.Items {
-			if err := s.workerClient.CoreV1().ServiceAccounts(wns).Delete(ctx, sa.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
-				klog.Errorf("Failed to delete synced serviceaccount %s: %v", sa.Name, err)
-			}
-		}
+	sas, err := s.workerClient.CoreV1().ServiceAccounts(wns).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return nil, fmt.Errorf("list serviceaccounts in %s: %w", wns, err)
+	}
+	for _, sa := range sas.Items {
+		result.serviceAccounts = append(result.serviceAccounts, sa.Name)
 	}
 
-	services, err := s.workerClient.CoreV1().Services(wns).List(ctx, metav1.ListOptions{
-		LabelSelector: labelSelector,
-	})
-	if err == nil {
-		for _, svc := range services.Items {
-			if err := s.workerClient.CoreV1().Services(wns).Delete(ctx, svc.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
-				klog.Errorf("Failed to delete synced service %s: %v", svc.Name, err)
-			}
-		}
+	services, err := s.workerClient.CoreV1().Services(wns).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return nil, fmt.Errorf("list services in %s: %w", wns, err)
+	}
+	for _, svc := range services.Items {
+		result.services = append(result.services, svc.Name)
 	}
 
-	klog.Infof("Cleaned up synced resources for %s/%s", sourceNS, podName)
-	return nil
+	return result, nil
+}
+
+func mergeLabels(existing, desired map[string]string) map[string]string {
+	if existing == nil {
+		return desired
+	}
+	for k, v := range desired {
+		existing[k] = v
+	}
+	delete(existing, labelSourcePod)
+	return existing
 }

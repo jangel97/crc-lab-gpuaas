@@ -43,8 +43,9 @@ type GPUProviderConfig struct {
 }
 
 type GPUProvider struct {
-	cfg    GPUProviderConfig
-	syncer *ResourceSyncer
+	cfg        GPUProviderConfig
+	syncer     *ResourceSyncer
+	reconciler *DepReconciler
 
 	mu           sync.Mutex
 	managedPods  map[string]string      // tenant "namespace/name" -> worker pod name
@@ -60,12 +61,24 @@ func (p *GPUProvider) managedByValue() string {
 
 func NewGPUProvider(cfg GPUProviderConfig) *GPUProvider {
 	managedBy := "vk-gpu-provider-" + cfg.ProviderID
-	return &GPUProvider{
+	p := &GPUProvider{
 		cfg:         cfg,
 		syncer:      NewResourceSyncer(cfg.TenantClient, cfg.WorkerClient, cfg.WorkerNamespacePrefix, cfg.DefaultRemoteStorageClass, managedBy),
 		managedPods: make(map[string]string),
 		podCache:    make(map[string]*corev1.Pod),
 	}
+	p.reconciler = NewDepReconciler(p.syncer, p.podCacheSnapshot, 2*time.Minute)
+	return p
+}
+
+func (p *GPUProvider) podCacheSnapshot() map[string]*corev1.Pod {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	snap := make(map[string]*corev1.Pod, len(p.podCache))
+	for k, v := range p.podCache {
+		snap[k] = v.DeepCopy()
+	}
+	return snap
 }
 
 // Compile-time interface checks.
@@ -133,12 +146,15 @@ func (p *GPUProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 
 	if err := p.syncer.SyncResources(ctx, pod); err != nil {
-		klog.Errorf("Failed to sync resources for %s: %v", key, err)
-		return err
+		if errors.IsForbidden(err) || errors.IsUnauthorized(err) {
+			klog.Errorf("Infrastructure error syncing resources for %s: %v", key, err)
+			return err
+		}
+		klog.Warningf("Initial resource sync for %s incomplete (reconciler will retry): %v", key, err)
 	}
 
 	if err := p.syncer.SyncHeadlessServices(ctx, pod); err != nil {
-		klog.Warningf("Failed to sync headless services for %s: %v", key, err)
+		klog.Warningf("Initial headless service sync for %s incomplete (reconciler will retry): %v", key, err)
 	}
 
 	workerPod := p.transformPod(pod, workerNS, pvcMap)
@@ -161,6 +177,8 @@ func (p *GPUProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	p.managedPods[key] = created.Name
 	p.podCache[key] = pod.DeepCopy()
 	p.mu.Unlock()
+
+	p.reconciler.Enqueue(pod.Namespace)
 	return nil
 }
 
@@ -189,10 +207,7 @@ func (p *GPUProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 		klog.Errorf("Failed to delete worker pod %s: %v", wpName, err)
 	}
 
-	if err := p.syncer.CleanupResources(ctx, pod.Namespace, pod.Name); err != nil {
-		klog.Errorf("Failed to cleanup synced resources for %s: %v", key, err)
-	}
-
+	p.reconciler.Enqueue(pod.Namespace)
 	return nil
 }
 
@@ -374,63 +389,69 @@ func (p *GPUProvider) startPVCInformer(ctx context.Context) {
 	klog.Info("Control PVC deletion informer started")
 }
 
-func (p *GPUProvider) startSecretInformer(ctx context.Context) {
-	secretLW := cache.NewFilteredListWatchFromClient(
-		p.cfg.TenantClient.CoreV1().RESTClient(),
-		"secrets",
-		metav1.NamespaceAll,
-		func(options *metav1.ListOptions) {},
-	)
-	_, secretInformer := cache.NewInformer(secretLW, &corev1.Secret{}, 30*time.Second,
-		cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				secret, ok := obj.(*corev1.Secret)
-				if !ok {
-					return
-				}
-				p.handleSecretUpdate(ctx, secret)
-			},
-			UpdateFunc: func(oldObj, newObj interface{}) {
-				secret, ok := newObj.(*corev1.Secret)
-				if !ok {
-					return
-				}
-				p.handleSecretUpdate(ctx, secret)
-			},
-		},
-	)
-	go secretInformer.Run(ctx.Done())
-	klog.Info("Tenant secret update informer started")
-}
-
-func (p *GPUProvider) handleSecretUpdate(ctx context.Context, secret *corev1.Secret) {
-	p.mu.Lock()
-	var matchingPods []*corev1.Pod
-	for key, pod := range p.podCache {
-		if pod.Namespace != secret.Namespace {
-			continue
+func (p *GPUProvider) startTenantInformers(ctx context.Context) {
+	enqueueNS := func(obj interface{}, resource string) {
+		meta, ok := obj.(metav1.Object)
+		if !ok {
+			return
 		}
-		secrets, _ := discoverReferences(pod)
-		for _, name := range secrets {
-			if name == secret.Name {
-				matchingPods = append(matchingPods, pod)
-				klog.V(4).Infof("Secret %s/%s referenced by managed pod %s", secret.Namespace, secret.Name, key)
+		ns := meta.GetNamespace()
+		if ns == "" || isSystemNamespace(ns) {
+			return
+		}
+		p.mu.Lock()
+		hasManaged := false
+		for key := range p.podCache {
+			podNS, _, _ := splitKey(key)
+			if podNS == ns {
+				hasManaged = true
 				break
 			}
 		}
+		p.mu.Unlock()
+		if hasManaged {
+			klog.V(4).Infof("Tenant %s %s/%s changed, enqueuing namespace for reconciliation", resource, ns, meta.GetName())
+			p.reconciler.Enqueue(ns)
+		}
 	}
-	p.mu.Unlock()
 
-	if len(matchingPods) == 0 {
-		return
-	}
+	secretLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.TenantClient.CoreV1().RESTClient(), "secrets", metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {},
+	)
+	_, secretInf := cache.NewInformer(secretLW, &corev1.Secret{}, 30*time.Second,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) { enqueueNS(obj, "secret") },
+			UpdateFunc: func(_, obj interface{}) { enqueueNS(obj, "secret") },
+		},
+	)
+	go secretInf.Run(ctx.Done())
 
-	pod := matchingPods[0]
-	if err := p.syncer.syncSecret(ctx, secret.Namespace, pod.Name, secret.Name); err != nil {
-		klog.Errorf("Failed to re-sync updated secret %s/%s: %v", secret.Namespace, secret.Name, err)
-	} else {
-		klog.Infof("Re-synced updated secret %s/%s to worker", secret.Namespace, secret.Name)
-	}
+	cmLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.TenantClient.CoreV1().RESTClient(), "configmaps", metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {},
+	)
+	_, cmInf := cache.NewInformer(cmLW, &corev1.ConfigMap{}, 5*time.Minute,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) { enqueueNS(obj, "configmap") },
+			UpdateFunc: func(_, obj interface{}) { enqueueNS(obj, "configmap") },
+		},
+	)
+	go cmInf.Run(ctx.Done())
+
+	svcLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.TenantClient.CoreV1().RESTClient(), "services", metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {},
+	)
+	_, svcInf := cache.NewInformer(svcLW, &corev1.Service{}, 5*time.Minute,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) { enqueueNS(obj, "service") },
+			UpdateFunc: func(_, obj interface{}) { enqueueNS(obj, "service") },
+		},
+	)
+	go svcInf.Run(ctx.Done())
+
+	klog.Info("Tenant resource informers started (secrets, configmaps, services)")
 }
 
 // --- Internal ---
