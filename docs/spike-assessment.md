@@ -799,7 +799,7 @@ tests/rhoai_3/e2e/test_workloads.py::test_raycluster_via_vk                  PAS
 |--------------|:---:|--------|-------|
 | **PyTorchJob** | Yes | `test_pytorchjob_via_vk` | Training operator creates pods, VK dispatches, status syncs back. Requires emptyDir for `/tmp` (PyTorch 2.11.0 + restricted SCC). |
 | **PyTorchJob + PVC** | Yes | `test_pytorchjob_checkpoint_with_pvc` | Checkpoint save/load via catapult PVC works end-to-end. |
-| **KServe InferenceService** | Yes | `test_kserve_raw_inference_via_vk` | RawDeployment mode (only mode in 3.x). cert-manager injects a `proxy-tls` volume from an async-created secret — VK provider polls up to 30s for the secret to appear before syncing. |
+| **KServe InferenceService** | Yes | `test_kserve_raw_inference_via_vk` | RawDeployment mode (only mode in 3.x). cert-manager injects a `proxy-tls` volume from an async-created secret — VK defers missing secrets to the informer (see below). |
 | **Notebook CR** | Yes | `test_notebook_cr_via_vk` | Notebook controller creates StatefulSet, pod dispatched via VK. kube-rbac-proxy replaces oauth-proxy in 3.x. |
 | **RayCluster** | Yes | `test_raycluster_via_vk` | Head pod dispatched via VK, reaches Running on worker. cert-manager TLS secret synced via informer. |
 | **RayJob** | Partial | `test_rayjob_via_vk` | Head pod dispatches and runs GPU workload on worker. Job submission fails: kuberay's submitter pod runs on tenant real node and cannot reach Ray dashboard on worker without Submariner. Needs cross-cluster networking. |
@@ -881,6 +881,27 @@ Submariner is not deployed on tenant-rhoai3 (it is on sno-tenant/sno-tenant2).
 ---
 
 ## Limitations
+
+### Resource sync must be eventually-consistent
+
+A VK provider cannot assume that all resources a pod references (secrets,
+configmaps, services) exist at CreatePod time. Controllers like cert-manager,
+service-ca-operator, and kuberay create auxiliary resources asynchronously —
+the ordering between "pod spec references secret X" and "secret X exists" is
+not guaranteed.
+
+If CreatePod blocks or fails on a missing dependency, higher-level controllers
+(kuberay, training-operator) interpret the failure as "pod is unhealthy" and
+replace it. This creates a thrashing cycle: the replacement pod may also fail
+if the dependency still doesn't exist, and the cleanup of the old pod may
+delete the dependency (e.g. cert-manager deletes Certificate secrets when the
+owning pod is removed).
+
+The correct pattern: CreatePod should succeed with whatever resources are
+available, creating the worker pod immediately. The worker kubelet retries
+volume mounts for missing secrets. An informer watches the tenant cluster for
+new/updated resources and syncs them to the worker when they appear. This is
+the same eventually-consistent model a regular kubelet uses.
 
 ### SecurityContext pass-through
 

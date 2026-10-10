@@ -122,6 +122,9 @@ func discoverReferences(pod *corev1.Pod) (secrets, configmaps []string) {
 	return
 }
 
+// syncSecret is non-blocking: if the secret doesn't exist yet (e.g. cert-manager
+// hasn't issued it), we return nil and let the tenant secret informer sync it later.
+// Blocking or failing here causes higher-level controllers to thrash pods.
 func (s *ResourceSyncer) syncSecret(ctx context.Context, sourceNS, podName, name string) error {
 	secret, err := s.tenantClient.CoreV1().Secrets(sourceNS).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
