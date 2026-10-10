@@ -14,24 +14,31 @@ enables Services and Routes to reach remote GPU pods.
 Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 +---- sno-tenant VM ---------+  +---- sno-tenant2 VM --------+  +---- sno-worker VM ---------+
 |  12 vCPU, 14 GB RAM        |  |  10 vCPU, 16 GB RAM        |  |  8 vCPU, 24 GB RAM         |
-|  OCP 4.22, RHOAI           |  |  OCP 4.18, RHOAI           |  |  OCP 4.22                  |
+|  OCP 4.22, RHOAI 2.x       |  |  OCP 4.18, RHOAI 2.x       |  |  OCP 4.22                  |
 |  VK → virtual node         |  |  VK → virtual node         |  |  GPU Operator (RTX 5090)   |
 |   "gpu-worker" (1 GPU)     |  |   "gpu-worker" (1 GPU)     |  |  Kueue, Kyverno, LVMS      |
 +-----------------------------+  +-----------------------------+  +-----------------------------+
          \                                    |                               /
           +------- Submariner v0.24 (Libreswan IPsec) --------+--------------+
+                                              |
++---- sno-tenant-rhoai3 VM --+
+|  12 vCPU, 16 GB RAM        |
+|  OCP 4.19, RHOAI 3.x       |
+|  VK → virtual node         |
+|   "gpu-worker" (1 GPU)     |
++-----------------------------+
 ```
 
-| Component | Tenant (sno-tenant) | Tenant 2 (sno-tenant2) | Worker (sno-worker) |
-|-----------|--------------------|-----------------------|--------------------|
-| OpenShift | 4.22 | 4.18 | 4.22 |
-| vCPU / RAM | 12 / 14 GB | 10 / 16 GB | 8 / 24 GB |
-| GPU | — | — | RTX 5090 (32 GB VRAM) |
-| RHOAI | 2.25.8 | 2.25.8 | — |
-| Operators | RHOAI, OSSM 2.x, Serverless | RHOAI, OSSM 2.x, Serverless | GPU Operator, Kueue, Kyverno, LVMS |
-| Pod CIDR | 10.128.0.0/14 | 10.136.0.0/14 | 10.132.0.0/14 |
-| Service CIDR | 172.30.0.0/16 | 172.32.0.0/16 | 172.31.0.0/16 |
-| Networking | Submariner v0.24 | Submariner v0.24 | Submariner v0.24 |
+| Component | Tenant (sno-tenant) | Tenant 2 (sno-tenant2) | Tenant RHOAI3 (sno-tenant-rhoai3) | Worker (sno-worker) |
+|-----------|--------------------|-----------------------|----------------------------------|---------------------|
+| OpenShift | 4.22 | 4.18 | 4.19 | 4.22 |
+| vCPU / RAM | 12 / 14 GB | 10 / 16 GB | 12 / 16 GB | 8 / 24 GB |
+| GPU | — | — | — | RTX 5090 (32 GB VRAM) |
+| RHOAI | 2.25 | 2.25 | 3.5 | — |
+| Operators | RHOAI, OSSM 2.x, Serverless | RHOAI, OSSM 2.x, Serverless | RHOAI, cert-manager, jobset | GPU Operator, Kueue, Kyverno, LVMS |
+| Pod CIDR | 10.128.0.0/14 | 10.136.0.0/14 | 10.140.0.0/14 | 10.132.0.0/14 |
+| Service CIDR | 172.30.0.0/16 | 172.32.0.0/16 | 172.33.0.0/16 | 172.31.0.0/16 |
+| Networking | Submariner v0.24 | Submariner v0.24 | Submariner v0.24 | Submariner v0.24 |
 
 All clusters run as single-node OpenShift on libvirt VMs on a gaming PC
 (Intel Core Ultra 9 285K, 62 GB RAM, Ubuntu 24.04).
@@ -787,10 +794,10 @@ tests/rhoai_3/e2e/test_workloads.py::test_pytorchjob_via_vk                   PA
 tests/rhoai_3/e2e/test_workloads.py::test_kserve_raw_inference_via_vk         PASSED
 tests/rhoai_3/e2e/test_workloads.py::test_notebook_cr_via_vk                  PASSED
 tests/rhoai_3/e2e/test_workloads.py::test_pytorchjob_checkpoint_with_pvc      PASSED
-tests/rhoai_3/e2e/test_workloads.py::test_rayjob_via_vk                     WIP (head pod Running, submitter needs Submariner)
+tests/rhoai_3/e2e/test_workloads.py::test_rayjob_via_vk                       PASSED
 tests/rhoai_3/e2e/test_workloads.py::test_raycluster_via_vk                  PASSED
 
-7 passed, 2 in progress
+9 passed
 ```
 
 #### RHOAI 3.x VK compatibility matrix
@@ -802,7 +809,7 @@ tests/rhoai_3/e2e/test_workloads.py::test_raycluster_via_vk                  PAS
 | **KServe InferenceService** | Yes | `test_kserve_raw_inference_via_vk` | RawDeployment mode (only mode in 3.x). cert-manager injects a `proxy-tls` volume from an async-created secret — VK defers missing secrets to the informer (see below). |
 | **Notebook CR** | Yes | `test_notebook_cr_via_vk` | Notebook controller creates StatefulSet, pod dispatched via VK. kube-rbac-proxy replaces oauth-proxy in 3.x. |
 | **RayCluster** | Yes | `test_raycluster_via_vk` | Head pod dispatched via VK, reaches Running on worker. cert-manager TLS secret synced via informer. |
-| **RayJob** | Partial | `test_rayjob_via_vk` | Head pod dispatches and runs GPU workload on worker. Job submission fails: kuberay's submitter pod runs on tenant real node and cannot reach Ray dashboard on worker without Submariner. Needs cross-cluster networking. |
+| **RayJob** | Yes | `test_rayjob_via_vk` | Head pod dispatches and runs GPU workload on worker. Submitter pod reaches Ray dashboard on worker via Submariner cross-cluster networking. Requires Submariner deployed on tenant cluster. |
 | **DataSciencePipelines** | ? | — | Not yet tested. Pipeline runner pods may be dispatchable. |
 | **ModelMeshServing** | ? | — | Alternative multi-model serving runtime. Not yet tested. |
 | **ModelRegistry** | N/A | — | Metadata service, does not create GPU workload pods. |
@@ -855,17 +862,46 @@ strip `DeletionTimestamp`/`DeletionGracePeriodSeconds` before calling `notifyCb`
 **Result:** Head pod now reaches Running in a single attempt with no thrashing.
 CreatePod completes in ~60ms (vs 4+ seconds with the polling approach).
 
-#### RayJob limitation: submitter needs cross-cluster networking
+#### Per-namespace dependency reconciler
+
+The initial informer-based approach (sync one resource inline per event) had
+structural issues: no retry for worker-side write failures on ConfigMaps/Services/
+ServiceAccounts, a scalar `labelSourcePod` that broke when two pods shared a
+resource, and no informer for ConfigMaps or Services.
+
+The replacement is a per-namespace reconciler that derives the desired worker-side
+state from all current tenant pods in a namespace, without maintaining an ownership
+registry. A rate-limited workqueue deduplicates reconciliation keys, and a periodic
+resync (every 2 minutes) guarantees convergence after transient failures.
+
+**Reconciliation cycle:**
+1. Snapshot `podCache`, filter pods in the target namespace
+2. Compute desired state: union of all pods' secrets, configmaps, SAs, headless services
+3. List actual worker-side resources by `labelManagedBy + labelSourceNamespace`
+4. Create/update: desired minus actual
+5. Garbage-collect: actual minus desired (orphaned resources deleted)
+6. On failure: rate-limited re-enqueue; on success: forget
+
+**Entry points:** `CreatePod` (best-effort initial sync + enqueue), `DeletePod`
+(enqueue — reconciler handles dep cleanup), tenant informers (Secret/CM/Service
+add/update → enqueue namespace), periodic resync (enqueue all active namespaces).
+
+**Error classification:** Sync methods distinguish tenant-side read errors from
+worker-side write errors. Tenant API errors (non-NotFound) propagate to `CreatePod`
+and fail it — VK library retries with backoff. Worker write failures are logged
+and swallowed — the reconciler retries. Tenant NotFound (async deps like
+cert-manager secrets) returns nil — the reconciler picks them up when they appear.
+
+#### RayJob: Submariner required for submitter connectivity
 
 kuberay's RayJob creates a submitter pod that runs on the tenant's real node (not
 through VK). The submitter calls `ray job submit --address <dashboard-url>` to reach
 the Ray dashboard on the head pod. Since the head pod runs on the worker cluster, the
-dashboard IP is a worker-cluster pod IP — unreachable from the tenant without Submariner
-or equivalent cross-cluster networking.
+dashboard IP is a worker-cluster pod IP — unreachable from the tenant without Submariner.
 
-The `test_rayjob_via_vk` test works around this by exec'ing into the worker head pod
-directly to verify GPU access, rather than waiting for the submitter to succeed.
-Submariner is not deployed on tenant-rhoai3 (it is on sno-tenant/sno-tenant2).
+Once Submariner was deployed on tenant-rhoai3, the submitter pod can reach the Ray
+dashboard on the worker via the IPsec tunnel and the RayJob completes successfully.
+This confirms that Submariner is a hard dependency for RayJob workloads dispatched via VK.
 
 ---
 
@@ -1140,6 +1176,13 @@ to the VK service account.
     is occupied, additional GPU pods are queued via scheduling gates.
     When the GPU is freed (pod completes or is deleted), the next pod
     in the queue is admitted (S22).
+
+20. **RHOAI 3.x is fully compatible with VK dispatch.** All RHOAI 3.x
+    workload types — PyTorchJob, KServe (raw), Notebook, RayCluster,
+    RayJob — work through VK. RHOAI 3.x uses cert-manager + jobset
+    instead of OSSM/Serverless, requiring no Istio workarounds. RayJob
+    requires Submariner for the submitter pod to reach the Ray dashboard
+    on the worker cluster.
 
 ## What This Spike Does Not Prove
 

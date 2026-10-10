@@ -146,11 +146,8 @@ func (p *GPUProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 
 	if err := p.syncer.SyncResources(ctx, pod); err != nil {
-		if errors.IsForbidden(err) || errors.IsUnauthorized(err) {
-			klog.Errorf("Infrastructure error syncing resources for %s: %v", key, err)
-			return err
-		}
-		klog.Warningf("Initial resource sync for %s incomplete (reconciler will retry): %v", key, err)
+		klog.Errorf("Failed to read tenant resources for %s: %v", key, err)
+		return fmt.Errorf("sync resources for %s: %w", key, err)
 	}
 
 	if err := p.syncer.SyncHeadlessServices(ctx, pod); err != nil {

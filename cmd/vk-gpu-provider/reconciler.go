@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -156,6 +157,11 @@ func (r *DepReconciler) computeDesiredState(ctx context.Context, tenantNS string
 		services:        make(map[string]*corev1.Service),
 	}
 
+	allServices, err := r.syncer.tenantClient.CoreV1().Services(tenantNS).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		klog.Warningf("Failed to list services in %s: %v", tenantNS, err)
+	}
+
 	for _, pod := range pods {
 		secrets, configmaps := discoverReferences(pod)
 		for _, name := range secrets {
@@ -168,13 +174,13 @@ func (r *DepReconciler) computeDesiredState(ctx context.Context, tenantNS string
 			ds.serviceAccounts[pod.Spec.ServiceAccountName] = true
 		}
 
-		svcs, err := r.syncer.discoverHeadlessServices(ctx, pod)
-		if err != nil {
-			klog.Warningf("Failed to discover headless services for %s/%s: %v", tenantNS, pod.Name, err)
-			continue
-		}
-		for _, svc := range svcs {
-			ds.services[svc.Name] = svc
+		if allServices != nil {
+			for i := range allServices.Items {
+				svc := &allServices.Items[i]
+				if svc.Spec.ClusterIP == "None" && selectorMatchesPod(svc, pod) {
+					ds.services[svc.Name] = svc
+				}
+			}
 		}
 	}
 
@@ -240,10 +246,6 @@ func (r *DepReconciler) garbageCollect(ctx context.Context, tenantNS string, des
 }
 
 func splitKey(key string) (namespace, name string, ok bool) {
-	for i := 0; i < len(key); i++ {
-		if key[i] == '/' {
-			return key[:i], key[i+1:], true
-		}
-	}
-	return key, "", false
+	namespace, name, ok = strings.Cut(key, "/")
+	return
 }

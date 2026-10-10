@@ -165,7 +165,8 @@ func (s *ResourceSyncer) syncSecret(ctx context.Context, sourceNS, name string) 
 	}
 
 	if err != nil {
-		return err
+		klog.Warningf("Worker write failed for secret %s/%s: %v (reconciler will retry)", wns, name, err)
+		return nil
 	}
 	klog.Infof("Synced secret %s -> %s/%s", name, wns, name)
 	return nil
@@ -206,7 +207,8 @@ func (s *ResourceSyncer) syncConfigMap(ctx context.Context, sourceNS, name strin
 	}
 
 	if err != nil {
-		return err
+		klog.Warningf("Worker write failed for configmap %s/%s: %v (reconciler will retry)", wns, name, err)
+		return nil
 	}
 	klog.Infof("Synced configmap %s -> %s/%s", name, wns, name)
 	return nil
@@ -251,7 +253,8 @@ func (s *ResourceSyncer) syncServiceAccount(ctx context.Context, sourceNS, name 
 	}
 
 	if err != nil {
-		return err
+		klog.Warningf("Worker write failed for serviceaccount %s/%s: %v (reconciler will retry)", wns, name, err)
+		return nil
 	}
 	klog.Infof("Synced serviceaccount %s -> %s/%s", name, wns, name)
 	return nil
@@ -331,7 +334,8 @@ func (s *ResourceSyncer) syncService(ctx context.Context, sourceNS string, svc *
 	}
 
 	if err != nil {
-		return err
+		klog.Warningf("Worker write failed for service %s/%s: %v (reconciler will retry)", wns, svc.Name, err)
+		return nil
 	}
 	klog.Infof("Synced headless service %s -> %s/%s", svc.Name, wns, svc.Name)
 	return nil
