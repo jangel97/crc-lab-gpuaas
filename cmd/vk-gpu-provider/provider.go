@@ -13,7 +13,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/klog/v2"
 
 	dto "github.com/prometheus/client_model/go"
@@ -40,6 +43,7 @@ type GPUProviderConfig struct {
 	KubeletPort               int32
 	TenantClient              kubernetes.Interface
 	WorkerClient              kubernetes.Interface
+	WorkerRESTConfig          *rest.Config
 }
 
 type GPUProvider struct {
@@ -305,7 +309,62 @@ func (p *GPUProvider) GetContainerLogs(ctx context.Context, namespace, podName, 
 }
 
 func (p *GPUProvider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
-	return fmt.Errorf("not supported")
+	key := namespace + "/" + podName
+	p.mu.Lock()
+	wpName, ok := p.managedPods[key]
+	p.mu.Unlock()
+	if !ok {
+		return errdefs.NotFoundf("pod %s not found", key)
+	}
+
+	if p.cfg.WorkerClient == nil || p.cfg.WorkerRESTConfig == nil {
+		return fmt.Errorf("exec for %s: worker client not configured", key)
+	}
+
+	workerNS := workerNamespace(p.cfg.WorkerNamespacePrefix, namespace)
+
+	req := p.cfg.WorkerClient.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Namespace(workerNS).
+		Name(wpName).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: containerName,
+			Command:   cmd,
+			Stdin:     attach.Stdin() != nil,
+			Stdout:    attach.Stdout() != nil,
+			Stderr:    attach.Stderr() != nil,
+			TTY:       attach.TTY(),
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(p.cfg.WorkerRESTConfig, "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("exec for %s/%s: %w", workerNS, wpName, err)
+	}
+
+	opts := remotecommand.StreamOptions{
+		Stdin:  attach.Stdin(),
+		Stdout: attach.Stdout(),
+		Stderr: attach.Stderr(),
+		Tty:    attach.TTY(),
+	}
+	if resize := attach.Resize(); resize != nil {
+		opts.TerminalSizeQueue = &termSizeQueue{ch: resize}
+	}
+
+	return exec.StreamWithContext(ctx, opts)
+}
+
+type termSizeQueue struct {
+	ch <-chan api.TermSize
+}
+
+func (t *termSizeQueue) Next() *remotecommand.TerminalSize {
+	size, ok := <-t.ch
+	if !ok {
+		return nil
+	}
+	return &remotecommand.TerminalSize{Width: size.Width, Height: size.Height}
 }
 
 func (p *GPUProvider) AttachToContainer(ctx context.Context, namespace, podName, containerName string, attach api.AttachIO) error {

@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"io"
 	"testing"
 
+	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
+	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -310,5 +314,40 @@ func TestTransform_NilSecurityContext(t *testing.T) {
 	}
 	if w.Spec.Containers[0].SecurityContext != nil {
 		t.Error("nil container SecurityContext should stay nil")
+	}
+}
+
+// --- RunInContainer tests ---
+
+type stubAttachIO struct{}
+
+func (s *stubAttachIO) Stdin() io.Reader               { return nil }
+func (s *stubAttachIO) Stdout() io.WriteCloser          { return nil }
+func (s *stubAttachIO) Stderr() io.WriteCloser          { return nil }
+func (s *stubAttachIO) TTY() bool                       { return false }
+func (s *stubAttachIO) Resize() <-chan api.TermSize      { return nil }
+
+func TestRunInContainer_NotFound(t *testing.T) {
+	p := &GPUProvider{
+		cfg:         GPUProviderConfig{WorkerNamespacePrefix: "vk-test-"},
+		managedPods: map[string]string{},
+	}
+	err := p.RunInContainer(context.Background(), "ns", "no-such-pod", "main", []string{"echo"}, &stubAttachIO{})
+	if err == nil {
+		t.Fatal("expected error for unknown pod")
+	}
+	if !errdefs.IsNotFound(err) {
+		t.Errorf("expected NotFound error, got: %v", err)
+	}
+}
+
+func TestRunInContainer_KnownPodWithoutConfig(t *testing.T) {
+	p := &GPUProvider{
+		cfg:         GPUProviderConfig{WorkerNamespacePrefix: "vk-test-"},
+		managedPods: map[string]string{"ns/my-pod": "ns--my-pod"},
+	}
+	err := p.RunInContainer(context.Background(), "ns", "my-pod", "main", []string{"echo"}, &stubAttachIO{})
+	if err == nil {
+		t.Fatal("expected error when WorkerClient/WorkerRESTConfig are nil")
 	}
 }

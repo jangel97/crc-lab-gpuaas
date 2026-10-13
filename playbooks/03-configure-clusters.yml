@@ -39,6 +39,11 @@
     include_tasks: tasks/install-lvms.yml
     when: components.lvms | default(false) | bool
 
+  # Kyverno (tenant-rhoai3 — VK toleration injection for LMEval)
+  - name: Install Kyverno
+    include_tasks: tasks/install-kyverno.yml
+    when: components.kyverno | default(false) | bool
+
   # RHOAI — dispatch to version-specific task file based on rhoai_channel
   - name: Install RHOAI 3.x
     include_tasks: tasks/install-rhoai3.yml

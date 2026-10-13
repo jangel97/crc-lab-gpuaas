@@ -82,6 +82,7 @@ all:
           rhoai_channel: stable-3.5
           components:
             rhoai: true
+            kyverno: true
         tenant2-rhoai3:
           ocp_version: "4.19"
           role: tenant
@@ -97,7 +98,7 @@ all:
           cluster_network_cidr: "10.144.0.0/14"
           cluster_network_prefix: 23
           service_network_cidr: "172.34.0.0/16"
-          rhoai_channel: stable-3.5
+          rhoai_channel: stable-3.4
           components:
             rhoai: true
         worker:

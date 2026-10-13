@@ -73,12 +73,12 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	tenantClient, err := buildClient(tenantKubeconfig, insecureSkipTLSVerify)
+	tenantClient, _, err := buildClient(tenantKubeconfig, insecureSkipTLSVerify)
 	if err != nil {
 		klog.Fatalf("Failed to create tenant client: %v", err)
 	}
 
-	workerClient, err := buildClient(workerKubeconfig, insecureSkipTLSVerify)
+	workerClient, workerRESTConfig, err := buildClient(workerKubeconfig, insecureSkipTLSVerify)
 	if err != nil {
 		klog.Fatalf("Failed to create worker client: %v", err)
 	}
@@ -156,6 +156,7 @@ func main() {
 				KubeletPort:               int32(kubeletPort),
 				TenantClient:              tenantClient,
 				WorkerClient:              workerClient,
+				WorkerRESTConfig:          workerRESTConfig,
 			})
 			provider.ConfigureNode(cfg.Node)
 
@@ -187,7 +188,7 @@ func main() {
 	}
 }
 
-func buildClient(kubeconfig string, insecure bool) (kubernetes.Interface, error) {
+func buildClient(kubeconfig string, insecure bool) (kubernetes.Interface, *rest.Config, error) {
 	var cfg *rest.Config
 	var err error
 
@@ -201,7 +202,7 @@ func buildClient(kubeconfig string, insecure bool) (kubernetes.Interface, error)
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if insecure {
@@ -210,7 +211,11 @@ func buildClient(kubeconfig string, insecure bool) (kubernetes.Interface, error)
 		cfg.TLSClientConfig.CAFile = ""
 	}
 
-	return kubernetes.NewForConfig(cfg)
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return client, cfg, nil
 }
 
 const prefixConfigMapNS = "kube-system"
