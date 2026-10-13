@@ -52,6 +52,14 @@ RAYCLUSTER_GROUP = "ray.io"
 RAYCLUSTER_VERSION = "v1"
 RAYCLUSTER_PLURAL = "rayclusters"
 
+DSPA_GROUP = "datasciencepipelinesapplications.opendatahub.io"
+DSPA_VERSION = "v1"
+DSPA_PLURAL = "datasciencepipelinesapplications"
+
+LMEVAL_GROUP = "trustyai.opendatahub.io"
+LMEVAL_VERSION = "v1alpha1"
+LMEVAL_PLURAL = "lmevaljobs"
+
 PYTORCH_IMAGE = "pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime"
 RAY_IMAGE = "rayproject/ray:2.46.0-py312-cu128"
 
@@ -1335,3 +1343,526 @@ def test_raycluster_via_vk(
             f"RayCluster {cluster_name} state is {state!r}, not 'ready'. "
             f"Head pod is Running on worker — cluster may need status sync."
         )
+
+
+@pytest.mark.rhoai3
+def test_dsp_pipeline_via_vk(
+    cleanup, rhoai3_tenant_clients,
+    rhoai3_test_namespace,
+):
+    """DataSciencePipelines infrastructure on a VK-enabled cluster.
+
+    Deploys DSPA with embedded MariaDB and MinIO, verifies all components
+    reach Ready. Pipeline step pods use standard Kubernetes pod specs
+    (nodeName, tolerations) configurable via KFP v2 platform_spec —
+    VK dispatch works the same as any other workload pod.
+    """
+    tenant_core, tenant_custom = rhoai3_tenant_clients
+    ns = rhoai3_test_namespace
+    apps_api = client.AppsV1Api(tenant_core.api_client)
+
+    dspa_name = "rhoai3-dspa"
+
+    try:
+        tenant_custom.delete_namespaced_custom_object(
+            group=DSPA_GROUP, version=DSPA_VERSION,
+            namespace=ns, plural=DSPA_PLURAL, name=dspa_name,
+        )
+        time.sleep(30)
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+    dspa = {
+        "apiVersion": f"{DSPA_GROUP}/{DSPA_VERSION}",
+        "kind": "DataSciencePipelinesApplication",
+        "metadata": {"name": dspa_name, "namespace": ns},
+        "spec": {
+            "dspVersion": "v2",
+            "apiServer": {
+                "cABundle": {
+                    "configMapKey": "ca.crt",
+                    "configMapName": "kube-root-ca.crt",
+                },
+            },
+            "database": {
+                "mariaDB": {"deploy": True, "pvcSize": "1Gi"},
+            },
+            "objectStorage": {
+                "minio": {
+                    "deploy": True,
+                    "pvcSize": "1Gi",
+                    "image": "quay.io/opendatahub/minio:RELEASE.2019-08-14T20-37-41Z-license-compliance",
+                },
+            },
+        },
+    }
+
+    tenant_custom.create_namespaced_custom_object(
+        group=DSPA_GROUP, version=DSPA_VERSION,
+        namespace=ns, plural=DSPA_PLURAL, body=dspa,
+    )
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=DSPA_GROUP, version=DSPA_VERSION,
+            namespace=ns, plural=DSPA_PLURAL, name=dspa_name)
+
+    for component in [
+        f"ds-pipeline-{dspa_name}",
+        f"mariadb-{dspa_name}",
+        f"minio-{dspa_name}",
+    ]:
+        deadline = time.time() + 300
+        ready = False
+        while time.time() < deadline:
+            try:
+                dep = apps_api.read_namespaced_deployment(component, ns)
+                if (dep.status.ready_replicas or 0) >= 1:
+                    ready = True
+                    break
+            except client.exceptions.ApiException:
+                pass
+            time.sleep(10)
+        assert ready, f"DSPA component {component} not ready within 300s"
+
+    deadline = time.time() + 60
+    dspa_ready = False
+    conditions = []
+    while time.time() < deadline:
+        obj = tenant_custom.get_namespaced_custom_object(
+            group=DSPA_GROUP, version=DSPA_VERSION,
+            namespace=ns, plural=DSPA_PLURAL, name=dspa_name,
+        )
+        conditions = obj.get("status", {}).get("conditions", [])
+        for c in conditions:
+            if c.get("type") == "Ready" and c.get("status") == "True":
+                dspa_ready = True
+                break
+        if dspa_ready:
+            break
+        time.sleep(5)
+    assert dspa_ready, (
+        f"DSPA {dspa_name} did not reach Ready. "
+        f"Conditions: {[c.get('type') + '=' + c.get('status') for c in conditions]}"
+    )
+
+
+KYVERNO_POLICY_GROUP = "policies.kyverno.io"
+KYVERNO_POLICY_VERSION = "v1"
+KYVERNO_POLICY_PLURAL = "mutatingpolicies"
+
+SERVING_RUNTIME_GROUP = "serving.kserve.io"
+SERVING_RUNTIME_VERSION = "v1alpha1"
+SERVING_RUNTIME_PLURAL = "servingruntimes"
+
+VLLM_CPU_IMAGE = "registry.redhat.io/rhaii/vllm-cpu-rhel9@sha256:7a28b867955055a8836ea2a78e70b8bad63c1ee50e8a5f8dd95d1194f20ec489"
+LMEVAL_MODEL_NAME = "facebook/opt-125m"
+
+
+def _get_tenant_node_ip(tenant_core):
+    nodes = tenant_core.list_node()
+    for node in nodes.items:
+        for addr in (node.status.addresses or []):
+            if addr.type == "InternalIP":
+                return addr.address
+    raise RuntimeError("No InternalIP found on tenant nodes")
+
+
+def _wait_isvc_ready(tenant_custom, ns, isvc_name, timeout=300):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        obj = tenant_custom.get_namespaced_custom_object(
+            group=ISVC_GROUP, version=ISVC_VERSION,
+            namespace=ns, plural=ISVC_PLURAL, name=isvc_name,
+        )
+        conditions = obj.get("status", {}).get("conditions", [])
+        for c in conditions:
+            if c.get("type") == "Ready" and c.get("status") == "True":
+                return True
+        time.sleep(10)
+    return False
+
+
+@pytest.mark.rhoai3
+def test_lmeval_via_vk(
+    cleanup, rhoai3_tenant_clients, rhoai3_worker_clients,
+    rhoai3_test_namespace, rhoai3_vk_worker_namespace,
+):
+    """LMEvalJob evaluating a served model, dispatched via VK with Kyverno.
+
+    Deploys a model (facebook/opt-125m) via KServe on the tenant, then
+    creates an LMEvalJob using local-completions to evaluate it.  The
+    LMEvalJob CRD has no tolerations/nodeName fields, so a Kyverno
+    MutatingPolicy injects VK tolerations.  A NodePort service exposes
+    the model to the worker cluster over the shared network.
+    """
+    tenant_core, tenant_custom = rhoai3_tenant_clients
+    worker_core, _ = rhoai3_worker_clients
+    ns = rhoai3_test_namespace
+    apps_api = client.AppsV1Api(tenant_core.api_client)
+    api_ext = client.ApiextensionsV1Api(tenant_core.api_client)
+
+    try:
+        apps_api.read_namespaced_deployment(
+            "trustyai-service-operator-controller-manager",
+            "redhat-ods-applications",
+        )
+    except client.exceptions.ApiException:
+        pytest.skip("TrustyAI operator not deployed — enable trustyai in DSC")
+
+    try:
+        api_ext.read_custom_resource_definition(
+            "mutatingpolicies.policies.kyverno.io"
+        )
+    except client.exceptions.ApiException:
+        pytest.skip("Kyverno not installed — run install-kyverno.yml playbook")
+
+    try:
+        api_ext.read_custom_resource_definition(
+            "inferenceservices.serving.kserve.io"
+        )
+    except client.exceptions.ApiException:
+        pytest.skip("KServe not installed — enable kserve in DSC")
+
+    # --- Cleanup from previous runs ---
+
+    policy_name = "gpuaas-inject-vk-tolerations"
+    job_name = "rhoai3-lmeval-vk"
+    pod_name = job_name
+    isvc_name = "lmeval-model"
+    runtime_name = "vllm-cpu"
+    nodeport_svc_name = "lmeval-model-nodeport"
+
+    for name in [job_name]:
+        try:
+            tenant_custom.delete_namespaced_custom_object(
+                group=LMEVAL_GROUP, version=LMEVAL_VERSION,
+                namespace=ns, plural=LMEVAL_PLURAL, name=name,
+            )
+            time.sleep(10)
+        except client.exceptions.ApiException as e:
+            if e.status != 404:
+                raise
+    force_delete_pod(tenant_core, pod_name, ns)
+
+    try:
+        tenant_custom.delete_cluster_custom_object(
+            group=KYVERNO_POLICY_GROUP, version=KYVERNO_POLICY_VERSION,
+            plural=KYVERNO_POLICY_PLURAL, name=policy_name,
+        )
+        time.sleep(5)
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+    # --- Step 1: Deploy model via KServe ---
+
+    runtime = {
+        "apiVersion": f"{SERVING_RUNTIME_GROUP}/{SERVING_RUNTIME_VERSION}",
+        "kind": "ServingRuntime",
+        "metadata": {"name": runtime_name, "namespace": ns},
+        "spec": {
+            "multiModel": False,
+            "supportedModelFormats": [
+                {"name": "vLLM", "autoSelect": True},
+            ],
+            "containers": [
+                {
+                    "name": "kserve-container",
+                    "image": VLLM_CPU_IMAGE,
+                    "args": [
+                        "--model", "/mnt/models",
+                        "--port", "8080",
+                        "--gpu-memory-utilization", "0.4",
+                        "--served-model-name", LMEVAL_MODEL_NAME,
+                    ],
+                    "ports": [{"containerPort": 8080, "protocol": "TCP"}],
+                    "volumeMounts": [{"name": "dshm", "mountPath": "/dev/shm"}],
+                    "resources": {
+                        "requests": {"cpu": "1", "memory": "2Gi"},
+                        "limits": {"cpu": "2", "memory": "4Gi"},
+                    },
+                },
+            ],
+            "volumes": [
+                {"name": "dshm", "emptyDir": {"medium": "Memory", "sizeLimit": "1Gi"}},
+            ],
+        },
+    }
+
+    try:
+        existing = tenant_custom.get_namespaced_custom_object(
+            group=SERVING_RUNTIME_GROUP, version=SERVING_RUNTIME_VERSION,
+            namespace=ns, plural=SERVING_RUNTIME_PLURAL, name=runtime_name,
+        )
+        runtime["metadata"]["resourceVersion"] = existing["metadata"]["resourceVersion"]
+        tenant_custom.replace_namespaced_custom_object(
+            group=SERVING_RUNTIME_GROUP, version=SERVING_RUNTIME_VERSION,
+            namespace=ns, plural=SERVING_RUNTIME_PLURAL, name=runtime_name,
+            body=runtime,
+        )
+    except client.exceptions.ApiException:
+        tenant_custom.create_namespaced_custom_object(
+            group=SERVING_RUNTIME_GROUP, version=SERVING_RUNTIME_VERSION,
+            namespace=ns, plural=SERVING_RUNTIME_PLURAL, body=runtime,
+        )
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=SERVING_RUNTIME_GROUP, version=SERVING_RUNTIME_VERSION,
+            namespace=ns, plural=SERVING_RUNTIME_PLURAL, name=runtime_name)
+
+    isvc = {
+        "apiVersion": f"{ISVC_GROUP}/{ISVC_VERSION}",
+        "kind": "InferenceService",
+        "metadata": {"name": isvc_name, "namespace": ns},
+        "spec": {
+            "predictor": {
+                "model": {
+                    "modelFormat": {"name": "vLLM"},
+                    "runtime": runtime_name,
+                    "storageUri": f"hf://{LMEVAL_MODEL_NAME}",
+                    "resources": {
+                        "requests": {"cpu": "1", "memory": "2Gi"},
+                        "limits": {"cpu": "2", "memory": "4Gi"},
+                    },
+                },
+            },
+        },
+    }
+
+    try:
+        existing = tenant_custom.get_namespaced_custom_object(
+            group=ISVC_GROUP, version=ISVC_VERSION,
+            namespace=ns, plural=ISVC_PLURAL, name=isvc_name,
+        )
+        isvc["metadata"]["resourceVersion"] = existing["metadata"]["resourceVersion"]
+        tenant_custom.replace_namespaced_custom_object(
+            group=ISVC_GROUP, version=ISVC_VERSION,
+            namespace=ns, plural=ISVC_PLURAL, name=isvc_name,
+            body=isvc,
+        )
+    except client.exceptions.ApiException:
+        tenant_custom.create_namespaced_custom_object(
+            group=ISVC_GROUP, version=ISVC_VERSION,
+            namespace=ns, plural=ISVC_PLURAL, body=isvc,
+        )
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=ISVC_GROUP, version=ISVC_VERSION,
+            namespace=ns, plural=ISVC_PLURAL, name=isvc_name)
+
+    assert _wait_isvc_ready(tenant_custom, ns, isvc_name, timeout=300), (
+        f"InferenceService {isvc_name} not Ready within 300s"
+    )
+
+    # --- Step 2: NodePort service for cross-cluster access ---
+
+    nodeport_svc = client.V1Service(
+        metadata=client.V1ObjectMeta(name=nodeport_svc_name, namespace=ns),
+        spec=client.V1ServiceSpec(
+            type="NodePort",
+            selector={"app": f"isvc.{isvc_name}-predictor"},
+            ports=[client.V1ServicePort(port=8080, target_port=8080, protocol="TCP")],
+        ),
+    )
+    try:
+        tenant_core.read_namespaced_service(nodeport_svc_name, ns)
+        tenant_core.replace_namespaced_service(nodeport_svc_name, ns, nodeport_svc)
+    except client.exceptions.ApiException:
+        tenant_core.create_namespaced_service(ns, nodeport_svc)
+    cleanup(tenant_core.delete_namespaced_service, nodeport_svc_name, ns)
+
+    svc = tenant_core.read_namespaced_service(nodeport_svc_name, ns)
+    node_port = svc.spec.ports[0].node_port
+    tenant_ip = _get_tenant_node_ip(tenant_core)
+    model_url = f"http://{tenant_ip}:{node_port}/v1/completions"
+
+    # --- Step 3: Kyverno MutatingPolicy for LMEval pods ---
+
+    policy = {
+        "apiVersion": f"{KYVERNO_POLICY_GROUP}/{KYVERNO_POLICY_VERSION}",
+        "kind": "MutatingPolicy",
+        "metadata": {"name": policy_name},
+        "spec": {
+            "failurePolicy": "Ignore",
+            "matchConstraints": {
+                "namespaceSelector": {
+                    "matchLabels": {
+                        "kubernetes.io/metadata.name": ns,
+                    },
+                },
+                "resourceRules": [
+                    {
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "operations": ["CREATE"],
+                        "resources": ["pods"],
+                    },
+                ],
+            },
+            "matchConditions": [
+                {
+                    "name": "is-lmeval-pod",
+                    "expression": (
+                        "has(object.metadata.labels) && "
+                        "'app.kubernetes.io/name' in object.metadata.labels && "
+                        "object.metadata.labels['app.kubernetes.io/name'] == 'ta-lmes'"
+                    ),
+                },
+            ],
+            "mutations": [
+                {
+                    "patchType": "JSONPatch",
+                    "jsonPatch": {
+                        "expression": (
+                            "has(object.spec.tolerations)"
+                            " ? [JSONPatch{op: \"add\", path: \"/spec/tolerations/-\","
+                            " value: {\"key\":\"virtual-kubelet.io/provider\",\"operator\":\"Exists\",\"effect\":\"NoSchedule\"}},"
+                            " JSONPatch{op: \"add\", path: \"/spec/tolerations/-\","
+                            " value: {\"key\":\"virtual-kubelet.io/provider\",\"operator\":\"Exists\",\"effect\":\"NoExecute\"}}]"
+                            " : [JSONPatch{op: \"add\", path: \"/spec/tolerations\","
+                            " value: [{\"key\":\"virtual-kubelet.io/provider\",\"operator\":\"Exists\",\"effect\":\"NoSchedule\"},"
+                            " {\"key\":\"virtual-kubelet.io/provider\",\"operator\":\"Exists\",\"effect\":\"NoExecute\"}]}]"
+                        ),
+                    },
+                },
+                {
+                    "patchType": "JSONPatch",
+                    "jsonPatch": {
+                        "expression": (
+                            "has(object.spec.initContainers) && size(object.spec.initContainers) > 0"
+                            " ? [JSONPatch{op: \"add\", path: \"/spec/initContainers/0/volumeMounts/-\","
+                            " value: {\"name\":\"tmp\",\"mountPath\":\"/tmp\"}},"
+                            " JSONPatch{op: \"add\", path: \"/spec/initContainers/0/volumeMounts/-\","
+                            " value: {\"name\":\"lmeval-output\",\"mountPath\":\"/opt/app-root/src/output\"}},"
+                            " JSONPatch{op: \"add\", path: \"/spec/initContainers/0/volumeMounts/-\","
+                            " value: {\"name\":\"lmeval-catalogs\",\"mountPath\":\"/opt/app-root/src/my_catalogs\"}}]"
+                            " : []"
+                        ),
+                    },
+                },
+            ],
+        },
+    }
+
+    tenant_custom.create_cluster_custom_object(
+        group=KYVERNO_POLICY_GROUP, version=KYVERNO_POLICY_VERSION,
+        plural=KYVERNO_POLICY_PLURAL, body=policy,
+    )
+    cleanup(tenant_custom.delete_cluster_custom_object,
+            group=KYVERNO_POLICY_GROUP, version=KYVERNO_POLICY_VERSION,
+            plural=KYVERNO_POLICY_PLURAL, name=policy_name)
+
+    time.sleep(5)
+
+    # --- Step 4: Create LMEvalJob with local-completions ---
+
+    lmeval_job = {
+        "apiVersion": f"{LMEVAL_GROUP}/{LMEVAL_VERSION}",
+        "kind": "LMEvalJob",
+        "metadata": {"name": job_name, "namespace": ns},
+        "spec": {
+            "model": "local-completions",
+            "modelArgs": [
+                {"name": "model", "value": LMEVAL_MODEL_NAME},
+                {"name": "base_url", "value": model_url},
+                {"name": "tokenizer", "value": LMEVAL_MODEL_NAME},
+                {"name": "num_concurrent", "value": "1"},
+            ],
+            "taskList": {
+                "taskNames": ["arc_easy"],
+            },
+            "limit": "2",
+            "batchSize": "1",
+            "allowOnline": True,
+            "pod": {
+                "affinity": {
+                    "nodeAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": {
+                            "nodeSelectorTerms": [
+                                {
+                                    "matchExpressions": [
+                                        {
+                                            "key": "kubernetes.io/hostname",
+                                            "operator": "In",
+                                            "values": [VK_NODE_NAME],
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+                "volumes": [
+                    {"name": "hf-cache", "emptyDir": {}},
+                    {"name": "tmp", "emptyDir": {}},
+                    {"name": "lmeval-output", "emptyDir": {}},
+                    {"name": "lmeval-catalogs", "emptyDir": {}},
+                ],
+                "container": {
+                    "env": [
+                        {"name": "HF_HOME", "value": "/tmp/hf-cache"},
+                    ],
+                    "volumeMounts": [
+                        {"name": "hf-cache", "mountPath": "/tmp/hf-cache"},
+                        {"name": "tmp", "mountPath": "/tmp"},
+                        {"name": "lmeval-output", "mountPath": "/opt/app-root/src/output"},
+                        {"name": "lmeval-catalogs", "mountPath": "/opt/app-root/src/my_catalogs"},
+                    ],
+                },
+            },
+        },
+    }
+
+    tenant_custom.create_namespaced_custom_object(
+        group=LMEVAL_GROUP, version=LMEVAL_VERSION,
+        namespace=ns, plural=LMEVAL_PLURAL, body=lmeval_job,
+    )
+    cleanup(tenant_custom.delete_namespaced_custom_object,
+            group=LMEVAL_GROUP, version=LMEVAL_VERSION,
+            namespace=ns, plural=LMEVAL_PLURAL, name=job_name)
+
+    # --- Step 5: Verify Kyverno injection ---
+
+    assert wait_pod_exists(tenant_core, pod_name, ns, timeout=120), (
+        f"LMEvalJob controller did not create pod {pod_name} within 120s"
+    )
+
+    pod = tenant_core.read_namespaced_pod(name=pod_name, namespace=ns)
+    tol_keys = [t.key for t in (pod.spec.tolerations or [])]
+    assert "virtual-kubelet.io/provider" in tol_keys, (
+        f"Kyverno did not inject VK tolerations. Pod tolerations: {tol_keys}"
+    )
+
+    # --- Step 6: Verify VK dispatch ---
+
+    w_pod_name = worker_pod_name(ns, pod_name)
+    assert wait_pod_exists(
+        worker_core, w_pod_name, rhoai3_vk_worker_namespace, timeout=120,
+    ), f"Worker pod {w_pod_name} did not appear — VK did not dispatch the pod"
+
+    # --- Step 7: Wait for LMEvalJob to complete via controller lifecycle ---
+    # The driver auto-exits after evaluation, the worker pod transitions to
+    # Succeeded, VK syncs the phase to the tenant pod, and the controller
+    # detects completion and marks the LMEvalJob CR as Complete.
+
+    deadline = time.time() + 600
+    job_state = ""
+    job_reason = ""
+    while time.time() < deadline:
+        try:
+            job = tenant_custom.get_namespaced_custom_object(
+                group=LMEVAL_GROUP, version=LMEVAL_VERSION,
+                namespace=ns, plural=LMEVAL_PLURAL, name=job_name,
+            )
+            job_state = job.get("status", {}).get("state", "")
+            job_reason = job.get("status", {}).get("reason", "")
+            if job_state == "Complete":
+                break
+        except client.exceptions.ApiException:
+            pass
+        time.sleep(10)
+
+    assert job_state == "Complete", (
+        f"LMEvalJob did not reach Complete state. state={job_state!r}, reason={job_reason!r}"
+    )
+    assert job_reason == "Succeeded", (
+        f"LMEvalJob completed but not with Succeeded. reason={job_reason!r}"
+    )

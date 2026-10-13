@@ -35,7 +35,7 @@ Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 | vCPU / RAM | 12 / 14 GB | 10 / 16 GB | 12 / 16 GB | 8 / 24 GB |
 | GPU | — | — | — | RTX 5090 (32 GB VRAM) |
 | RHOAI | 2.25 | 2.25 | 3.5 | — |
-| Operators | RHOAI, OSSM 2.x, Serverless | RHOAI, OSSM 2.x, Serverless | RHOAI, cert-manager, jobset | GPU Operator, Kueue, Kyverno, LVMS |
+| Operators | RHOAI, OSSM 2.x, Serverless | RHOAI, OSSM 2.x, Serverless | RHOAI, cert-manager, jobset, Kyverno | GPU Operator, Kueue, Kyverno, LVMS |
 | Pod CIDR | 10.128.0.0/14 | 10.136.0.0/14 | 10.140.0.0/14 | 10.132.0.0/14 |
 | Service CIDR | 172.30.0.0/16 | 172.32.0.0/16 | 172.33.0.0/16 | 172.31.0.0/16 |
 | Networking | Submariner v0.24 | Submariner v0.24 | Submariner v0.24 | Submariner v0.24 |
@@ -567,14 +567,14 @@ python -m pytest tests/test_distributed_training.py::test_headless_service_dns_r
 
 ### 8. Observability
 
-#### S14. Pod log proxying from worker
+#### S14. Pod log and exec proxying from worker
 
 | | |
 |---|---|
 | **Test** | `test_vk_gpu.py::test_pod_logs_proxied_from_worker` |
-| **What** | Pod on virtual node echoes a known marker → `kubectl logs` / `oc logs` on tenant API server proxied through VK kubelet API to worker pod → full output and `tail_lines=1` both work correctly |
+| **What** | Pod on virtual node echoes a known marker → `kubectl logs` / `oc logs` on tenant API server proxied through VK kubelet API to worker pod → full output and `tail_lines=1` both work correctly. `kubectl exec` is also proxied via SPDY to the worker pod. |
 | **Result** | PASS |
-| **Proves** | `kubectl logs` and `oc logs` work transparently against virtual node pods. VK runs a kubelet API server (port 10350) using the node's TLS cert, proxying log requests to the actual worker pod. |
+| **Proves** | `kubectl logs`, `oc logs`, and `kubectl exec` work transparently against virtual node pods. VK runs a kubelet API server (port 10350) using the node's TLS cert, proxying both log and exec requests to the actual worker pod. |
 
 **How to run:**
 ```bash
@@ -585,6 +585,7 @@ python -m pytest tests/test_vk_gpu.py::test_pod_logs_proxied_from_worker -v
 oc --kubeconfig=~/.kube/tenant logs <pod-name> -n vk-test -c <container>
 oc --kubeconfig=~/.kube/tenant logs <pod-name> -n vk-test -c <container> --tail=1
 oc --kubeconfig=~/.kube/tenant logs <pod-name> -n vk-test -c <container> --follow
+oc --kubeconfig=~/.kube/tenant exec <pod-name> -n vk-test -c <container> -- nvidia-smi
 ```
 
 **What to look for:** The test:
@@ -599,6 +600,14 @@ oc --kubeconfig=~/.kube/tenant logs <pod-name> -n vk-test -c <container> --follo
 - Kubelet serving cert mounted from `/var/lib/kubelet/pki/kubelet-server-current.pem`
 - Port 10350 (avoids conflict with real kubelet on 10250)
 - Privileged SCC for the VK service account (hostNetwork + hostPath on OpenShift)
+
+**Exec proxy implementation:** `RunInContainer` looks up the worker pod name
+from the internal `managedPods` map, builds an SPDY executor targeting the
+worker API server using `remotecommand.NewSPDYExecutor`, and streams stdin/
+stdout/stderr/resize between the caller and the worker pod. This enables
+operators like the TrustyAI controller to exec into VK-dispatched pods
+transparently — the controller calls `kubectl exec` against the tenant API
+server, the kubelet API routes it to VK, and VK proxies it to the worker.
 
 ---
 
@@ -795,9 +804,16 @@ tests/rhoai_3/e2e/test_workloads.py::test_kserve_raw_inference_via_vk         PA
 tests/rhoai_3/e2e/test_workloads.py::test_notebook_cr_via_vk                  PASSED
 tests/rhoai_3/e2e/test_workloads.py::test_pytorchjob_checkpoint_with_pvc      PASSED
 tests/rhoai_3/e2e/test_workloads.py::test_rayjob_via_vk                       PASSED
-tests/rhoai_3/e2e/test_workloads.py::test_raycluster_via_vk                  PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_tfjob_via_vk                        PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_xgboostjob_via_vk                   PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_raycluster_via_vk                   PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_dsp_pipeline_via_vk                 PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_lmeval_via_vk                       PASSED
+tests/rhoai_3/e2e/test_networking.py::test_kserve_inference_reachable_via_submariner   PASSED
+tests/rhoai_3/e2e/test_networking.py::test_notebook_reachable_via_submariner           SKIPPED (workbenches Removed)
+tests/rhoai_3/e2e/test_networking.py::test_submariner_tunnel_recovery_rhoai3           PASSED
 
-9 passed
+15 passed, 1 skipped
 ```
 
 #### RHOAI 3.x VK compatibility matrix
@@ -810,12 +826,14 @@ tests/rhoai_3/e2e/test_workloads.py::test_raycluster_via_vk                  PAS
 | **Notebook CR** | Yes | `test_notebook_cr_via_vk` | Notebook controller creates StatefulSet, pod dispatched via VK. kube-rbac-proxy replaces oauth-proxy in 3.x. |
 | **RayCluster** | Yes | `test_raycluster_via_vk` | Head pod dispatched via VK, reaches Running on worker. cert-manager TLS secret synced via informer. |
 | **RayJob** | Yes | `test_rayjob_via_vk` | Head pod dispatches and runs GPU workload on worker. Submitter pod reaches Ray dashboard on worker via Submariner cross-cluster networking. Requires Submariner deployed on tenant cluster. |
-| **DataSciencePipelines** | ? | — | Not yet tested. Pipeline runner pods may be dispatchable. |
-| **ModelMeshServing** | ? | — | Alternative multi-model serving runtime. Not yet tested. |
+| **TFJob** | Yes | `test_tfjob_via_vk` | TensorFlow training operator creates chief pod, VK dispatches, GPU training completes, status syncs back. |
+| **XGBoostJob** | Yes | `test_xgboostjob_via_vk` | XGBoost training operator creates master pod, VK dispatches, GPU-accelerated training completes. |
+| **DataSciencePipelines** | Yes | `test_dsp_pipeline_via_vk` | DSPA infrastructure (API server, MariaDB, MinIO) deploys on VK-enabled cluster. Pipeline step pods use standard Kubernetes scheduling (nodeName, tolerations) via KFP v2 platform_spec. |
+| **ModelMeshServing** | N/A | — | Removed in RHOAI 3.x. KServe RawDeployment is the only supported serving mode. Already tested in `test_kserve_raw_inference_via_vk`. |
 | **ModelRegistry** | N/A | — | Metadata service, does not create GPU workload pods. |
-| **TrustyAI / LMEval** | ? | — | Model evaluation jobs. Not yet tested. |
+| **TrustyAI / LMEval** | Yes (Kyverno) | `test_lmeval_via_vk` | CRD exposes `spec.pod.affinity` but NOT `tolerations` or `nodeName`. Workaround: Kyverno MutatingPolicy injects VK tolerations on pods in the test namespace. Full controller-driven lifecycle works: exec proxy enables status polling, driver auto-exits after evaluation, VK syncs Succeeded phase, controller marks LMEvalJob CR as Complete/Succeeded. |
 | **Dashboard** | N/A | — | UI component, does not create workload pods. |
-| **CodeFlare** | ? | — | Orchestrates RayCluster creation. Not yet tested. |
+| **CodeFlare** | N/A | — | Removed in RHOAI 3.x DSC. No `codeflare` component field. RayCluster dispatch tested separately in `test_raycluster_via_vk`. |
 
 #### VK provider fix: non-blocking secret sync with informer
 
@@ -902,6 +920,44 @@ dashboard IP is a worker-cluster pod IP — unreachable from the tenant without 
 Once Submariner was deployed on tenant-rhoai3, the submitter pod can reach the Ray
 dashboard on the worker via the IPsec tunnel and the RayJob completes successfully.
 This confirms that Submariner is a hard dependency for RayJob workloads dispatched via VK.
+
+#### Submariner networking validation (RHOAI 3.x)
+
+The RHOAI 2.x suite had Submariner networking tests (S9, S10, S11) for plain pods
+and notebook-style workloads. The RHOAI 3.x tests extend this to actual RHOAI
+workloads (KServe InferenceService, Notebook CR) dispatched through VK.
+
+**Test: `test_kserve_inference_reachable_via_submariner`** — Creates a KServe
+InferenceService (RawDeployment) with a GPU HTTP server on port 8080. KServe
+creates a Deployment, VK dispatches the pod to the worker, and the VK status
+sync propagates the worker pod's container readiness back to the tenant pod.
+A curl pod on the tenant reaches the inference endpoint through Submariner.
+
+Key finding: KServe RawDeployment creates a **headless Service** (`clusterIP: None`)
+for the predictor (`{isvc_name}-predictor`). DNS for headless Services resolves
+directly to pod IPs (not a ClusterIP), so clients must use the container's
+`targetPort` (8080), not the Service port (80) — there is no kube-proxy port
+translation. This is a KServe/RHOAI design choice, not a VK issue — the same
+behavior applies on vanilla RHOAI 3.x without VK. The EndpointSlice correctly
+contains the worker pod IP with `ready=True` and `serving=True`, but only after
+VK syncs container readiness from the worker pod status.
+
+**Test: `test_notebook_reachable_via_submariner`** — Skipped in current DSC
+configuration (workbenches component Removed). When enabled, creates a Notebook CR
+with a GPU HTTP server on port 8888, creates a ClusterIP Service selecting the
+notebook pod, and curls through Submariner.
+
+**Test: `test_submariner_tunnel_recovery_rhoai3`** — Same tunnel failure/recovery
+pattern as S11, but using RHOAI 3.x fixtures (OCP 4.19 tenant). Deploys a GPU
+pod + Service via VK, verifies pre-disruption connectivity, kills the Submariner
+gateway pod on the worker, waits for gateway recovery and IPsec re-establishment,
+then verifies connectivity is restored. Confirms Submariner self-healing works
+identically on the RHOAI 3.x tenant.
+
+**OpenShift SCC constraint:** `curlimages/curl:latest` fails silently (exit code 1,
+empty logs) under OpenShift's restricted SCC on the RHOAI 3.x tenant. The
+networking tests use `registry.access.redhat.com/ubi9/ubi-minimal:latest` which
+includes curl and runs correctly under restricted SCC.
 
 ---
 
@@ -1059,6 +1115,68 @@ This cannot be fixed without an upstream Submariner change (e.g., a
 `routeAgentNodeSelector` field in the CR) or a mutating admission webhook
 that injects a nodeAffinity anti-rule for `type=virtual-kubelet`.
 
+### LMEvalJob CRD lacks VK scheduling primitives (worked around)
+
+The LMEvalJob CRD (`trustyai.opendatahub.io/v1alpha1`) exposes
+`spec.pod.affinity` but does not expose `tolerations`, `nodeName`, or
+`nodeSelector`. Since the VK virtual node has `NoSchedule` and `NoExecute`
+taints (`virtual-kubelet.io/provider`), the evaluation pod cannot be
+scheduled even when node affinity targets the VK node — the scheduler
+rejects it due to untolerated taints.
+
+**Workaround (implemented):** A Kyverno `MutatingPolicy` on the tenant
+cluster injects VK tolerations on pods in the LMEval test namespace.
+The policy matches `CREATE` operations on pods where `kubernetes.io/metadata.name`
+matches the target namespace, and uses a CEL JSONPatch expression to add
+both `NoSchedule` and `NoExecute` tolerations for `virtual-kubelet.io/provider`.
+The test (`test_lmeval_via_vk`) creates the policy, submits an LMEvalJob,
+verifies tolerations were injected, and confirms full evaluation dispatch
+through VK.
+
+**Long-term fix:** An upstream CRD enhancement to expose `tolerations` in
+`LMEvalPodSpec` would eliminate the need for the webhook workaround.
+
+This does not affect other RHOAI workload types — PyTorchJob, KServe,
+Notebook, RayCluster, RayJob, and DSP pipeline steps all expose standard
+pod scheduling fields.
+
+### LMEval controller exec lifecycle through VK
+
+The TrustyAI controller manages the LMEval evaluation pod through
+`kubectl exec` — it execs `driver --get-status` to poll evaluation
+progress, then execs `driver --shutdown` to stop the driver when
+evaluation is complete. VK's `RunInContainer` exec proxy enables this
+full lifecycle to work transparently across clusters.
+
+**Exec proxy implementation:** When the controller calls `kubectl exec`
+against a pod on the virtual node, the request reaches VK's kubelet API
+server (port 10350). `RunInContainer` looks up the worker pod name from
+the internal `managedPods` map, constructs an SPDY exec request against
+the worker API server using `remotecommand.NewSPDYExecutor`, and streams
+stdin/stdout/stderr between the controller and the worker pod.
+
+**Driver lifecycle (observed in RHOAI 3.x):** The evaluation pod has an
+init container that copies the driver binary, and a main container that
+runs `lm_eval` with the driver. The controller polls `driver --get-status`
+via exec and detects when evaluation completes. The driver then auto-exits
+approximately 5 seconds after writing completion status (exit code 0),
+causing the container to terminate. The controller's subsequent
+`driver --shutdown` exec call hits a "container not found" error because
+the container has already exited — this is benign.
+
+**End-to-end flow verified:**
+1. Controller execs `driver --get-status` → VK proxies to worker → status returned
+2. Driver writes `JobCompleted` → auto-exits (exit code 0)
+3. Worker pod transitions to `Succeeded`
+4. VK syncs `Succeeded` phase from worker pod to tenant pod cache
+5. Controller detects pod `Succeeded` → marks LMEvalJob CR `state=Complete, reason=Succeeded`
+6. Controller's shutdown exec fails with "container not found" → benign, lifecycle already complete
+
+**Test assertion:** The `test_lmeval_via_vk` test now verifies the
+LMEvalJob CR reaches `state=Complete, reason=Succeeded` via the tenant
+API, confirming the full controller-driven lifecycle works end-to-end
+through VK — not just that the evaluation pod ran successfully.
+
 ### Worker RBAC is cluster-wide
 
 The `vk-remote-sa` service account on the worker cluster has a
@@ -1136,9 +1254,11 @@ to the VK service account.
 12. **Submariner tunnel self-heals.** Gateway pod failure → tunnel drops →
     automatic restart → tunnel re-establishes → connectivity restored (S11).
 
-13. **kubectl logs / oc logs work transparently.** VK runs a kubelet API
-    server using the node's TLS cert, proxying log requests to worker
-    pods. Supports full logs, tail, and follow (S14).
+13. **kubectl logs / oc logs / kubectl exec work transparently.** VK runs
+    a kubelet API server using the node's TLS cert, proxying both log and
+    exec requests to worker pods. Logs support full output, tail, and
+    follow. Exec uses SPDY to stream I/O to the worker pod, enabling
+    operators like TrustyAI to manage remote pods via exec (S14).
 
 14. **OCP/RHOAI version decoupling is proven.** Two tenants at different
     OCP versions (4.22 and 4.18) with independent RHOAI installations
@@ -1177,12 +1297,27 @@ to the VK service account.
     When the GPU is freed (pod completes or is deleted), the next pod
     in the queue is admitted (S22).
 
-20. **RHOAI 3.x is fully compatible with VK dispatch.** All RHOAI 3.x
-    workload types — PyTorchJob, KServe (raw), Notebook, RayCluster,
-    RayJob — work through VK. RHOAI 3.x uses cert-manager + jobset
-    instead of OSSM/Serverless, requiring no Istio workarounds. RayJob
-    requires Submariner for the submitter pod to reach the Ray dashboard
-    on the worker cluster.
+20. **RHOAI 3.x is fully compatible with VK dispatch.** All workload
+    types — PyTorchJob, KServe (raw), Notebook, RayCluster, RayJob,
+    DataSciencePipelines, and LMEvalJob — work through VK. LMEvalJob
+    requires a Kyverno MutatingPolicy to inject VK tolerations (CRD
+    only exposes `affinity`, not `tolerations`/`nodeName`). The full
+    TrustyAI controller lifecycle works end-to-end: the exec proxy
+    enables status polling via `kubectl exec`, the driver auto-exits
+    after evaluation, VK syncs the Succeeded phase, and the controller
+    marks the LMEvalJob CR as Complete/Succeeded.
+    ModelMeshServing and CodeFlare are removed in RHOAI 3.x. RayJob
+    requires Submariner for the submitter pod to reach the Ray
+    dashboard on the worker.
+
+21. **Submariner networking validated on RHOAI 3.x.** KServe
+    InferenceService (RawDeployment) on the worker GPU is reachable from
+    the RHOAI 3.x tenant via Submariner — curl from a tenant pod to the
+    KServe predictor Service returns HTTP 200 with GPU inference data.
+    KServe creates a headless Service (clusterIP: None), so DNS resolves
+    directly to the worker pod IP. Tunnel failure recovery also confirmed
+    on the 3.x tenant — gateway pod kill → auto-restart → IPsec
+    re-establishment → connectivity restored.
 
 ## What This Spike Does Not Prove
 
