@@ -10,23 +10,43 @@ enables Services and Routes to reach remote GPU pods.
 
 ## Lab Environment
 
-```
-Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
-+---- sno-tenant VM ---------+  +---- sno-tenant2 VM --------+  +---- sno-worker VM ---------+
-|  12 vCPU, 14 GB RAM        |  |  10 vCPU, 16 GB RAM        |  |  8 vCPU, 24 GB RAM         |
-|  OCP 4.22, RHOAI 2.x       |  |  OCP 4.18, RHOAI 2.x       |  |  OCP 4.22                  |
-|  VK → virtual node         |  |  VK → virtual node         |  |  GPU Operator (RTX 5090)   |
-|   "gpu-worker" (1 GPU)     |  |   "gpu-worker" (1 GPU)     |  |  Kueue, Kyverno, LVMS      |
-+-----------------------------+  +-----------------------------+  +-----------------------------+
-         \                                    |                               /
-          +------- Submariner v0.24 (Libreswan IPsec) --------+--------------+
-                                              |
-+---- sno-tenant-rhoai3 VM --+
-|  12 vCPU, 16 GB RAM        |
-|  OCP 4.19, RHOAI 3.x       |
-|  VK → virtual node         |
-|   "gpu-worker" (1 GPU)     |
-+-----------------------------+
+```mermaid
+graph TD
+    subgraph host["Gaming PC · Intel Ultra 9 285K · 62 GB RAM · Ubuntu 24.04"]
+        direction TB
+        subgraph tenants["Tenant Clusters"]
+            direction LR
+            subgraph t1["sno-tenant"]
+                t1_spec["12 vCPU · 14 GB RAM\nOCP 4.22 · RHOAI 2.x\nVK → gpu-worker (1 GPU)"]
+            end
+            subgraph t2["sno-tenant2"]
+                t2_spec["10 vCPU · 16 GB RAM\nOCP 4.18 · RHOAI 2.x\nVK → gpu-worker (1 GPU)"]
+            end
+            subgraph t3["sno-tenant-rhoai3"]
+                t3_spec["12 vCPU · 16 GB RAM\nOCP 4.19 · RHOAI 3.x\nVK → gpu-worker (1 GPU)"]
+            end
+        end
+
+        subgraph w["sno-worker"]
+            w_spec["8 vCPU · 24 GB RAM\nOCP 4.22\nGPU Operator (RTX 5090)\nKueue · Kyverno · LVMS"]
+        end
+
+        t1 <-->|"IPsec tunnel"| w
+        t2 <-->|"IPsec tunnel"| w
+        t3 <-->|"IPsec tunnel"| w
+    end
+
+    subm["Submariner v0.24\nLibreswan IPsec · UDP 4500"]
+    t1 ~~~ subm
+    subm ~~~ w
+
+    style host fill:#0f3460,stroke:#16213e,color:#fff
+    style tenants fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style t1 fill:#2b2d42,stroke:#444,color:#fff
+    style t2 fill:#2b2d42,stroke:#444,color:#fff
+    style t3 fill:#2b2d42,stroke:#444,color:#fff
+    style w fill:#1a1a2e,stroke:#e94560,color:#fff
+    style subm fill:#533483,stroke:#7b5ea7,color:#fff
 ```
 
 | Component | Tenant (sno-tenant) | Tenant 2 (sno-tenant2) | Tenant RHOAI3 (sno-tenant-rhoai3) | Worker (sno-worker) |
@@ -457,14 +477,25 @@ python -m pytest tests/test_submariner_networking.py::test_gpu_service_via_subma
 6. Asserts HTTP response contains `"status": "ok"` and `RTX 5090`
 
 **Traffic flow:**
-```
-curl pod (tenant)
-  → Service ClusterIP (tenant)
-  → EndpointSlice (10.132.x.x, worker pod IP)
-  → Submariner route agent → IPsec tunnel (UDP 4500)
-  → worker gateway → OVN
-  → GPU pod (nvidia-smi)
-  → {"gpu": "NVIDIA GeForce RTX 5090, 32607, 0, 40", "status": "ok"}
+```mermaid
+graph LR
+    curl["curl pod\n(tenant)"]
+    svc["Service ClusterIP\n(tenant)"]
+    ep["EndpointSlice\n10.132.x.x"]
+    subm["Submariner\nroute agent\nIPsec · UDP 4500"]
+    gw["Worker gateway\nOVN"]
+    gpu["GPU pod\nnvidia-smi"]
+    resp["JSON response\nstatus: ok\nRTX 5090"]
+
+    curl --> svc --> ep --> subm --> gw --> gpu --> resp
+
+    style curl fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style svc fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style ep fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style subm fill:#533483,stroke:#7b5ea7,color:#fff
+    style gw fill:#1a1a2e,stroke:#e94560,color:#fff
+    style gpu fill:#1a1a2e,stroke:#e94560,color:#fff
+    style resp fill:#2b2d42,stroke:#444,color:#fff
 ```
 
 ---
