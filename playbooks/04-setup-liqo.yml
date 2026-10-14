@@ -28,6 +28,7 @@
       --set telemetry.enabled=false
       --set offloading.disableNetworkCheck=true
       --set discovery.config.clusterID=gpu-worker
+      --disable-kernel-version-check
     register: liqo_worker_install
     changed_when: "'installed' in liqo_worker_install.stdout or 'upgraded' in liqo_worker_install.stdout"
 
@@ -45,6 +46,7 @@
       --set telemetry.enabled=false
       --set offloading.disableNetworkCheck=true
       --set discovery.config.clusterID=tenant-rhoai3
+      --disable-kernel-version-check
     register: liqo_tenant_install
     changed_when: "'installed' in liqo_tenant_install.stdout or 'upgraded' in liqo_tenant_install.stdout"
 

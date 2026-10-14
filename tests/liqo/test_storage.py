@@ -13,6 +13,7 @@ from kubernetes import client
 from helpers import force_delete_pod
 
 
+LIQO_STORAGE_CLASS = "liqo"
 LVMS_STORAGE_CLASS = "lvms-vg1"
 
 
@@ -53,15 +54,10 @@ def test_pvc_reflection(
         pass
 
     pvc = client.V1PersistentVolumeClaim(
-        metadata=client.V1ObjectMeta(
-            name=pvc_name,
-            namespace=ns,
-            annotations={
-                "liqo.io/remote-storage-class": LVMS_STORAGE_CLASS,
-            },
-        ),
+        metadata=client.V1ObjectMeta(name=pvc_name, namespace=ns),
         spec=client.V1PersistentVolumeClaimSpec(
             access_modes=["ReadWriteOnce"],
+            storage_class_name=LIQO_STORAGE_CLASS,
             resources=client.V1VolumeResourceRequirements(
                 requests={"storage": "1Gi"},
             ),
@@ -161,12 +157,10 @@ def test_pvc_persists_across_pod_restart(
         pass
 
     pvc = client.V1PersistentVolumeClaim(
-        metadata=client.V1ObjectMeta(
-            name=pvc_name, namespace=ns,
-            annotations={"liqo.io/remote-storage-class": LVMS_STORAGE_CLASS},
-        ),
+        metadata=client.V1ObjectMeta(name=pvc_name, namespace=ns),
         spec=client.V1PersistentVolumeClaimSpec(
             access_modes=["ReadWriteOnce"],
+            storage_class_name=LIQO_STORAGE_CLASS,
             resources=client.V1VolumeResourceRequirements(
                 requests={"storage": "1Gi"},
             ),

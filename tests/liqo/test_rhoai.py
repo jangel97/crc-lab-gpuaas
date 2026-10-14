@@ -211,7 +211,7 @@ def test_kserve_raw_inference_via_liqo(
         if e.status != 404:
             raise
 
-    gpu_server_script = "; ".join([
+    gpu_server_script = "\n".join([
         "import http.server, json, subprocess",
         "class H(http.server.BaseHTTPRequestHandler):",
         "  def do_GET(self):",
