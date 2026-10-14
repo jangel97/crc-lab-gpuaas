@@ -64,23 +64,34 @@ graph TD
 
 | Claim | How it was validated |
 |-------|---------------------|
-| **RHOAI version doesn't matter** | RHOAI 2.x (OCP 4.22) and 3.x (OCP 4.19) both dispatch to the same GPU worker. |
-| **Tenants run in parallel** | Both suites run simultaneously on the same GPU — no coordination, no awareness of each other. |
-| **All major workloads work** | PyTorchJob, KServe, Notebooks, XGBoostJob, TFJob, RayJob, LMEval, DSP — no RHOAI modifications needed. |
-| **Kueue enforces quota** | GPU admission, queuing, and cross-tenant preemption all work. Priority is admin-controlled. |
-| **Networking works** | Services and inference endpoints reach GPU pods via Submariner. Tunnel self-heals after failure. |
-| **Distributed training works** | Headless Service sync enables inter-pod DNS on the worker. Validated for the mechanism; full multi-GPU deferred (lab has 1 GPU). |
-| **Worker stays bare** | No RHOAI CRDs or operators on the GPU cluster. |
+| **RHOAI version independence** | RHOAI 2.x (OCP 4.22) and 3.x (OCP 4.19) both dispatch to the same GPU worker. |
+| **Concurrent tenant execution** | Both suites run simultaneously on the same GPU infrastructure, without coordination or awareness of each other. |
+| **Broad workload compatibility** | PyTorchJob, KServe, Notebooks, XGBoostJob, TFJob, RayJob, LMEval, and DSP — without RHOAI modifications. |
+| **Kueue quota enforcement** | GPU admission, queuing, and cross-tenant preemption work. Priority is admin-controlled. |
+| **Cross-cluster networking** | Services and inference endpoints reach GPU pods via Submariner. |
+| **Distributed training prerequisites** | Headless Service synchronization enables inter-pod DNS on the worker. Full multi-GPU training remains untested. |
+| **Decoupled GPU worker** | No RHOAI CRDs or operators are required on the GPU cluster. |
 
-### What it doesn't prove (yet)
+### Known limitations and remaining validation
 
-- Full multi-GPU distributed training (mechanism works, need >1 GPU to test end-to-end)
-- RBAC sync across clusters (by design — avoids privilege escalation)
-- Production HA (single-node clusters in lab)
+**Workload compatibility**
+- **LMEvalJob:** The CRD lacks scheduling fields (tolerations, nodeSelector). Requires a Kyverno workaround until addressed upstream.
+- **KServe with Istio:** Sidecar injection is incompatible with the current offloading mechanism. Affects RHOAI 2.x; RHOAI 3.x no longer uses OSSM.
+- **In-cluster API access:** Roles and RoleBindings are intentionally not synchronized, limiting workloads that need Kubernetes API permissions.
 
-Full spike assessment with all 22 validated scenarios:
-[docs/spike-assessment.md](docs/spike-assessment.md)
+**Security and isolation**
+- **SCC compatibility:** SecurityContext pass-through works between OpenShift clusters but may fail when security policies differ.
+- **Worker RBAC:** VK currently uses cluster-wide permissions rather than namespace-scoped access.
+- **Kubelet API:** Requires privileged SCC permissions for hostNetwork and hostPath.
 
+**Networking**
+- **Submariner routeagent:** Creates a cosmetic Pending pod on the virtual node. Requires an upstream Submariner change to eliminate.
+
+**Not yet validated**
+- **Multi-GPU execution:** Full distributed training and Kueue fair-sharing require a multi-GPU environment; the lab has only one GPU.
+- **High availability:** The lab uses single-node clusters and a single VK replica. Production HA and failover remain untested.
+
+Full spike assessment, including all 22 validated scenarios: [docs/spike-assessment.md](docs/spike-assessment.md)    
 ---
 
 ## VK architecture
