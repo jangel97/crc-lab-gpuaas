@@ -370,23 +370,17 @@ target pods created by the ShadowPod controller.
 
 ---
 
-## Deployment Guide — What We Learned
+## Deployment Findings
 
-### Install flags that matter
+### PVC StorageClass — not annotation
 
-```bash
-liqoctl install openshift \
-  --set networking.enabled=false \          # mandatory — Liqo WireGuard breaks on OCP (SCC)
-  --set storage.enabled=true \              # enables PVC reflection with StorageClass remapping
-  --set telemetry.enabled=false \
-  --set offloading.disableNetworkCheck=true \  # suppresses Liqo's own network readiness check
-  --disable-kernel-version-check            # skips Pod CIDR and kernel validation (not needed without networking)
-```
+Liqo docs mention a `liqo.io/remote-storage-class` annotation on PVCs.
+This did not work in our testing. The correct model is:
 
-Without `--disable-kernel-version-check`, Liqo validates Pod CIDRs and
-kernel versions across clusters even when networking is disabled. This
-causes spurious failures, especially when the tenant has stale pods with
-worker CIDRs left over from previous VK deployments.
+1. At peering time, configure `--remote-real-storage-class-name=lvms-vg1`
+2. Liqo creates a virtual StorageClass called `liqo` on the tenant
+3. PVCs use `storageClassName: liqo` — Liqo reflects them to the worker
+   with `storageClassName: lvms-vg1`
 
 ### Peering: GPU resource advertisement
 
@@ -403,81 +397,30 @@ the virtual node's `allocatable`. This is a static advertisement — Liqo
 does not auto-discover GPU count from the worker. If the worker has 4
 GPUs, you must specify `=4` explicitly.
 
-### Namespace offloading strategy
+### Submariner + Liqo networking disabled
 
-```bash
-liqoctl offload namespace <ns> \
-  --pod-offloading-strategy Remote \
-  --namespace-mapping-strategy EnforceSameName
-```
+Liqo's WireGuard networking breaks on OpenShift due to SCC privilege
+requirements. We disable it entirely (`networking.enabled=false`) and
+keep Submariner for cross-cluster traffic.
 
-- **`Remote`** means all pods in the namespace go to the worker. No pods
-  run locally. This is what we want for GPU workload namespaces.
-- **`EnforceSameName`** means the twin namespace on the worker has the
-  same name. This simplifies debugging (`oc get pods -n vk-test` works
-  on both clusters) and is required for headless Service DNS resolution
-  to work correctly across clusters.
+This works because when networking is disabled, Liqo syncs the **real
+worker PodIP** (e.g., `10.132.x.x`) to the tenant pod status without
+IP remapping. Submariner routes traffic to that PodIP through its IPsec
+tunnel. Tests L3 and L13 validate this.
 
-### PVC StorageClass — not annotation
+One side effect: Submariner's routeagent DaemonSet tries to schedule on
+the Liqo virtual node and gets `OffloadingBackOff`. Harmless but noisy.
+Can be suppressed with a node anti-affinity on `liqo.io/type=virtual-node`.
 
-Liqo docs mention a `liqo.io/remote-storage-class` annotation on PVCs.
-This did not work in our testing. The correct model is:
+### Next Steps
 
-1. At peering time, configure `--remote-real-storage-class-name=lvms-vg1`
-2. Liqo creates a virtual StorageClass called `liqo` on the tenant
-3. PVCs use `storageClassName: liqo` — Liqo reflects them to the worker
-   with `storageClassName: lvms-vg1`
-
-### Coexistence with existing VK
-
-If you have a custom VK deployment already running (e.g., `vk-gpu-provider`
-in `kube-system`), **scale it to 0 before testing Liqo**. Both systems
-register virtual nodes and will compete for pods in overlapping namespaces.
-With a single GPU, this means both try to schedule GPU pods simultaneously,
-and the second one hangs waiting for a GPU that's already in use.
-
-Also delete the old custom VK's virtual node (`oc delete node gpu-worker`)
-before Liqo peering — Liqo will fail with `node gpu-worker already exists`
-if the old one is still registered.
-
-### Submariner routeagent on virtual node
-
-Submariner's routeagent DaemonSet will try to schedule a pod on the Liqo
-virtual node. Liqo rejects it with `OffloadingBackOff` status. This is
-harmless — the routeagent doesn't need to run on a virtual node. But it
-does generate noise in `oc get pods -A`. If it bothers you, add a node
-affinity or anti-affinity to the routeagent DaemonSet to exclude
-`liqo.io/type=virtual-node` nodes.
-
-### Liqo install failure recovery
-
-If `liqoctl install` fails partway through (e.g., Kueue webhooks not
-ready, timeout), the Helm release is left in a broken state. `liqoctl
-install` will then fail with `"liqo" has no deployed releases`. To
-recover:
-
-1. Delete the Helm release secret: `oc delete secret -n liqo -l name=liqo`
-2. Delete stale webhooks: `oc delete validatingwebhookconfiguration,mutatingwebhookconfiguration -l app.kubernetes.io/part-of=liqo`
-3. Check for stale APIServices: `oc get apiservices | grep liqo` — a
-   stale `v1beta1.metrics.liqo.io` pointing to a deleted service will
-   block namespace termination with `DiscoveryFailed`
-4. Delete the `liqo` namespace (may need step 3 first)
-5. Retry `liqoctl install`
-
-### Kueue integration (not yet validated)
-
-The plan is the same as with the custom VK: Kyverno ClusterPolicy on
-the worker mutates GPU pods to add Kueue queue labels. The difference
-is that Liqo creates pods via the ShadowPod controller, so the Kyverno
-policy match rules need to target pods created by that controller (not
-pods with our custom VK labels). The open question (L12) is whether the
-ShadowPod controller overwrites Kyverno-added labels during
-reconciliation — if it does, Kueue integration breaks.
-
-### What operators need to know (RHOAI tenants)
-
-Nothing. That's the point. Tenants create PyTorchJobs, InferenceServices,
-or plain pods in an offloaded namespace. No `nodeName`, no tolerations,
-no annotations. Liqo's mutating webhook handles scheduling transparently.
-The only visible difference is that PVCs must use `storageClassName: liqo`
-instead of the local StorageClass.
+1. **Kueue integration** — Deploy Kyverno ClusterPolicy on worker
+   targeting ShadowPod-created pods. Run L11/L12 to validate whether
+   Kyverno-added Kueue labels survive ShadowPod controller reconciliation.
+   If the controller overwrites them, Kueue integration breaks and we
+   need an alternative (e.g., mutating the ShadowPod CRD directly).
+2. **Multi-tenant** — Test multiple tenants peered to the same worker.
+   Liqo uses twin namespaces per peering, so namespace isolation model
+   differs from the custom VK's `vk-{hash}-{ns}` prefix approach.
+3. **RHOAI 2.x** — Current results are RHOAI 3.x only. If RHOAI 2.x
+   support is needed, test against an RHOAI 2.x tenant cluster.
