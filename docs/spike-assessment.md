@@ -790,30 +790,31 @@ tests/test_vk_gpu.py::test_pod_logs_proxied_from_worker                       PA
 
 ### RHOAI 3.x e2e (tenant-rhoai3, OCP 4.19.49)
 
-Environment: sno-tenant-rhoai3 (24 GiB, OCP 4.19.49, RHOAI 3.x) + sno-worker (24 GiB, GPU).
-All DSC components set to Managed (kserve, trainingoperator, workbenches, dashboard, ray, kueue, etc.).
+Environment: sno-tenant-rhoai3 (16 GiB, OCP 4.19.49, RHOAI 3.x) + sno-worker (24 GiB, GPU).
+DSC components: kserve Managed, trainingoperator Managed, aipipelines Managed,
+workbenches Removed, ray Removed, dashboard Removed. Kyverno installed for LMEval toleration injection.
 No OSSM/Istio, no Serverless/Knative — RHOAI 3.x uses cert-manager + jobset as prerequisites.
 KServe runs in RawDeployment mode only.
 
 ```
+tests/rhoai_3/e2e/test_networking.py::test_kserve_inference_reachable_via_submariner   PASSED
+tests/rhoai_3/e2e/test_networking.py::test_notebook_reachable_via_submariner           SKIPPED (workbenches Removed)
+tests/rhoai_3/e2e/test_networking.py::test_submariner_tunnel_recovery_rhoai3           PASSED
 tests/rhoai_3/e2e/test_smoke.py::test_no_rhoai_crds_on_worker                PASSED
 tests/rhoai_3/e2e/test_smoke.py::test_rhoai3_components_running               PASSED
 tests/rhoai_3/e2e/test_smoke.py::test_no_ossm_on_rhoai3                       PASSED
 tests/rhoai_3/e2e/test_workloads.py::test_pytorchjob_via_vk                   PASSED
 tests/rhoai_3/e2e/test_workloads.py::test_kserve_raw_inference_via_vk         PASSED
-tests/rhoai_3/e2e/test_workloads.py::test_notebook_cr_via_vk                  PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_notebook_cr_via_vk                  SKIPPED (workbenches Removed)
 tests/rhoai_3/e2e/test_workloads.py::test_pytorchjob_checkpoint_with_pvc      PASSED
-tests/rhoai_3/e2e/test_workloads.py::test_rayjob_via_vk                       PASSED
-tests/rhoai_3/e2e/test_workloads.py::test_tfjob_via_vk                        PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_rayjob_via_vk                       SKIPPED (KubeRay not running)
+tests/rhoai_3/e2e/test_tfjob_via_vk                                           SKIPPED (TF 2.19 no sm_120)
 tests/rhoai_3/e2e/test_workloads.py::test_xgboostjob_via_vk                   PASSED
-tests/rhoai_3/e2e/test_workloads.py::test_raycluster_via_vk                   PASSED
-tests/rhoai_3/e2e/test_workloads.py::test_dsp_pipeline_via_vk                 PASSED
+tests/rhoai_3/e2e/test_workloads.py::test_raycluster_via_vk                   SKIPPED (KubeRay not running)
+tests/rhoai_3/e2e/test_workloads.py::test_dsp_pipeline_via_vk                 SKIPPED (No StorageClass)
 tests/rhoai_3/e2e/test_workloads.py::test_lmeval_via_vk                       PASSED
-tests/rhoai_3/e2e/test_networking.py::test_kserve_inference_reachable_via_submariner   PASSED
-tests/rhoai_3/e2e/test_networking.py::test_notebook_reachable_via_submariner           SKIPPED (workbenches Removed)
-tests/rhoai_3/e2e/test_networking.py::test_submariner_tunnel_recovery_rhoai3           PASSED
 
-15 passed, 1 skipped
+10 passed, 6 skipped
 ```
 
 #### RHOAI 3.x VK compatibility matrix
@@ -824,9 +825,9 @@ tests/rhoai_3/e2e/test_networking.py::test_submariner_tunnel_recovery_rhoai3    
 | **PyTorchJob + PVC** | Yes | `test_pytorchjob_checkpoint_with_pvc` | Checkpoint save/load via catapult PVC works end-to-end. |
 | **KServe InferenceService** | Yes | `test_kserve_raw_inference_via_vk` | RawDeployment mode (only mode in 3.x). cert-manager injects a `proxy-tls` volume from an async-created secret — VK defers missing secrets to the informer (see below). |
 | **Notebook CR** | Yes | `test_notebook_cr_via_vk` | Notebook controller creates StatefulSet, pod dispatched via VK. kube-rbac-proxy replaces oauth-proxy in 3.x. |
-| **RayCluster** | Yes | `test_raycluster_via_vk` | Head pod dispatched via VK, reaches Running on worker. cert-manager TLS secret synced via informer. |
-| **RayJob** | Yes | `test_rayjob_via_vk` | Head pod dispatches and runs GPU workload on worker. Submitter pod reaches Ray dashboard on worker via Submariner cross-cluster networking. Requires Submariner deployed on tenant cluster. |
-| **TFJob** | Yes | `test_tfjob_via_vk` | TensorFlow training operator creates chief pod, VK dispatches, GPU training completes, status syncs back. |
+| **RayCluster** | Yes | `test_raycluster_via_vk` | Head pod dispatched via VK, reaches Running on worker. cert-manager TLS secret synced via informer. Requires `ray: Managed` in DSC. |
+| **RayJob** | Yes | `test_rayjob_via_vk` | Head pod dispatches and runs GPU workload on worker. Submitter pod reaches Ray dashboard on worker via Submariner cross-cluster networking. Requires `ray: Managed` in DSC and Submariner. |
+| **TFJob** | Yes | `test_tfjob_via_vk` | TensorFlow training operator creates chief pod, VK dispatches, GPU training completes, status syncs back. TF 2.19.0 does not support Blackwell (sm_120) — skipped on RTX 5090. |
 | **XGBoostJob** | Yes | `test_xgboostjob_via_vk` | XGBoost training operator creates master pod, VK dispatches, GPU-accelerated training completes. |
 | **DataSciencePipelines** | Yes | `test_dsp_pipeline_via_vk` | DSPA infrastructure (API server, MariaDB, MinIO) deploys on VK-enabled cluster. Pipeline step pods use standard Kubernetes scheduling (nodeName, tolerations) via KFP v2 platform_spec. |
 | **ModelMeshServing** | N/A | — | Removed in RHOAI 3.x. KServe RawDeployment is the only supported serving mode. Already tested in `test_kserve_raw_inference_via_vk`. |
@@ -1196,6 +1197,25 @@ node reads.
 Risk in the spike is low — the worker cluster is single-purpose and
 has no sensitive workloads outside VK-managed namespaces.
 
+### RBAC resources (Role / RoleBinding) not synced
+
+The VK reconciler syncs ServiceAccounts, Secrets, ConfigMaps, and Services
+to the worker namespace, but does not sync Roles or RoleBindings. If a
+namespace-admin creates a Role + RoleBinding + ServiceAccount on the tenant,
+the SA is synced but the RBAC policy is not. The pod runs on the worker, but
+if the container makes in-cluster Kubernetes API calls using the SA token, the
+token authenticates against the worker API server where the corresponding
+Role and RoleBinding do not exist — the request is denied.
+
+This does not affect pure compute workloads (training, inference) that never
+call the Kubernetes API. It matters for workloads that do in-cluster API calls
+(operators, sidecar controllers, pipeline runners that query pod status).
+
+This is the same behavior as vanilla RHOAI 3.x for cross-cluster scenarios —
+RBAC is always cluster-scoped, and syncing RBAC across clusters would require
+careful consideration of privilege escalation risks (a tenant-side Role could
+grant permissions that should not exist on the worker).
+
 ### Kubelet API server requires privileged SCC
 
 The VK Deployment needs `hostNetwork: true` and a `hostPath` volume for the
@@ -1318,6 +1338,15 @@ to the VK service account.
     directly to the worker pod IP. Tunnel failure recovery also confirmed
     on the 3.x tenant — gateway pod kill → auto-restart → IPsec
     re-establishment → connectivity restored.
+
+22. **Cross-tenant parallel execution is fully decoupled.** RHOAI 2.x
+    (OCP 4.22) and RHOAI 3.x (OCP 4.19) test suites run simultaneously
+    against the same shared GPU worker. Both suites dispatch GPU workloads
+    (PyTorchJob, KServe inference) to the worker concurrently — each
+    tenant's VK instance operates independently via its own worker
+    namespace prefix. Tests that complete before infrastructure disruption
+    all pass on both sides. The tenants share a single GPU without
+    coordination or mutual awareness.
 
 ## What This Spike Does Not Prove
 

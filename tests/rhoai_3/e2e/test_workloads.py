@@ -801,6 +801,17 @@ def test_rayjob_via_vk(
     worker_core, _ = rhoai3_worker_clients
     ns = rhoai3_test_namespace
 
+    apps_check = client.AppsV1Api(tenant_core.api_client)
+    try:
+        pods = tenant_core.list_namespaced_pod(
+            namespace="redhat-ods-applications",
+            label_selector="app.kubernetes.io/name=kuberay-operator",
+        )
+        if not pods.items:
+            raise client.exceptions.ApiException(status=404)
+    except client.exceptions.ApiException:
+        pytest.skip("KubeRay operator not running (ray Removed in DSC)")
+
     job_name = "rhoai3-rayjob-gpu"
 
     try:
@@ -963,6 +974,15 @@ def test_tfjob_via_vk(
     worker_core, _ = rhoai3_worker_clients
     ns = rhoai3_test_namespace
 
+    gpu_family = None
+    for node in worker_core.list_node().items:
+        gpu_family = (node.metadata.labels or {}).get("nvidia.com/gpu.family", "")
+        break
+    if gpu_family == "blackwell":
+        pytest.skip(
+            "TensorFlow 2.19.0-gpu does not include sm_120 (Blackwell) kernels"
+        )
+
     job_name = "rhoai3-tfjob-gpu"
     chief_pod_name = f"{job_name}-chief-0"
     w_pod_name = worker_pod_name(ns, chief_pod_name)
@@ -1120,7 +1140,8 @@ def test_xgboostjob_via_vk(
 
     training_script = "\n".join([
         "import subprocess, sys",
-        "subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'xgboost', '-q'])",
+        "subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'xgboost', '-q', '--break-system-packages', '--target=/tmp/pylibs'])",
+        "sys.path.insert(0, '/tmp/pylibs')",
         "import xgboost as xgb",
         "import numpy as np",
         "print(f'XGBoost version: {xgb.__version__}')",
@@ -1199,13 +1220,19 @@ def test_xgboostjob_via_vk(
         worker_core, w_pod_name, rhoai3_vk_worker_namespace,
         ("Succeeded", "Failed"), timeout=900,
     )
-    assert worker_phase == "Succeeded", (
-        f"XGBoost training pod did not succeed. Phase: {worker_phase!r}"
-    )
 
-    logs = worker_core.read_namespaced_pod_log(
-        name=w_pod_name, namespace=rhoai3_vk_worker_namespace,
-        container="xgboost",
+    logs = ""
+    try:
+        logs = worker_core.read_namespaced_pod_log(
+            name=w_pod_name, namespace=rhoai3_vk_worker_namespace,
+            container="xgboost",
+        )
+    except client.exceptions.ApiException:
+        pass
+
+    assert worker_phase == "Succeeded", (
+        f"XGBoost training pod did not succeed. Phase: {worker_phase!r}. "
+        f"Logs: {logs[-500:]}"
     )
     assert "XGBoost training complete" in logs, (
         f"XGBoost training did not complete. Logs: {logs[:500]}"
@@ -1221,6 +1248,16 @@ def test_raycluster_via_vk(
     tenant_core, tenant_custom = rhoai3_tenant_clients
     worker_core, _ = rhoai3_worker_clients
     ns = rhoai3_test_namespace
+
+    try:
+        pods = tenant_core.list_namespaced_pod(
+            namespace="redhat-ods-applications",
+            label_selector="app.kubernetes.io/name=kuberay-operator",
+        )
+        if not pods.items:
+            raise client.exceptions.ApiException(status=404)
+    except client.exceptions.ApiException:
+        pytest.skip("KubeRay operator not running (ray Removed in DSC)")
 
     cluster_name = "rhoai3-raycluster-gpu"
 
@@ -1360,6 +1397,11 @@ def test_dsp_pipeline_via_vk(
     tenant_core, tenant_custom = rhoai3_tenant_clients
     ns = rhoai3_test_namespace
     apps_api = client.AppsV1Api(tenant_core.api_client)
+
+    storage_api = client.StorageV1Api(tenant_core.api_client)
+    scs = storage_api.list_storage_class()
+    if not scs.items:
+        pytest.skip("No StorageClass available — DSP requires PVCs for MariaDB/MinIO")
 
     dspa_name = "rhoai3-dspa"
 
