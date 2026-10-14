@@ -411,20 +411,42 @@ One side effect: Submariner's routeagent DaemonSet tries to schedule on
 the Liqo virtual node and gets `OffloadingBackOff`. Harmless but noisy.
 Can be suppressed with a node anti-affinity on `liqo.io/type=virtual-node`.
 
+### SCC pass-through
+
+Liqo passes the pod spec through to the worker without modifying the
+security context. The worker's SCC admission controller applies its own
+policy to the actual pod — same behavior as the custom VK.
+
+Verified: a pod created on the tenant with no explicit `securityContext`
+ran on the worker under the `privileged` SCC (assigned by the worker's
+admission controller based on the ShadowPod service account). Liqo does
+not interfere with or modify security contexts.
+
 ### Kueue setup on worker
 
 Kyverno + Kueue configuration required on the worker for the twin
 namespace (the namespace Liqo creates to mirror the tenant's offloaded
 namespace):
 
-1. Twin namespace needs labels:
+1. Kyverno installed on worker with privileged SCC for its service
+   accounts (required on OpenShift)
+2. Kyverno MutatingPolicies from `kueue-gpu-policy` repo applied:
+   `mutate-queue-name` and `mutate-priority` (match namespaces with
+   `gpuaas.redhat.com/managed=true`)
+3. WorkloadPriorityClasses created (`gpuaas-production`, `gpuaas-critical`,
+   `gpuaas-standard`, `gpuaas-opportunistic`)
+4. Twin namespace labeled:
    - `gpuaas.redhat.com/managed=true`
    - `kyverno.io/watch=enabled`
    - `gpuaas.redhat.com/default-priority=gpuaas-standard`
    - annotation: `gpuaas.redhat.com/allowed-priorities=<comma-separated>`
-2. LocalQueue `default` in twin namespace pointing to `cluster-queue`
-3. Kueue webhook `reinvocationPolicy: IfNeeded` (Kyverno runs first,
+5. LocalQueue `default` in twin namespace pointing to `cluster-queue`
+6. Kueue webhook `reinvocationPolicy: IfNeeded` (Kyverno runs first,
    Kueue re-invokes to see the labels)
+
+The ShadowPod controller does **not** overwrite Kyverno-added labels
+during reconciliation. This was the critical unknown — L12 confirms
+Kueue integration is viable.
 
 ### Next Steps
 
