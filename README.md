@@ -7,49 +7,57 @@ CRDs, dashboards) stays on each tenant. Only bare compute pods land on the
 shared GPU worker — no RHOAI installed there, just GPU Operator + Kueue.
 
 ```mermaid
-graph LR
-    subgraph tenant1["Tenant 1 — RHOAI 2.x (OCP 4.22)"]
-        rhoai2[RHOAI Operators<br/>Training, KServe,<br/>Notebooks, DSP]
-        vk1[Virtual Kubelet]
-        rhoai2 -->|creates pods| vk1
+graph TD
+    subgraph tenants["Tenant Clusters (control plane only)"]
+        direction LR
+        subgraph t1["RHOAI 2.x · OCP 4.22"]
+            ops1["Training · KServe\nNotebooks · DSP"]
+            vk1["Virtual Kubelet"]
+        end
+        subgraph t2["RHOAI 3.x · OCP 4.19"]
+            ops2["Training · KServe\nLMEval · Ray"]
+            vk2["Virtual Kubelet"]
+        end
     end
 
-    subgraph tenant2["Tenant 2 — RHOAI 3.x (OCP 4.19)"]
-        rhoai3[RHOAI Operators<br/>Training, KServe,<br/>LMEval]
-        vk2[Virtual Kubelet]
-        rhoai3 -->|creates pods| vk2
+    subgraph sub["Submariner · IPsec tunnel"]
+        direction LR
+        net["L3 cross-cluster networking\nServices · Routes · Inference endpoints"]
     end
 
-    subgraph worker["Shared GPU Cluster (no RHOAI)"]
-        gpu[GPU Operator<br/>RTX 5090]
-        kueue[Kueue<br/>quota + preemption]
-        kyverno[Kyverno<br/>priority labels]
-        ns1[vk-prefix1-ns<br/>Tenant 1 pods]
-        ns2[vk-prefix2-ns<br/>Tenant 2 pods]
+    subgraph gpu_cluster["Shared GPU Cluster (no RHOAI)"]
+        direction LR
+        subgraph infra[" "]
+            direction TB
+            gpu_op["GPU Operator\nRTX 5090"]
+            kueue["Kueue\nquota · preemption"]
+            kyverno["Kyverno\npriority labels"]
+        end
+        subgraph namespaces["Per-tenant namespaces"]
+            direction LR
+            ns1["vk-a3f-tenant-ns\nTenant 1 pods"]
+            ns2["vk-b7c-tenant-ns\nTenant 2 pods"]
+        end
         kueue -.->|admits| ns1
         kueue -.->|admits| ns2
     end
 
-    vk1 -->|sync resources<br/>+ create pod| ns1
-    vk2 -->|sync resources<br/>+ create pod| ns2
-    ns1 -.->|status sync| vk1
-    ns2 -.->|status sync| vk2
+    ops1 -->|creates pods| vk1
+    ops2 -->|creates pods| vk2
+    vk1 -->|"sync + dispatch"| ns1
+    vk2 -->|"sync + dispatch"| ns2
+    ns1 -.->|status| vk1
+    ns2 -.->|status| vk2
+    tenants <--> sub
+    sub <--> gpu_cluster
 
-    subgraph submariner["Submariner IPsec Tunnel"]
-        tunnel[L3 connectivity]
-    end
-
-    tenant1 <-->|Services, Routes,<br/>inference endpoints| tunnel
-    tenant2 <-->|Services, Routes,<br/>inference endpoints| tunnel
-    tunnel <--> worker
-
-    style worker fill:#1a1a2e,stroke:#e94560,color:#fff
-    style tenant1 fill:#0f3460,stroke:#16213e,color:#fff
-    style tenant2 fill:#0f3460,stroke:#16213e,color:#fff
-    style submariner fill:#533483,stroke:#2b2d42,color:#fff
-    style gpu fill:#e94560,stroke:#1a1a2e,color:#fff
-    style kueue fill:#2b2d42,stroke:#e94560,color:#fff
-    style kyverno fill:#2b2d42,stroke:#e94560,color:#fff
+    style tenants fill:#0f3460,stroke:#16213e,color:#fff
+    style t1 fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style t2 fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style sub fill:#533483,stroke:#2b2d42,color:#fff
+    style gpu_cluster fill:#1a1a2e,stroke:#e94560,color:#fff
+    style infra fill:#2b2d42,stroke:#444,color:#fff
+    style namespaces fill:#2b2d42,stroke:#444,color:#fff
 ```
 
 ### What the spike proves
