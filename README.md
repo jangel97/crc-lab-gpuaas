@@ -83,46 +83,151 @@ Full spike assessment with all 22 validated scenarios:
 
 ---
 
-## How it works
+## VK architecture
 
-A custom Virtual Kubelet provider runs on each tenant cluster and registers
-a virtual node (`gpu-worker`) advertising GPU capacity. When a pod targets
-that node, VK:
+The VK provider is a Go binary (`cmd/vk-gpu-provider/`) built on the
+`virtual-kubelet/virtual-kubelet` v1.11.0 library. It runs as a Deployment
+on each tenant cluster and manages the full pod lifecycle across two clusters.
 
-1. Creates a per-tenant namespace on the worker (`{prefix}{tenant-ns}`)
-2. Syncs referenced secrets, configmaps, service accounts, headless services, and PVCs
-3. Creates the pod on the worker GPU cluster
-4. Syncs status back to the tenant so operators see success/failure
+```mermaid
+graph TD
+    subgraph tenant["Tenant Cluster"]
+        direction TB
+        api_t["Tenant API Server"]
+        vk_node["Virtual Node\ngpu-worker"]
 
-Users and operators don't know the pod ran elsewhere. The training operator
-creates a PyTorchJob, the pod runs on a remote GPU, status comes back —
-the operator marks the job Succeeded.
+        subgraph vk_proc["VK Provider Process"]
+            direction TB
+            lib["VK Library\npod informer · node heartbeat\nlease renewal · work queue"]
+            provider["GPUProvider\nCreatePod · DeletePod\nstatus sync · exec proxy"]
+            syncer["ResourceSyncer\nsecrets · configmaps · SAs\nheadless services · PVCs"]
+            reconciler["DepReconciler\nperiodic resync (2 min)\nevent-driven · GC"]
+            kubelet_api["Kubelet API :10350\nkubectl logs · exec · attach"]
+
+            lib -->|"pod assigned\nto virtual node"| provider
+            provider --> syncer
+            provider --> reconciler
+        end
+
+        subgraph t_informers["Tenant Informers"]
+            secret_inf["Secret informer"]
+            cm_inf["ConfigMap informer"]
+            svc_inf["Service informer"]
+            pvc_inf["PVC informer"]
+        end
+
+        t_informers -->|"resource changed\nenqueue namespace"| reconciler
+        pvc_inf -->|"control PVC deleted"| syncer
+    end
+
+    subgraph worker["Worker Cluster"]
+        direction TB
+        api_w["Worker API Server"]
+        w_informer["Worker Pod Informer\nlabel: managed-by=vk-gpu-provider"]
+        ns["Per-tenant namespaces\n{prefix}{tenant-ns}"]
+        gpu["GPU\nRTX 5090"]
+
+        w_informer -->|"status changed"| api_w
+    end
+
+    provider -->|"1. ensure namespace\n2. sync resources\n3. create pod"| api_w
+    syncer -->|"sync secrets, CMs\nSAs, services, PVCs"| ns
+    w_informer -->|"status sync\n(Running, Succeeded, Failed)"| provider
+    kubelet_api -->|"log/exec proxy\nvia SPDY"| api_w
+    api_w --> gpu
+
+    style tenant fill:#0f3460,stroke:#16213e,color:#fff
+    style worker fill:#1a1a2e,stroke:#e94560,color:#fff
+    style vk_proc fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style t_informers fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style ns fill:#2b2d42,stroke:#444,color:#fff
+```
+
+### Pod dispatch flow
+
+When a pod is assigned to the virtual node, the provider runs this pipeline:
 
 ```mermaid
 sequenceDiagram
-    participant User as User / Operator
-    participant Tenant as Tenant API Server
-    participant VK as Virtual Kubelet
-    participant Worker as Worker API Server
-    participant GPU as GPU (RTX 5090)
+    participant Op as RHOAI Operator
+    participant T as Tenant API
+    participant VK as VK Provider
+    participant S as ResourceSyncer
+    participant R as DepReconciler
+    participant W as Worker API
+    participant GPU as GPU
 
-    User->>Tenant: Create PyTorchJob / InferenceService / Notebook
-    Tenant->>Tenant: Operator creates pod<br/>(nodeName: gpu-worker)
-    Tenant->>VK: Pod assigned to virtual node
+    Op->>T: Create pod (nodeName: gpu-worker)
+    T->>VK: Pod event (VK library informer)
 
-    VK->>Worker: Create namespace {prefix}{tenant-ns}
-    VK->>Worker: Sync secrets, configmaps, SAs, services
-    VK->>Worker: Create pod (scheduling fields cleared)
+    Note over VK: Reject DaemonSet pods<br/>Reject system namespaces<br/>Skip if already managed
 
-    Worker->>Worker: Kyverno adds queue + priority labels
-    Worker->>Worker: Kueue gates → admits pod
-    Worker->>GPU: Pod runs on GPU
+    VK->>T: Re-read pod from API<br/>(recover original fieldRefs)
+    VK->>W: Ensure namespace {prefix}{ns}
 
-    GPU-->>Worker: Container completes
-    Worker-->>VK: Status sync (informer)
-    VK-->>Tenant: Update pod status (Succeeded)
-    Tenant-->>User: Operator sees job Succeeded
+    VK->>S: SyncResources(pod)
+    S->>T: GET secrets, configmaps, SA
+    S->>W: CREATE/UPDATE in worker namespace
+    Note over S: Missing resources return nil<br/>(reconciler will retry)
+
+    VK->>S: SyncHeadlessServices(pod)
+    S->>T: List services (clusterIP=None)
+    S->>W: Sync matching services
+
+    VK->>S: ValidateAndSyncPVCs(pod)
+    Note over S: Reject non-catapult PVCs<br/>Create execution PVCs
+
+    Note over VK: transformPod():<br/>clear nodeName, tolerations,<br/>affinity, schedulerName<br/>remap PVC names<br/>strip SA token volumes
+
+    VK->>W: Create pod
+    VK->>R: Enqueue namespace
+
+    W->>W: Kyverno adds queue/priority labels
+    W->>W: Kueue gates → admits
+    W->>GPU: Pod runs
+
+    GPU-->>W: Container exits
+    W-->>VK: Worker informer (status sync)
+    VK-->>T: Update tenant pod status
+    T-->>Op: Operator sees Succeeded
 ```
+
+### Key internals
+
+**Resource sync is non-blocking.** If a resource doesn't exist yet (e.g.,
+cert-manager hasn't issued a TLS secret), the provider creates the worker
+pod anyway. The worker kubelet retries volume mounts. Tenant informers
+detect the new resource and the reconciler syncs it — the pod starts
+without requeuing.
+
+**The reconciler computes desired state from all pods in a namespace,**
+not individual pod events. It unions all resource references across pods,
+syncs the missing ones, and garbage-collects resources no longer referenced
+by any pod. Rate-limited workqueue with exponential backoff. Periodic
+resync every 2 minutes guarantees convergence.
+
+**Pod transformation clears all scheduling fields** (nodeName, nodeSelector,
+affinity, tolerations, schedulerName, priority) so the worker scheduler
+places the pod normally. SecurityContext passes through unchanged — the
+worker's SCC/PSA admission re-evaluates it.
+
+**Status sync is informer-driven.** A worker pod informer watches all pods
+labeled `managed-by: vk-gpu-provider`. On add/update, the worker pod's
+status is copied to the tenant pod via the VK library's `NotifyPods`
+callback. On delete (e.g., Kueue preemption), the tenant pod is marked
+`Failed` with reason `WorkerPodPreempted`.
+
+**kubectl logs and exec are proxied.** The provider runs a kubelet API
+server on port 10350 using the node's TLS cert. `GetContainerLogs` streams
+logs from the worker pod. `RunInContainer` uses SPDY to proxy exec sessions
+to the worker API server.
+
+**Node capacity is dynamic.** A background goroutine polls worker node
+resources every 30s and updates the virtual node's allocatable (CPU,
+memory, GPU, pods) only when values change.
+
+For full implementation details, see
+[docs/vk-architecture.md](docs/vk-architecture.md).
 
 ## Lab setup
 
