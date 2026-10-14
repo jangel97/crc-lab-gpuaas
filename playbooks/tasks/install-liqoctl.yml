@@ -1,0 +1,56 @@
+---
+- name: Check if liqoctl is already installed
+  command: liqoctl version --client
+  register: liqoctl_check
+  failed_when: false
+  changed_when: false
+
+- name: Set liqoctl install needed
+  set_fact:
+    liqoctl_needs_install: >-
+      {{ liqoctl_check.rc != 0 or
+         liqo_version not in (liqoctl_check.stdout | default('')) }}
+
+- name: Detect architecture
+  set_fact:
+    liqoctl_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+    liqoctl_os: "{{ 'darwin' if ansible_system == 'Darwin' else 'linux' }}"
+
+- name: Download liqoctl {{ liqo_version }}
+  get_url:
+    url: "https://github.com/liqotech/liqo/releases/download/{{ liqo_version }}/liqoctl-{{ liqoctl_os }}-{{ liqoctl_arch }}.tar.gz"
+    dest: /tmp/liqoctl.tar.gz
+    mode: '0644'
+  when: liqoctl_needs_install
+
+- name: Extract liqoctl binary
+  unarchive:
+    src: /tmp/liqoctl.tar.gz
+    dest: /tmp
+    remote_src: true
+  when: liqoctl_needs_install
+
+- name: Install liqoctl to local bin
+  copy:
+    src: /tmp/liqoctl
+    dest: "{{ local_bin }}/liqoctl"
+    mode: '0755'
+  when: liqoctl_needs_install
+
+- name: Clean up download
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/liqoctl.tar.gz
+    - /tmp/liqoctl
+  when: liqoctl_needs_install
+
+- name: Verify liqoctl version
+  command: liqoctl version --client
+  register: liqoctl_version
+  changed_when: false
+
+- name: Print liqoctl version
+  debug:
+    msg: "liqoctl {{ liqoctl_version.stdout }}"
