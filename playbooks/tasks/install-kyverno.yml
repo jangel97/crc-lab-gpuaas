@@ -1,0 +1,57 @@
+---
+- name: Check if Kyverno is installed
+  command: oc get deployment -n kyverno kyverno-admission-controller
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: kyverno_check
+  failed_when: false
+  changed_when: false
+
+- name: Download Kyverno manifest
+  get_url:
+    url: "https://github.com/kyverno/kyverno/releases/latest/download/install.yaml"
+    dest: /tmp/kyverno-install.yaml
+  when: kyverno_check.rc != 0
+
+- name: Install Kyverno
+  command: oc apply --server-side -f /tmp/kyverno-install.yaml
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  when: kyverno_check.rc != 0
+
+- name: Grant privileged SCC to Kyverno service accounts
+  command:
+    cmd: oc adm policy add-scc-to-user privileged -z {{ item }} -n kyverno
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  loop:
+    - kyverno-admission-controller
+    - kyverno-background-controller
+    - kyverno-cleanup-controller
+    - kyverno-reports-controller
+  register: scc_result
+  changed_when: "'added' in (scc_result.stdout | default(''))"
+
+- name: Restart Kyverno deployments to pick up SCC
+  command: oc rollout restart deployment {{ item }} -n kyverno
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  loop:
+    - kyverno-admission-controller
+    - kyverno-background-controller
+    - kyverno-cleanup-controller
+    - kyverno-reports-controller
+  when: kyverno_check.rc != 0 or scc_result.changed
+
+- name: Wait for Kyverno admission controller
+  command: oc wait deployment -n kyverno kyverno-admission-controller --for=condition=Available --timeout=300s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  retries: 3
+  delay: 15
+  register: kyverno_wait
+  until: kyverno_wait.rc == 0
+
+- name: Report Kyverno status
+  debug:
+    msg: "Kyverno installed on {{ inventory_hostname }}"

@@ -21,7 +21,6 @@
     PATH: "{{ local_bin }}:{{ lookup('env', 'PATH') }}"
 
   tasks:
-  # Free up resources by disabling non-essential components
   - name: Slim down cluster
     include_tasks: tasks/slim-down-cluster.yml
 
@@ -30,27 +29,34 @@
     include_tasks: tasks/install-gpu-operator.yml
     when: components.gpu_operator | default(false) | bool
 
-  # Kueue (worker only)
+  # Kueue (worker only — manages GPU quota)
   - name: Install Kueue
     include_tasks: tasks/install-kueue.yml
     when: components.kueue | default(false) | bool
 
-  # LVMS (tenant only, provides StorageClass for PVCs)
+  # LVMS (worker only)
   - name: Install LVMS
     include_tasks: tasks/install-lvms.yml
     when: components.lvms | default(false) | bool
 
-  # Liqo (both, role-aware)
-  - name: Install Liqo
-    include_tasks: tasks/install-liqo.yml
-    when: components.liqo is defined
+  # Kyverno (tenant-rhoai3 — VK toleration injection for LMEval)
+  - name: Install Kyverno
+    include_tasks: tasks/install-kyverno.yml
+    when: components.kyverno | default(false) | bool
 
-  # RHOAI (tenant only)
-  - name: Install RHOAI
-    include_tasks: tasks/install-rhoai.yml
-    when: components.rhoai | default(false) | bool
+  # RHOAI — dispatch to version-specific task file based on rhoai_channel
+  - name: Install RHOAI 3.x
+    include_tasks: tasks/install-rhoai3.yml
+    when:
+    - components.rhoai | default(false) | bool
+    - "'3' in (rhoai_channel | default(''))"
 
-  # Disable default catalog sources after all operators are installed (~300-600MB saved)
+  - name: Install RHOAI 2.x
+    include_tasks: tasks/install-rhoai2.yml
+    when:
+    - components.rhoai | default(false) | bool
+    - "'2' in (rhoai_channel | default(''))"
+
   - name: Disable OperatorHub default catalog sources
     command: >
       oc patch operatorhub.config.openshift.io/cluster --type merge

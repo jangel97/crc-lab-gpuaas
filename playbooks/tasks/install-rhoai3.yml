@@ -1,0 +1,177 @@
+---
+# Prereq: Cert Manager operator
+- name: Create Cert Manager namespace and subscription
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: cert-manager-operator
+      ---
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: cert-manager-operator
+        namespace: cert-manager-operator
+      spec:
+        targetNamespaces:
+        - cert-manager-operator
+      ---
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: openshift-cert-manager-operator
+        namespace: cert-manager-operator
+      spec:
+        channel: stable-v1
+        name: openshift-cert-manager-operator
+        source: redhat-operators
+        sourceNamespace: openshift-marketplace
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Wait for Cert Manager deployment
+  command: oc wait deployment -n cert-manager cert-manager --for=condition=Available --timeout=300s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  retries: 3
+  delay: 30
+  register: certmgr_wait
+  until: certmgr_wait.rc == 0
+
+# Prereq: JobSet operator (package name is "job-set", OwnNamespace install mode)
+- name: Create JobSet namespace and subscription
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: jobset-system
+      ---
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: jobset-operator
+        namespace: jobset-system
+      spec:
+        targetNamespaces:
+        - jobset-system
+      ---
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: job-set
+        namespace: jobset-system
+      spec:
+        channel: stable-v1.0
+        name: job-set
+        source: redhat-operators
+        sourceNamespace: openshift-marketplace
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Wait for JobSet operator deployment
+  command: oc wait deployment -n jobset-system jobset-operator --for=condition=Available --timeout=300s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  retries: 3
+  delay: 30
+  register: jobset_wait
+  until: jobset_wait.rc == 0
+
+# RHOAI operator
+- name: Check if RHOAI operator is installed
+  command: oc get deployment -n redhat-ods-operator rhods-operator
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: rhoai_check
+  failed_when: false
+  changed_when: false
+
+- name: Install RHOAI operator subscription
+  when: rhoai_check.rc != 0
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: redhat-ods-operator
+      ---
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: rhods-operator
+        namespace: redhat-ods-operator
+      ---
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: rhods-operator
+        namespace: redhat-ods-operator
+      spec:
+        channel: {{ rhoai_channel }}
+        name: rhods-operator
+        source: redhat-operators
+        sourceNamespace: openshift-marketplace
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Wait for RHOAI operator
+  command: oc wait deployment -n redhat-ods-operator rhods-operator --for=condition=Available --timeout=600s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  retries: 3
+  delay: 30
+  register: rhoai_wait
+  until: rhoai_wait.rc == 0
+
+- name: Create DSCInitialization and DataScienceCluster
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: dscinitialization.opendatahub.io/v1
+      kind: DSCInitialization
+      metadata:
+        name: default-dsci
+      spec:
+        applicationsNamespace: redhat-ods-applications
+      ---
+      apiVersion: datasciencecluster.opendatahub.io/v1
+      kind: DataScienceCluster
+      metadata:
+        name: default-dsc
+      spec:
+        components:
+          trainingoperator:
+            managementState: Managed
+          kserve:
+            managementState: Managed
+            serving:
+              managementState: Managed
+          ray:
+            managementState: Removed
+          dashboard:
+            managementState: Removed
+          workbenches:
+            managementState: Removed
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Wait for training operator deployment
+  command: >
+    oc wait deployment -n redhat-ods-applications
+    kubeflow-training-operator
+    --for=condition=Available --timeout=600s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  retries: 3
+  delay: 30
+  register: training_op_wait
+  until: training_op_wait.rc == 0
+
+- name: Report RHOAI 3.x status
+  debug:
+    msg: "RHOAI 3.x installed on {{ inventory_hostname }} (channel: {{ rhoai_channel }}) with training operator, Ray, KServe, dashboard, workbenches"

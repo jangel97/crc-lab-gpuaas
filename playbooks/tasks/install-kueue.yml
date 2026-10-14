@@ -9,12 +9,12 @@
 
 - name: Download Kueue manifest
   get_url:
-    url: "https://github.com/kubernetes-sigs/kueue/releases/download/v0.10.1/manifests.yaml"
-    dest: "/tmp/kueue-v0.10.1.yaml"
+    url: "https://github.com/kubernetes-sigs/kueue/releases/download/{{ kueue_version }}/manifests.yaml"
+    dest: "/tmp/kueue-{{ kueue_version }}.yaml"
   when: kueue_check.rc != 0
 
 - name: Install Kueue
-  command: oc apply --server-side -f /tmp/kueue-v0.10.1.yaml
+  command: oc apply --server-side -f /tmp/kueue-{{ kueue_version }}.yaml
   environment:
     KUBECONFIG: "{{ kubeconfig }}"
   when: kueue_check.rc != 0
@@ -27,6 +27,60 @@
   delay: 15
   register: kueue_wait
   until: kueue_wait.rc == 0
+
+- name: Patch Kueue config to only enable batch/job and pod integrations
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: kueue-manager-config
+        namespace: kueue-system
+      data:
+        controller_manager_config.yaml: |
+          apiVersion: config.kueue.x-k8s.io/v1beta2
+          kind: Configuration
+          health:
+            healthProbeBindAddress: :8081
+          metrics:
+            bindAddress: :8443
+          webhook:
+            port: 9443
+          leaderElection:
+            leaderElect: true
+            resourceName: c1f6bfd2.kueue.x-k8s.io
+          controller:
+            groupKindConcurrency:
+              Job.batch: 5
+              Pod: 5
+              Workload.kueue.x-k8s.io: 10
+              LocalQueue.kueue.x-k8s.io: 5
+              Cohort.kueue.x-k8s.io: 1
+              ClusterQueue.kueue.x-k8s.io: 5
+              ResourceFlavor.kueue.x-k8s.io: 1
+          clientConnection:
+            qps: 300
+            burst: 500
+          integrations:
+            frameworks:
+            - "batch/job"
+            - "pod"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: kueue_config_patch
+
+- name: Restart Kueue controller if config changed
+  command: oc rollout restart deployment kueue-controller-manager -n kueue-system
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  when: kueue_config_patch.changed
+
+- name: Wait for Kueue controller after config change
+  command: oc rollout status deployment kueue-controller-manager -n kueue-system --timeout=120s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  when: kueue_config_patch.changed
 
 - name: Report Kueue status
   debug:

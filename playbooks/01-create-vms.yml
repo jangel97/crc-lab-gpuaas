@@ -41,7 +41,7 @@
     become: true
     command: >
       virsh net-update default add ip-dhcp-host
-      '<host mac="{{ hostvars[item].vm_mac }}" ip="{{ hostvars[item].vm_ip }}"/>'
+      '<host mac="{{ hostvars[item].vm_mac }}" name="{{ hostvars[item].vm_name }}" ip="{{ hostvars[item].vm_ip }}"/>'
       --live --config
     loop: "{{ groups['clusters'] }}"
     register: dhcp_result
@@ -57,19 +57,25 @@
     - "{{ work_dir }}"
     - "{{ kubeconfig_dir }}"
 
-  - name: Download openshift-install
+  - name: Collect unique OCP versions
+    set_fact:
+      ocp_versions: "{{ groups['clusters'] | map('extract', hostvars, 'ocp_version') | select('defined') | unique | list }}"
+
+  - name: Download openshift-install for each OCP version
     get_url:
-      url: "{{ openshift_install_url }}"
-      dest: "/tmp/openshift-install-{{ ocp_version }}.tar.gz"
+      url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ item }}/openshift-install-linux.tar.gz"
+      dest: "/tmp/openshift-install-{{ item }}.tar.gz"
+    loop: "{{ ocp_versions }}"
 
-  - name: Extract openshift-install
-    unarchive:
-      src: "/tmp/openshift-install-{{ ocp_version }}.tar.gz"
-      dest: "{{ local_bin }}/"
-      remote_src: true
-      include: [openshift-install]
+  - name: Extract openshift-install per version
+    shell: |
+      cd /tmp && tar xzf openshift-install-{{ item }}.tar.gz openshift-install
+      mv /tmp/openshift-install {{ local_bin }}/openshift-install-{{ item }}
+    loop: "{{ ocp_versions }}"
+    args:
+      creates: "{{ local_bin }}/openshift-install-{{ item }}"
 
-  - name: Download oc client
+  - name: Download oc client (latest version)
     get_url:
       url: "{{ oc_client_url }}"
       dest: "/tmp/openshift-client-{{ ocp_version }}.tar.gz"
@@ -84,7 +90,7 @@
   tasks:
   - name: Create VMs from inventory
     include_tasks: tasks/create-vm.yml
-    loop: "{{ groups['clusters'] }}"
+    loop: "{{ target_clusters | default(groups['clusters']) }}"
     loop_control:
       loop_var: cluster
     vars:

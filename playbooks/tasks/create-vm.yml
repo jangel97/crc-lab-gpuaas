@@ -31,7 +31,7 @@
 
 - name: "{{ cluster }} | Generate agent ISO"
   command: >
-    {{ local_bin }}/openshift-install agent create image
+    {{ local_bin }}/openshift-install-{{ c.ocp_version | default(ocp_version) }} agent create image
     --dir {{ work_dir }}/{{ cluster }}
   environment:
     PATH: "{{ local_bin }}:{{ ansible_env.PATH }}"
@@ -120,7 +120,7 @@
     virsh start {{ c.vm_name }}
   args:
     executable: /bin/bash
-  when: c.gpu_passthrough | default(false) | bool
+  when: c.gpu_passthrough | default(false) | bool and vm_exists.rc != 0
   changed_when: true
 
 - name: "{{ cluster }} | Show VM status"

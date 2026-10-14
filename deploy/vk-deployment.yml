@@ -1,0 +1,53 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vk-gpu-provider
+  namespace: kube-system
+  labels:
+    app: vk-gpu-provider
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vk-gpu-provider
+  template:
+    metadata:
+      labels:
+        app: vk-gpu-provider
+    spec:
+      serviceAccountName: vk-gpu-provider
+      hostNetwork: true
+      containers:
+      - name: vk
+        image: quay.io/jmorenas/gpuaas-virtual-kubelet:latest
+        args:
+        - --nodename=gpu-worker
+        - --worker-kubeconfig=/etc/vk/kubeconfig
+        - --default-remote-storage-class=lvms-vg1
+        - --insecure-skip-tls-verify
+        - --kubelet-cert=/var/lib/kubelet/pki/kubelet-server-current.pem
+        - --kubelet-port=10350
+        - --v=2
+        env:
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        volumeMounts:
+        - name: worker-kubeconfig
+          mountPath: /etc/vk
+          readOnly: true
+        - name: kubelet-pki
+          mountPath: /var/lib/kubelet/pki
+          readOnly: true
+      volumes:
+      - name: worker-kubeconfig
+        secret:
+          secretName: worker-kubeconfig
+      - name: kubelet-pki
+        hostPath:
+          path: /var/lib/kubelet/pki
+          type: Directory

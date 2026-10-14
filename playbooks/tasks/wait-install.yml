@@ -15,7 +15,7 @@
 
 - name: "{{ cluster }} | Wait for agent-based install"
   command: >
-    {{ ansible_env.HOME }}/.local/bin/openshift-install agent wait-for install-complete
+    {{ local_bin }}/openshift-install-{{ c.ocp_version | default(ocp_version) }} agent wait-for install-complete
     --dir {{ work_dir }}/{{ cluster }}
     --log-level info
   async: 3600
@@ -46,6 +46,14 @@
   delay: 10
   until: vm_ip.stdout | length > 0
   changed_when: false
+
+- name: "{{ cluster }} | Ensure /etc/hosts entries"
+  become: true
+  lineinfile:
+    path: /etc/hosts
+    regexp: ".*api(-int)?\\.{{ cluster }}\\.{{ base_domain }}.*"
+    line: "{{ vm_ip.stdout }} api.{{ cluster }}.{{ base_domain }} api-int.{{ cluster }}.{{ base_domain }}"
+    state: present
 
 - name: "{{ cluster }} | Add to in-memory inventory"
   add_host:

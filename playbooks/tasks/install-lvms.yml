@@ -56,6 +56,11 @@
   until: lvms_csv.stdout == 'Succeeded'
   changed_when: false
 
+- name: Set LVMS device class name
+  set_fact:
+    lvms_device_class: "vg1"
+    lvms_device_class_default: true
+
 - name: Create LVMCluster
   command:
     cmd: oc apply -f -
@@ -68,8 +73,8 @@
       spec:
         storage:
           deviceClasses:
-          - name: vg1
-            default: true
+          - name: {{ lvms_device_class }}
+            default: {{ lvms_device_class_default }}
             thinPoolConfig:
               name: thin-pool-1
               sizePercent: 90
@@ -90,7 +95,7 @@
   changed_when: false
 
 - name: Verify StorageClass exists
-  command: oc get storageclass lvms-vg1
+  command: "oc get storageclass lvms-{{ lvms_device_class }}"
   environment:
     KUBECONFIG: "{{ kubeconfig }}"
   register: sc_check
@@ -98,4 +103,4 @@
 
 - name: Print StorageClass info
   debug:
-    msg: "LVMS StorageClass 'lvms-vg1' is available"
+    msg: "LVMS StorageClass 'lvms-{{ lvms_device_class }}' is available"

@@ -1,0 +1,15 @@
+---
+- name: Set up Submariner cross-cluster networking
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  environment:
+    PATH: "{{ local_bin }}:{{ lookup('env', 'PATH') }}"
+
+  tasks:
+  - name: Install subctl CLI
+    include_tasks: tasks/install-subctl.yml
+
+  - name: Deploy Submariner and verify connectivity
+    include_tasks: tasks/setup-submariner.yml

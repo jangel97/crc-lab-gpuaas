@@ -1,0 +1,51 @@
+---
+- name: Check if subctl is already installed
+  command: subctl version
+  register: subctl_check
+  failed_when: false
+  changed_when: false
+
+- name: Set subctl install needed
+  set_fact:
+    subctl_needs_install: >-
+      {{ subctl_check.rc != 0 or
+         ('release-' + submariner_version) not in (subctl_check.stdout | default('')) }}
+
+- name: Download subctl {{ submariner_version }}
+  get_url:
+    url: "https://github.com/submariner-io/subctl/releases/download/subctl-release-{{ submariner_version }}/subctl-release-{{ submariner_version }}-linux-amd64.tar.xz"
+    dest: /tmp/subctl.tar.xz
+    mode: '0644'
+  when: subctl_needs_install
+
+- name: Extract subctl binary
+  unarchive:
+    src: /tmp/subctl.tar.xz
+    dest: /tmp
+    remote_src: true
+  when: subctl_needs_install
+
+- name: Install subctl to local bin
+  copy:
+    src: /tmp/subctl-release-{{ submariner_version }}/subctl
+    dest: "{{ local_bin }}/subctl"
+    mode: '0755'
+  when: subctl_needs_install
+
+- name: Clean up download
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/subctl.tar.xz
+    - /tmp/subctl-release-{{ submariner_version }}
+  when: subctl_needs_install
+
+- name: Verify subctl version
+  command: subctl version
+  register: subctl_version
+  changed_when: false
+
+- name: Print subctl version
+  debug:
+    msg: "subctl {{ subctl_version.stdout }}"

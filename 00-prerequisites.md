@@ -349,7 +349,8 @@ cd ~/crc-lab-gpuaas
 ansible-playbook -i inventory.yml playbooks/01-create-vms.yml
 ansible-playbook -i inventory.yml playbooks/02-wait-and-discover.yml
 ansible-playbook -i inventory.yml playbooks/03-configure-clusters.yml
-ansible-playbook -i inventory.yml playbooks/04-peer-clusters.yml
+ansible-playbook -i inventory.yml playbooks/04-setup-virtual-kubelet.yml
+ansible-playbook -i inventory.yml playbooks/05-setup-submariner.yml
 ```
 
 ## Monitoring

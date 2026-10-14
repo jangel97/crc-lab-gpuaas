@@ -1,0 +1,70 @@
+---
+# Switch VM profiles: start the requested profile's VMs, shut down the rest.
+#
+# Usage:
+#   ansible-playbook playbooks/vm-power.yml -e target_profile=rhoai3
+#   ansible-playbook playbooks/vm-power.yml -e target_profile=rhoai2
+#   ansible-playbook playbooks/vm-power.yml -e target_profile=all      # start everything
+#   ansible-playbook playbooks/vm-power.yml -e target_profile=none     # shut down everything
+#
+# The worker VM is always started (profile: always) unless target_profile=none.
+
+- name: "Switch VM profile: {{ target_profile }}"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+  - name: Validate target_profile
+    assert:
+      that: target_profile is defined
+      fail_msg: "Usage: ansible-playbook playbooks/vm-power.yml -e target_profile=rhoai2|rhoai3|all|none"
+
+  - name: Determine desired state for each VM
+    set_fact:
+      vm_actions: >-
+        {%- set result = [] -%}
+        {%- for host in groups['clusters'] -%}
+          {%- set p = hostvars[host].profile | default('') -%}
+          {%- set vm = hostvars[host].vm_name -%}
+          {%- if target_profile == 'all' -%}
+            {%- set _ = result.append({'vm': vm, 'state': 'running'}) -%}
+          {%- elif target_profile == 'none' -%}
+            {%- set _ = result.append({'vm': vm, 'state': 'shut-off'}) -%}
+          {%- elif p == target_profile or p == 'always' -%}
+            {%- set _ = result.append({'vm': vm, 'state': 'running'}) -%}
+          {%- else -%}
+            {%- set _ = result.append({'vm': vm, 'state': 'shut-off'}) -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ result }}
+
+  - name: Shut down VMs not in profile '{{ target_profile }}'
+    command: virsh shutdown {{ item.vm }}
+    loop: "{{ vm_actions | selectattr('state', 'eq', 'shut-off') | list }}"
+    loop_control:
+      label: "{{ item.vm }}"
+    register: stop_result
+    failed_when: stop_result.rc != 0 and 'not running' not in stop_result.stderr and 'failed to get domain' not in stop_result.stderr
+    changed_when: stop_result.rc == 0
+
+  - name: Wait for VMs to shut down
+    pause:
+      seconds: 15
+    when: stop_result.changed | default(false)
+
+  - name: Start VMs for profile '{{ target_profile }}'
+    command: virsh start {{ item.vm }}
+    loop: "{{ vm_actions | selectattr('state', 'eq', 'running') | list }}"
+    loop_control:
+      label: "{{ item.vm }}"
+    register: start_result
+    failed_when: start_result.rc != 0 and 'already active' not in start_result.stderr
+    changed_when: start_result.rc == 0
+
+  - name: Summary
+    debug:
+      msg: >-
+        Profile '{{ target_profile }}' —
+        started: {{ vm_actions | selectattr('state', 'eq', 'running') | map(attribute='vm') | list | join(', ') }},
+        stopped: {{ vm_actions | selectattr('state', 'eq', 'shut-off') | map(attribute='vm') | list | join(', ') or 'none' }}

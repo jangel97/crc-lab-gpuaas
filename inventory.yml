@@ -2,11 +2,12 @@ all:
   vars:
     ocp_version: "4.22"
     base_domain: "local.lab"
-    liqo_version: "v1.2.0"
+    kueue_version: "v0.19.7"
 
     pull_secret_path: "{{ playbook_dir }}/../pull-secret.json"
     work_dir: "{{ playbook_dir }}/../.workdir"
     kubeconfig_dir: "{{ lookup('env', 'HOME') }}/.kube"
+    kubeconfig: "{{ kubeconfig_dir }}/{{ inventory_hostname }}"
     local_bin: "{{ lookup('env', 'HOME') }}/.local/bin"
     libvirt_pool: /var/lib/libvirt/images
     libvirt_network: default
@@ -15,13 +16,25 @@ all:
     openshift_install_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ ocp_version }}/openshift-install-linux.tar.gz"
     oc_client_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-{{ ocp_version }}/openshift-client-linux.tar.gz"
 
+    submariner_version: "0.24"
+
+    gaming_pc_host: "192.168.1.139"
+
+    vk_image: "quay.io/jmorenas/gpuaas-virtual-kubelet:latest"
+    vk_node_name: "gpu-worker"
+    vk_test_namespace: "vk-test"
+    vk_worker_namespace: "vk-workloads"
+
   children:
     clusters:
       hosts:
         tenant:
+          ocp_version: "4.22"
+          role: tenant
+          profile: rhoai2
           vm_name: sno-tenant
           vm_cpus: 12
-          vm_ram_mb: 16384
+          vm_ram_mb: 14336
           vm_disk_gb: 120
           vm_mac: "52:54:00:aa:bb:01"
           vm_ip: "192.168.122.10"
@@ -30,11 +43,68 @@ all:
           cluster_network_cidr: "10.128.0.0/14"
           cluster_network_prefix: 23
           service_network_cidr: "172.30.0.0/16"
+          rhoai_channel: stable-2.25
           components:
-            lvms: true
             rhoai: true
-            liqo: control_plane
+        tenant2:
+          ocp_version: "4.18"
+          role: tenant
+          profile: rhoai2
+          vm_name: sno-tenant2
+          vm_cpus: 10
+          vm_ram_mb: 16384
+          vm_disk_gb: 120
+          vm_mac: "52:54:00:aa:bb:03"
+          vm_ip: "192.168.122.12"
+          gpu_passthrough: false
+          data_disk_gb: 50
+          cluster_network_cidr: "10.136.0.0/14"
+          cluster_network_prefix: 23
+          service_network_cidr: "172.32.0.0/16"
+          rhoai_channel: stable-2.25
+          components:
+            rhoai: true
+        tenant-rhoai3:
+          ocp_version: "4.19"
+          role: tenant
+          profile: rhoai3
+          vm_name: sno-tenant-rhoai3
+          vm_cpus: 12
+          vm_ram_mb: 16384
+          vm_disk_gb: 120
+          vm_mac: "52:54:00:aa:bb:04"
+          vm_ip: "192.168.122.13"
+          gpu_passthrough: false
+          data_disk_gb: 50
+          cluster_network_cidr: "10.140.0.0/14"
+          cluster_network_prefix: 23
+          service_network_cidr: "172.33.0.0/16"
+          rhoai_channel: stable-3.5
+          components:
+            rhoai: true
+            kyverno: true
+        tenant2-rhoai3:
+          ocp_version: "4.19"
+          role: tenant
+          profile: rhoai3
+          vm_name: sno-tenant2-rhoai3
+          vm_cpus: 10
+          vm_ram_mb: 16384
+          vm_disk_gb: 120
+          vm_mac: "52:54:00:aa:bb:05"
+          vm_ip: "192.168.122.14"
+          gpu_passthrough: false
+          data_disk_gb: 50
+          cluster_network_cidr: "10.144.0.0/14"
+          cluster_network_prefix: 23
+          service_network_cidr: "172.34.0.0/16"
+          rhoai_channel: stable-3.4
+          components:
+            rhoai: true
         worker:
+          role: worker
+          profile: always
+          ocp_version: "4.22"
           vm_name: sno-worker
           vm_cpus: 8
           vm_ram_mb: 24576
@@ -44,10 +114,11 @@ all:
           gpu_passthrough: true
           gpu_pci_vga: "02:00.0"
           gpu_pci_audio: "02:00.1"
+          data_disk_gb: 50
           cluster_network_cidr: "10.132.0.0/14"
           cluster_network_prefix: 23
           service_network_cidr: "172.31.0.0/16"
           components:
+            lvms: true
             gpu_operator: true
             kueue: true
-            liqo: agent

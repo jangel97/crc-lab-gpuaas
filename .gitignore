@@ -1,2 +1,4 @@
 .workdir/
 pull-secret.json
+/vk-gpu-provider
+__pycache__/

@@ -1,0 +1,145 @@
+---
+# Broker lives on the GPU (worker) cluster — it's long-lived,
+# tied to physical hardware. Control clusters get rebuilt.
+
+- name: Deploy Submariner broker on GPU cluster
+  command: >
+    subctl deploy-broker
+    --kubeconfig {{ kubeconfig_dir }}/worker
+  args:
+    chdir: "{{ work_dir }}"
+  register: broker_deploy
+  changed_when: "'Deploying the broker' in broker_deploy.stdout"
+
+- name: Identify tenant clusters
+  set_fact:
+    tenant_clusters: "{{ groups['clusters'] | select('match', 'tenant') | list }}"
+
+- name: Join GPU cluster to broker
+  command: >
+    subctl join
+    --kubeconfig {{ kubeconfig_dir }}/worker
+    {{ work_dir }}/broker-info.subm
+    --clusterid gpu
+    --natt=false
+    --cable-driver libreswan
+  register: gpu_join
+  changed_when: "'Deploying submariner' in gpu_join.stdout"
+
+- name: Join tenant clusters to broker
+  command: >
+    subctl join
+    --kubeconfig {{ kubeconfig_dir }}/{{ item }}
+    {{ work_dir }}/broker-info.subm
+    --clusterid {{ item }}
+    --natt=false
+    --cable-driver libreswan
+  loop: "{{ tenant_clusters }}"
+  register: tenant_join
+  changed_when: "'Deploying submariner' in (tenant_join.stdout | default(''))"
+
+- name: Wait for Submariner tunnels to connect
+  shell: >
+    subctl show connections --kubeconfig {{ kubeconfig_dir }}/{{ item }} 2>&1
+  register: sub_conn
+  retries: 12
+  delay: 10
+  until: "'connected' in sub_conn.stdout"
+  changed_when: false
+  loop: "{{ tenant_clusters }}"
+
+- name: Print connection status
+  debug:
+    msg: "{{ item.stdout }}"
+  loop: "{{ sub_conn.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# Verify cross-cluster pod connectivity (worker ↔ first tenant)
+- name: Create verification pod on worker
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: submariner-verify
+        namespace: {{ vk_worker_namespace }}
+      spec:
+        containers:
+        - name: nginx
+          image: docker.io/library/nginx:latest
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+
+- name: Create verification pod on each tenant
+  command:
+    cmd: oc apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: submariner-verify
+        namespace: {{ vk_test_namespace }}
+      spec:
+        containers:
+        - name: nginx
+          image: docker.io/library/nginx:latest
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}"
+  loop: "{{ tenant_clusters }}"
+
+- name: Wait for worker verification pod
+  shell: >
+    oc wait pod/submariner-verify -n {{ vk_worker_namespace }}
+    --for=condition=Ready --timeout=120s
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+
+- name: Wait for tenant verification pods
+  shell: >
+    oc wait pod/submariner-verify -n {{ vk_test_namespace }}
+    --for=condition=Ready --timeout=120s
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}"
+  loop: "{{ tenant_clusters }}"
+
+- name: Get worker verification pod IP
+  shell: >
+    oc get pod submariner-verify -n {{ vk_worker_namespace }}
+    -o jsonpath='{.status.podIP}'
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+  register: worker_verify_ip
+  changed_when: false
+
+- name: Test cross-cluster connectivity (each tenant → worker)
+  shell: >
+    oc exec -n {{ vk_test_namespace }} submariner-verify --
+    curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10
+    http://{{ worker_verify_ip.stdout }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}"
+  loop: "{{ tenant_clusters }}"
+  register: conn_tests
+  retries: 3
+  delay: 5
+  until: conn_tests.stdout == '200'
+  changed_when: false
+
+- name: Delete worker verification pod
+  command: >
+    oc delete pod submariner-verify --ignore-not-found -n {{ vk_worker_namespace }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/worker"
+
+- name: Delete tenant verification pods
+  command: >
+    oc delete pod submariner-verify --ignore-not-found -n {{ vk_test_namespace }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}"
+  loop: "{{ tenant_clusters }}"
+
+- name: Print verification result
+  debug:
+    msg: "Submariner connectivity verified for {{ tenant_clusters | join(', ') }}"

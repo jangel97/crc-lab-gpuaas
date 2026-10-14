@@ -1,0 +1,1032 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/klog/v2"
+
+	dto "github.com/prometheus/client_model/go"
+	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
+	"github.com/virtual-kubelet/virtual-kubelet/node"
+	"github.com/virtual-kubelet/virtual-kubelet/node/api"
+	"github.com/virtual-kubelet/virtual-kubelet/node/api/statsv1alpha1"
+)
+
+const (
+	labelManagedBy       = "app.kubernetes.io/managed-by"
+	labelSourceNamespace = "vk.gpuaas.io/source-namespace"
+	labelSourceName      = "vk.gpuaas.io/source-name"
+	labelSourcePod       = "vk.gpuaas.io/source-pod"
+)
+
+type GPUProviderConfig struct {
+	NodeName                  string
+	ProviderID                string
+	WorkerNamespacePrefix     string
+	DefaultRemoteStorageClass string
+	TaintValue                string
+	NodeIP                    string
+	KubeletPort               int32
+	TenantClient              kubernetes.Interface
+	WorkerClient              kubernetes.Interface
+	WorkerRESTConfig          *rest.Config
+}
+
+type GPUProvider struct {
+	cfg        GPUProviderConfig
+	syncer     *ResourceSyncer
+	reconciler *DepReconciler
+
+	mu           sync.Mutex
+	managedPods  map[string]string      // tenant "namespace/name" -> worker pod name
+	podCache     map[string]*corev1.Pod // tenant "namespace/name" -> tenant-view pod with worker status
+	notifyCb      func(*corev1.Pod)
+	nodeNotifyCb  func(*corev1.Node)
+	lastResources corev1.ResourceList
+}
+
+func (p *GPUProvider) managedByValue() string {
+	return "vk-gpu-provider-" + p.cfg.ProviderID
+}
+
+func NewGPUProvider(cfg GPUProviderConfig) *GPUProvider {
+	managedBy := "vk-gpu-provider-" + cfg.ProviderID
+	p := &GPUProvider{
+		cfg:         cfg,
+		syncer:      NewResourceSyncer(cfg.TenantClient, cfg.WorkerClient, cfg.WorkerNamespacePrefix, cfg.DefaultRemoteStorageClass, managedBy),
+		managedPods: make(map[string]string),
+		podCache:    make(map[string]*corev1.Pod),
+	}
+	p.reconciler = NewDepReconciler(p.syncer, p.podCacheSnapshot, 2*time.Minute)
+	return p
+}
+
+func (p *GPUProvider) podCacheSnapshot() map[string]*corev1.Pod {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	snap := make(map[string]*corev1.Pod, len(p.podCache))
+	for k, v := range p.podCache {
+		snap[k] = v.DeepCopy()
+	}
+	return snap
+}
+
+// Compile-time interface checks.
+var (
+	_ node.PodLifecycleHandler = (*GPUProvider)(nil)
+	_ node.PodNotifier         = (*GPUProvider)(nil)
+	_ node.NodeProvider        = (*GPUProvider)(nil)
+)
+
+// --- PodLifecycleHandler ---
+
+func (p *GPUProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
+	// Returning an error causes the VK library to emit a ProviderCreateFailed event
+	// and requeue with exponential backoff (~1s → ~16min). The library controls the
+	// retry loop — we cannot stop it. Each retry is cheap (immediate return, no
+	// worker API calls). Returning nil instead would silently accept the pod as
+	// "created" even though nothing is dispatched, leaving it stuck with no status.
+	if isDaemonSetPod(pod) {
+		klog.Infof("Rejecting DaemonSet-owned pod %s/%s — virtual nodes do not run DaemonSets", pod.Namespace, pod.Name)
+		return errdefs.InvalidInput("DaemonSet-owned pods are not supported on virtual nodes")
+	}
+	if isSystemNamespace(pod.Namespace) {
+		klog.Infof("Rejecting pod %s/%s from system namespace", pod.Namespace, pod.Name)
+		return errdefs.InvalidInput("pods from system namespaces are not dispatched to worker clusters")
+	}
+	key := pod.Namespace + "/" + pod.Name
+
+	p.mu.Lock()
+	_, exists := p.managedPods[key]
+	p.mu.Unlock()
+	if exists {
+		return nil
+	}
+
+	// TODO(upstream): VK library calls PopulateEnvironmentVariables before
+	// CreatePod, resolving secretKeyRef/configMapKeyRef to literal values.
+	// This breaks cross-cluster providers that need the original refs for
+	// resource sync. It also fails on status.podIP/hostIP fieldRefs (used by
+	// Istio sidecar's INSTANCE_IP env var) because podFieldSelectorRuntimeValue
+	// doesn't handle status fields. Propose fixes in virtual-kubelet/virtual-kubelet:
+	//   1. Support status.podIP/hostIP/podIPs in internal/podutils/env.go
+	//   2. Opt-out mechanism for PopulateEnvironmentVariables
+	// Workaround: re-read the pod from the API server (for ref resolution);
+	// disable Istio sidecar injection on VK-bound pods (for fieldRef issue).
+	freshPod, err := p.cfg.TenantClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("re-read pod %s: %w", key, err)
+	}
+	pod = freshPod
+
+	klog.Infof("New pod assigned to virtual node: %s", key)
+
+	workerNS := workerNamespace(p.cfg.WorkerNamespacePrefix, pod.Namespace)
+	if err := p.ensureNamespace(ctx, workerNS); err != nil {
+		klog.Errorf("Failed to ensure worker namespace %s: %v", workerNS, err)
+		p.storeAndNotify(pod, corev1.PodFailed, "NamespaceCreateFailed", err.Error())
+		return nil
+	}
+
+	pvcMap, err := p.syncer.ValidateAndSyncPVCs(ctx, pod)
+	if err != nil {
+		klog.Errorf("PVC validation failed for %s: %v", key, err)
+		p.storeAndNotify(pod, corev1.PodFailed, "InvalidPVCStorageClass", err.Error())
+		return nil
+	}
+
+	if err := p.syncer.SyncResources(ctx, pod); err != nil {
+		klog.Errorf("Failed to read tenant resources for %s: %v", key, err)
+		return fmt.Errorf("sync resources for %s: %w", key, err)
+	}
+
+	if err := p.syncer.SyncHeadlessServices(ctx, pod); err != nil {
+		klog.Warningf("Initial headless service sync for %s incomplete (reconciler will retry): %v", key, err)
+	}
+
+	workerPod := p.transformPod(pod, workerNS, pvcMap)
+	created, err := p.cfg.WorkerClient.CoreV1().Pods(workerNS).Create(ctx, workerPod, metav1.CreateOptions{})
+	if err != nil {
+		if errors.IsAlreadyExists(err) {
+			klog.Infof("Worker pod already exists for %s", key)
+			p.mu.Lock()
+			p.managedPods[key] = workerPod.Name
+			p.podCache[key] = pod.DeepCopy()
+			p.mu.Unlock()
+			return nil
+		}
+		klog.Errorf("Failed to create worker pod for %s: %v", key, err)
+		return err
+	}
+
+	klog.Infof("Created worker pod %s/%s for tenant pod %s", workerNS, created.Name, key)
+	p.mu.Lock()
+	p.managedPods[key] = created.Name
+	p.podCache[key] = pod.DeepCopy()
+	p.mu.Unlock()
+
+	p.reconciler.Enqueue(pod.Namespace)
+	return nil
+}
+
+func (p *GPUProvider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
+	return nil
+}
+
+func (p *GPUProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
+	key := pod.Namespace + "/" + pod.Name
+
+	p.mu.Lock()
+	wpName, exists := p.managedPods[key]
+	delete(p.managedPods, key)
+	delete(p.podCache, key)
+	p.mu.Unlock()
+
+	if !exists {
+		return nil
+	}
+
+	workerNS := workerNamespace(p.cfg.WorkerNamespacePrefix, pod.Namespace)
+	klog.Infof("Tenant pod deleted: %s, cleaning up worker pod %s", key, wpName)
+
+	err := p.cfg.WorkerClient.CoreV1().Pods(workerNS).Delete(ctx, wpName, metav1.DeleteOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		klog.Errorf("Failed to delete worker pod %s: %v", wpName, err)
+	}
+
+	p.reconciler.Enqueue(pod.Namespace)
+	return nil
+}
+
+func (p *GPUProvider) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
+	key := namespace + "/" + name
+	p.mu.Lock()
+	pod, ok := p.podCache[key]
+	p.mu.Unlock()
+	if !ok {
+		return nil, errdefs.NotFoundf("pod %s not found", key)
+	}
+	return pod.DeepCopy(), nil
+}
+
+func (p *GPUProvider) GetPodStatus(ctx context.Context, namespace, name string) (*corev1.PodStatus, error) {
+	key := namespace + "/" + name
+	p.mu.Lock()
+	pod, ok := p.podCache[key]
+	p.mu.Unlock()
+	if !ok {
+		return nil, errdefs.NotFoundf("pod %s not found", key)
+	}
+	return pod.Status.DeepCopy(), nil
+}
+
+func (p *GPUProvider) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pods := make([]*corev1.Pod, 0, len(p.podCache))
+	for _, pod := range p.podCache {
+		pods = append(pods, pod.DeepCopy())
+	}
+	return pods, nil
+}
+
+// --- PodNotifier ---
+
+func (p *GPUProvider) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
+	p.mu.Lock()
+	p.notifyCb = cb
+	p.mu.Unlock()
+}
+
+// --- NodeProvider ---
+
+func (p *GPUProvider) Ping(ctx context.Context) error {
+	_, err := p.cfg.WorkerClient.Discovery().ServerVersion()
+	return err
+}
+
+func (p *GPUProvider) NotifyNodeStatus(ctx context.Context, cb func(*corev1.Node)) {
+	p.mu.Lock()
+	p.nodeNotifyCb = cb
+	p.mu.Unlock()
+	go p.nodeStatusUpdater(ctx)
+}
+
+// --- nodeutil.Provider stubs (not used — no kubelet API server) ---
+
+func (p *GPUProvider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
+	key := namespace + "/" + podName
+	p.mu.Lock()
+	wpName, ok := p.managedPods[key]
+	p.mu.Unlock()
+	if !ok {
+		return nil, errdefs.NotFoundf("pod %s not found", key)
+	}
+
+	workerNS := workerNamespace(p.cfg.WorkerNamespacePrefix, namespace)
+	logOpts := &corev1.PodLogOptions{
+		Container:  containerName,
+		Follow:     opts.Follow,
+		Previous:   opts.Previous,
+		Timestamps: opts.Timestamps,
+	}
+	if opts.Tail > 0 {
+		t := int64(opts.Tail)
+		logOpts.TailLines = &t
+	}
+	if opts.LimitBytes > 0 {
+		l := int64(opts.LimitBytes)
+		logOpts.LimitBytes = &l
+	}
+	if opts.SinceSeconds > 0 {
+		s := int64(opts.SinceSeconds)
+		logOpts.SinceSeconds = &s
+	}
+	if !opts.SinceTime.IsZero() {
+		t := metav1.NewTime(opts.SinceTime)
+		logOpts.SinceTime = &t
+	}
+
+	stream, err := p.cfg.WorkerClient.CoreV1().Pods(workerNS).GetLogs(wpName, logOpts).Stream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("logs for %s/%s container %q: %w", workerNS, wpName, containerName, err)
+	}
+	return stream, nil
+}
+
+func (p *GPUProvider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
+	key := namespace + "/" + podName
+	p.mu.Lock()
+	wpName, ok := p.managedPods[key]
+	p.mu.Unlock()
+	if !ok {
+		return errdefs.NotFoundf("pod %s not found", key)
+	}
+
+	if p.cfg.WorkerClient == nil || p.cfg.WorkerRESTConfig == nil {
+		return fmt.Errorf("exec for %s: worker client not configured", key)
+	}
+
+	workerNS := workerNamespace(p.cfg.WorkerNamespacePrefix, namespace)
+
+	req := p.cfg.WorkerClient.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Namespace(workerNS).
+		Name(wpName).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: containerName,
+			Command:   cmd,
+			Stdin:     attach.Stdin() != nil,
+			Stdout:    attach.Stdout() != nil,
+			Stderr:    attach.Stderr() != nil,
+			TTY:       attach.TTY(),
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(p.cfg.WorkerRESTConfig, "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("exec for %s/%s: %w", workerNS, wpName, err)
+	}
+
+	opts := remotecommand.StreamOptions{
+		Stdin:  attach.Stdin(),
+		Stdout: attach.Stdout(),
+		Stderr: attach.Stderr(),
+		Tty:    attach.TTY(),
+	}
+	if resize := attach.Resize(); resize != nil {
+		opts.TerminalSizeQueue = &termSizeQueue{ch: resize}
+	}
+
+	return exec.StreamWithContext(ctx, opts)
+}
+
+type termSizeQueue struct {
+	ch <-chan api.TermSize
+}
+
+func (t *termSizeQueue) Next() *remotecommand.TerminalSize {
+	size, ok := <-t.ch
+	if !ok {
+		return nil
+	}
+	return &remotecommand.TerminalSize{Width: size.Width, Height: size.Height}
+}
+
+func (p *GPUProvider) AttachToContainer(ctx context.Context, namespace, podName, containerName string, attach api.AttachIO) error {
+	return fmt.Errorf("not supported")
+}
+
+func (p *GPUProvider) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
+	return nil, fmt.Errorf("not supported")
+}
+
+func (p *GPUProvider) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily, error) {
+	return nil, fmt.Errorf("not supported")
+}
+
+func (p *GPUProvider) PortForward(ctx context.Context, namespace, pod string, port int32, stream io.ReadWriteCloser) error {
+	return fmt.Errorf("not supported")
+}
+
+// --- Worker informer (our own, not managed by the VK library) ---
+
+func (p *GPUProvider) startWorkerInformer(ctx context.Context) error {
+	workerLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.WorkerClient.CoreV1().RESTClient(),
+		"pods",
+		metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {
+			options.LabelSelector = labelManagedBy + "=" + p.managedByValue()
+		},
+	)
+	_, workerInformer := cache.NewInformer(workerLW, &corev1.Pod{}, 30*time.Second,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) { p.handleWorkerPodEvent(obj) },
+			UpdateFunc: func(_, obj interface{}) { p.handleWorkerPodEvent(obj) },
+			DeleteFunc: func(obj interface{}) { p.handleWorkerPodDelete(obj) },
+		},
+	)
+
+	go workerInformer.Run(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), workerInformer.HasSynced) {
+		return fmt.Errorf("worker informer cache sync failed")
+	}
+	klog.Info("Worker pod informer synced, managedPods rebuilt from existing worker pods")
+	return nil
+}
+
+func (p *GPUProvider) startPVCInformer(ctx context.Context) {
+	pvcLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.TenantClient.CoreV1().RESTClient(),
+		"persistentvolumeclaims",
+		metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {},
+	)
+	_, pvcInformer := cache.NewInformer(pvcLW, &corev1.PersistentVolumeClaim{}, 5*time.Minute,
+		cache.ResourceEventHandlerFuncs{
+			DeleteFunc: func(obj interface{}) {
+				pvc, ok := obj.(*corev1.PersistentVolumeClaim)
+				if !ok {
+					tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+					if !ok {
+						return
+					}
+					pvc, ok = tombstone.Obj.(*corev1.PersistentVolumeClaim)
+					if !ok {
+						return
+					}
+				}
+				if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != catapultStorageClass {
+					return
+				}
+				klog.Infof("Control PVC deleted: %s/%s, cleaning up execution PVC", pvc.Namespace, pvc.Name)
+				if err := p.syncer.CleanupExecutionPVC(ctx, pvc.Namespace, pvc.Name); err != nil {
+					klog.Errorf("Failed to cleanup execution PVC for %s/%s: %v", pvc.Namespace, pvc.Name, err)
+				}
+			},
+		},
+	)
+	go pvcInformer.Run(ctx.Done())
+	klog.Info("Control PVC deletion informer started")
+}
+
+func (p *GPUProvider) startTenantInformers(ctx context.Context) {
+	enqueueNS := func(obj interface{}, resource string) {
+		meta, ok := obj.(metav1.Object)
+		if !ok {
+			return
+		}
+		ns := meta.GetNamespace()
+		if ns == "" || isSystemNamespace(ns) {
+			return
+		}
+		p.mu.Lock()
+		hasManaged := false
+		for key := range p.podCache {
+			podNS, _, _ := splitKey(key)
+			if podNS == ns {
+				hasManaged = true
+				break
+			}
+		}
+		p.mu.Unlock()
+		if hasManaged {
+			klog.V(4).Infof("Tenant %s %s/%s changed, enqueuing namespace for reconciliation", resource, ns, meta.GetName())
+			p.reconciler.Enqueue(ns)
+		}
+	}
+
+	secretLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.TenantClient.CoreV1().RESTClient(), "secrets", metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {},
+	)
+	_, secretInf := cache.NewInformer(secretLW, &corev1.Secret{}, 30*time.Second,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) { enqueueNS(obj, "secret") },
+			UpdateFunc: func(_, obj interface{}) { enqueueNS(obj, "secret") },
+		},
+	)
+	go secretInf.Run(ctx.Done())
+
+	cmLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.TenantClient.CoreV1().RESTClient(), "configmaps", metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {},
+	)
+	_, cmInf := cache.NewInformer(cmLW, &corev1.ConfigMap{}, 5*time.Minute,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) { enqueueNS(obj, "configmap") },
+			UpdateFunc: func(_, obj interface{}) { enqueueNS(obj, "configmap") },
+		},
+	)
+	go cmInf.Run(ctx.Done())
+
+	svcLW := cache.NewFilteredListWatchFromClient(
+		p.cfg.TenantClient.CoreV1().RESTClient(), "services", metav1.NamespaceAll,
+		func(options *metav1.ListOptions) {},
+	)
+	_, svcInf := cache.NewInformer(svcLW, &corev1.Service{}, 5*time.Minute,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) { enqueueNS(obj, "service") },
+			UpdateFunc: func(_, obj interface{}) { enqueueNS(obj, "service") },
+		},
+	)
+	go svcInf.Run(ctx.Done())
+
+	klog.Info("Tenant resource informers started (secrets, configmaps, services)")
+}
+
+// --- Internal ---
+
+func (p *GPUProvider) handleWorkerPodEvent(obj interface{}) {
+	workerPod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+
+	// TODO(upstream): PodController clears knownPods on delete, but if the
+	// worker informer fires an update for a terminating pod before it's fully
+	// gone, GetPod returns stale data and the library skips CreatePod for the
+	// replacement. Propose a DeleteFunc handler or provider lifecycle hook.
+	if workerPod.DeletionTimestamp != nil {
+		return
+	}
+
+	sourceNS := workerPod.Labels[labelSourceNamespace]
+	sourceName := workerPod.Labels[labelSourceName]
+	if sourceNS == "" || sourceName == "" {
+		return
+	}
+
+	key := sourceNS + "/" + sourceName
+
+	p.mu.Lock()
+	if _, exists := p.managedPods[key]; !exists {
+		p.managedPods[key] = workerPod.Name
+		klog.Infof("Recovered managed pod mapping: %s -> %s", key, workerPod.Name)
+	}
+	cached := p.podCache[key]
+	p.mu.Unlock()
+
+	var tenantPod *corev1.Pod
+	if cached != nil {
+		tenantPod = cached.DeepCopy()
+	} else {
+		freshPod, err := p.cfg.TenantClient.CoreV1().Pods(sourceNS).Get(context.TODO(), sourceName, metav1.GetOptions{})
+		if err != nil {
+			klog.Warningf("Cannot read tenant pod %s for metadata: %v", key, err)
+			tenantPod = &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sourceName,
+					Namespace: sourceNS,
+				},
+			}
+		} else {
+			if freshPod.DeletionTimestamp != nil {
+				klog.V(4).Infof("Skipping status update for deleting tenant pod %s", key)
+				return
+			}
+			tenantPod = freshPod
+		}
+	}
+	tenantPod.Status = *workerPod.Status.DeepCopy()
+	tenantPod.DeletionTimestamp = nil
+	tenantPod.DeletionGracePeriodSeconds = nil
+
+	p.mu.Lock()
+	p.podCache[key] = tenantPod
+	cb := p.notifyCb
+	p.mu.Unlock()
+
+	if cb != nil {
+		cb(tenantPod)
+	}
+}
+
+func (p *GPUProvider) handleWorkerPodDelete(obj interface{}) {
+	workerPod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		workerPod, ok = tombstone.Obj.(*corev1.Pod)
+		if !ok {
+			return
+		}
+	}
+
+	sourceNS := workerPod.Labels[labelSourceNamespace]
+	sourceName := workerPod.Labels[labelSourceName]
+	if sourceNS == "" || sourceName == "" {
+		return
+	}
+
+	key := sourceNS + "/" + sourceName
+
+	p.mu.Lock()
+	_, managed := p.managedPods[key]
+	cached := p.podCache[key]
+	p.mu.Unlock()
+
+	if !managed {
+		return
+	}
+
+	klog.Infof("Worker pod deleted externally: %s/%s (tenant pod %s)", workerPod.Namespace, workerPod.Name, key)
+
+	var tenantPod *corev1.Pod
+	if cached != nil {
+		tenantPod = cached.DeepCopy()
+	} else {
+		tenantPod = &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: sourceName, Namespace: sourceNS},
+		}
+	}
+	tenantPod.Status.Phase = corev1.PodFailed
+	tenantPod.Status.Reason = "WorkerPodPreempted"
+	tenantPod.Status.Message = fmt.Sprintf("Worker pod %s/%s was deleted (likely preempted by Kueue)", workerPod.Namespace, workerPod.Name)
+
+	p.mu.Lock()
+	p.podCache[key] = tenantPod
+	cb := p.notifyCb
+	p.mu.Unlock()
+
+	if cb != nil {
+		cb(tenantPod)
+	}
+}
+
+func (p *GPUProvider) storeAndNotify(pod *corev1.Pod, phase corev1.PodPhase, reason, message string) {
+	failedPod := pod.DeepCopy()
+	failedPod.Status.Phase = phase
+	failedPod.Status.Reason = reason
+	failedPod.Status.Message = message
+
+	key := pod.Namespace + "/" + pod.Name
+	p.mu.Lock()
+	p.podCache[key] = failedPod
+	cb := p.notifyCb
+	p.mu.Unlock()
+
+	if cb != nil {
+		cb(failedPod)
+	}
+}
+
+// fetchWorkerResources queries all schedulable nodes on the worker cluster and
+// aggregates their Allocatable resources into a single ResourceList.
+func (p *GPUProvider) fetchWorkerResources(ctx context.Context) (corev1.ResourceList, error) {
+	nodeList, err := p.cfg.WorkerClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list worker nodes: %w", err)
+	}
+
+	totalCPU := resource.Quantity{}
+	totalMemory := resource.Quantity{}
+	totalPods := resource.Quantity{}
+	totalGPU := resource.Quantity{}
+	totalEphemeral := resource.Quantity{}
+
+	for _, n := range nodeList.Items {
+		if n.Spec.Unschedulable {
+			continue
+		}
+		if hasBlockingTaints(n.Spec.Taints) {
+			continue
+		}
+		alloc := n.Status.Allocatable
+		if alloc == nil {
+			continue
+		}
+		if v, ok := alloc[corev1.ResourceCPU]; ok {
+			totalCPU.Add(v)
+		}
+		if v, ok := alloc[corev1.ResourceMemory]; ok {
+			totalMemory.Add(v)
+		}
+		if v, ok := alloc[corev1.ResourcePods]; ok {
+			totalPods.Add(v)
+		}
+		if v, ok := alloc[corev1.ResourceName("nvidia.com/gpu")]; ok {
+			totalGPU.Add(v)
+		}
+		if v, ok := alloc[corev1.ResourceEphemeralStorage]; ok {
+			totalEphemeral.Add(v)
+		}
+	}
+
+	result := corev1.ResourceList{
+		corev1.ResourceCPU:    totalCPU,
+		corev1.ResourceMemory: totalMemory,
+		corev1.ResourcePods:   totalPods,
+	}
+	if !totalGPU.IsZero() {
+		result[corev1.ResourceName("nvidia.com/gpu")] = totalGPU
+	}
+	if !totalEphemeral.IsZero() {
+		result[corev1.ResourceEphemeralStorage] = totalEphemeral
+	}
+	return result, nil
+}
+
+func (p *GPUProvider) buildNodeStatus(resources corev1.ResourceList) corev1.NodeStatus {
+	nodeIP := p.cfg.NodeIP
+	if nodeIP == "" {
+		nodeIP = "127.0.0.1"
+	}
+	return corev1.NodeStatus{
+		Phase: corev1.NodeRunning,
+		DaemonEndpoints: corev1.NodeDaemonEndpoints{
+			KubeletEndpoint: corev1.DaemonEndpoint{Port: p.cfg.KubeletPort},
+		},
+		Capacity:    resources.DeepCopy(),
+		Allocatable: resources.DeepCopy(),
+		Conditions: []corev1.NodeCondition{
+			{
+				Type: corev1.NodeReady, Status: corev1.ConditionTrue,
+				LastHeartbeatTime: metav1.Now(), LastTransitionTime: metav1.Now(),
+				Reason: "KubeletReady", Message: "vk-gpu-provider is ready",
+			},
+			{Type: corev1.NodeMemoryPressure, Status: corev1.ConditionFalse, LastHeartbeatTime: metav1.Now(), LastTransitionTime: metav1.Now()},
+			{Type: corev1.NodeDiskPressure, Status: corev1.ConditionFalse, LastHeartbeatTime: metav1.Now(), LastTransitionTime: metav1.Now()},
+			{Type: corev1.NodePIDPressure, Status: corev1.ConditionFalse, LastHeartbeatTime: metav1.Now(), LastTransitionTime: metav1.Now()},
+		},
+		NodeInfo: corev1.NodeSystemInfo{
+			OperatingSystem: "linux",
+			Architecture:    "amd64",
+			KubeletVersion:  "v1.31.0-vk",
+		},
+		Addresses: []corev1.NodeAddress{
+			{Type: corev1.NodeInternalIP, Address: nodeIP},
+		},
+	}
+}
+
+func (p *GPUProvider) updateNodeStatus(ctx context.Context) {
+	resources, err := p.fetchWorkerResources(ctx)
+	if err != nil {
+		klog.Warningf("Failed to fetch worker resources: %v", err)
+		return
+	}
+
+	p.mu.Lock()
+	changed := !resourceListsEqual(p.lastResources, resources)
+	if changed {
+		p.lastResources = resources.DeepCopy()
+	}
+	cb := p.nodeNotifyCb
+	p.mu.Unlock()
+
+	if !changed || cb == nil {
+		return
+	}
+
+	cb(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: p.cfg.NodeName,
+			Labels: map[string]string{
+				"type":                   "virtual-kubelet",
+				"kubernetes.io/role":     "agent",
+				"kubernetes.io/hostname": p.cfg.NodeName,
+				"kubernetes.io/os":       "linux",
+				"kubernetes.io/arch":     "amd64",
+				"node.kubernetes.io/gpu": "true",
+			},
+		},
+		Status: p.buildNodeStatus(resources),
+	})
+}
+
+func (p *GPUProvider) nodeStatusUpdater(ctx context.Context) {
+	p.updateNodeStatus(ctx)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.updateNodeStatus(ctx)
+		}
+	}
+}
+
+// ConfigureNode sets up the virtual node spec with GPU capacity and VK taints.
+// Fetches real resources from the worker cluster; falls back to defaults if unavailable.
+func (p *GPUProvider) ConfigureNode(n *corev1.Node) {
+	if n.Labels == nil {
+		n.Labels = make(map[string]string)
+	}
+	n.Labels["kubernetes.io/os"] = "linux"
+	n.Labels["kubernetes.io/arch"] = "amd64"
+	n.Labels["node.kubernetes.io/gpu"] = "true"
+
+	n.Spec.Taints = []corev1.Taint{
+		{Key: "virtual-kubelet.io/provider", Value: p.cfg.TaintValue, Effect: corev1.TaintEffectNoSchedule},
+		{Key: "virtual-kubelet.io/provider", Value: p.cfg.TaintValue, Effect: corev1.TaintEffectNoExecute},
+	}
+
+	resources, err := p.fetchWorkerResources(context.TODO())
+	if err != nil {
+		klog.Warningf("Could not fetch worker resources at startup, using defaults: %v", err)
+		resources = corev1.ResourceList{
+			corev1.ResourceCPU:                     resource.MustParse("8"),
+			corev1.ResourceMemory:                  resource.MustParse("24Gi"),
+			corev1.ResourcePods:                    resource.MustParse("20"),
+			corev1.ResourceName("nvidia.com/gpu"):  resource.MustParse("1"),
+		}
+	} else {
+		klog.Infof("Virtual node resources from worker cluster: %v", resources)
+	}
+
+	n.Status = p.buildNodeStatus(resources)
+}
+
+// --- Pod transformation (unchanged) ---
+
+func (p *GPUProvider) ensureNamespace(ctx context.Context, ns string) error {
+	_, err := p.cfg.WorkerClient.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
+	if err == nil {
+		return nil
+	}
+	if !errors.IsNotFound(err) {
+		return err
+	}
+	nsObj := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ns,
+			Labels: map[string]string{
+				labelManagedBy: p.managedByValue(),
+			},
+		},
+	}
+	_, err = p.cfg.WorkerClient.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{})
+	if errors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
+func workerPodName(namespace, name string) string {
+	return fmt.Sprintf("%s--%s", namespace, name)
+}
+
+func workerNamespace(prefix, tenantNS string) string {
+	return prefix + tenantNS
+}
+
+func isSystemNamespace(ns string) bool {
+	return strings.HasPrefix(ns, "openshift-") ||
+		strings.HasPrefix(ns, "kube-") ||
+		strings.HasPrefix(ns, "redhat-ods-") ||
+		ns == "default" ||
+		ns == "kueue-system"
+}
+
+func resourceListsEqual(a, b corev1.ResourceList) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		bv, ok := b[k]
+		if !ok || v.Cmp(bv) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func hasBlockingTaints(taints []corev1.Taint) bool {
+	for _, t := range taints {
+		if t.Effect != corev1.TaintEffectNoSchedule && t.Effect != corev1.TaintEffectNoExecute {
+			continue
+		}
+		if t.Key == "nvidia.com/gpu" || t.Key == "node-role.kubernetes.io/worker" {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isDaemonSetPod(pod *corev1.Pod) bool {
+	for _, ref := range pod.OwnerReferences {
+		if ref.Kind == "DaemonSet" {
+			return true
+		}
+	}
+	return false
+}
+
+
+var labelSkipSet = map[string]bool{
+	labelManagedBy: true,
+}
+
+var labelSkipPrefixes = []string{
+	"openshift.io/",
+	"pod-security.kubernetes.io/",
+}
+
+var annotationSkipPrefixes = []string{
+	"openshift.io/",
+	"kubernetes.io/",
+	"k8s.ovn.org/",
+}
+
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *GPUProvider) transformPod(pod *corev1.Pod, workerNS string, pvcNameMap map[string]string) *corev1.Pod {
+	workerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      workerPodName(pod.Namespace, pod.Name),
+			Namespace: workerNS,
+			Labels: map[string]string{
+				labelManagedBy:       p.managedByValue(),
+				labelSourceNamespace: pod.Namespace,
+				labelSourceName:      pod.Name,
+			},
+			Annotations: map[string]string{},
+		},
+		Spec: *pod.Spec.DeepCopy(),
+	}
+
+	for k, v := range pod.Labels {
+		if labelSkipSet[k] {
+			continue
+		}
+		if hasAnyPrefix(k, labelSkipPrefixes) {
+			continue
+		}
+		workerPod.Labels[k] = v
+	}
+
+	for k, v := range pod.Annotations {
+		if hasAnyPrefix(k, annotationSkipPrefixes) {
+			continue
+		}
+		workerPod.Annotations[k] = v
+	}
+
+	workerPod.Spec.NodeName = ""
+	workerPod.Spec.NodeSelector = nil
+	workerPod.Spec.Affinity = nil
+	workerPod.Spec.Tolerations = nil
+	workerPod.Spec.SchedulerName = ""
+	workerPod.Spec.Priority = nil
+	workerPod.Spec.PriorityClassName = ""
+
+	if workerPod.Spec.ServiceAccountName == "default" || workerPod.Spec.ServiceAccountName == "" {
+		workerPod.Spec.ServiceAccountName = "default"
+	}
+
+	workerPod.Spec.Volumes = filterVolumes(workerPod.Spec.Volumes)
+
+	for i, v := range workerPod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil {
+			if execName, ok := pvcNameMap[v.PersistentVolumeClaim.ClaimName]; ok {
+				workerPod.Spec.Volumes[i].PersistentVolumeClaim.ClaimName = execName
+			}
+		}
+	}
+
+	for i := range workerPod.Spec.Containers {
+		workerPod.Spec.Containers[i].VolumeMounts = filterVolumeMounts(
+			workerPod.Spec.Containers[i].VolumeMounts,
+			workerPod.Spec.Volumes,
+		)
+	}
+	for i := range workerPod.Spec.InitContainers {
+		workerPod.Spec.InitContainers[i].VolumeMounts = filterVolumeMounts(
+			workerPod.Spec.InitContainers[i].VolumeMounts,
+			workerPod.Spec.Volumes,
+		)
+	}
+
+	// SecurityContext is passed through as-is. We cannot distinguish
+	// user-set fields from SCC-injected ones (see docs/security-context-handling.md).
+	// If a value is incompatible with the worker cluster's SCC/PSA,
+	// the pod fails visibly rather than losing user intent silently.
+
+	return workerPod
+}
+
+func filterVolumes(volumes []corev1.Volume) []corev1.Volume {
+	var filtered []corev1.Volume
+	for _, v := range volumes {
+		if v.Projected != nil {
+			isServiceAccountProjected := false
+			for _, src := range v.Projected.Sources {
+				if src.ServiceAccountToken != nil {
+					isServiceAccountProjected = true
+					break
+				}
+			}
+			if isServiceAccountProjected {
+				continue
+			}
+		}
+		if strings.HasPrefix(v.Name, "kube-api-access") {
+			continue
+		}
+		filtered = append(filtered, v)
+	}
+	return filtered
+}
+
+func filterVolumeMounts(mounts []corev1.VolumeMount, volumes []corev1.Volume) []corev1.VolumeMount {
+	volumeNames := make(map[string]bool)
+	for _, v := range volumes {
+		volumeNames[v.Name] = true
+	}
+
+	var filtered []corev1.VolumeMount
+	for _, m := range mounts {
+		if volumeNames[m.Name] {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered
+}

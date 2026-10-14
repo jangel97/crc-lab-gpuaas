@@ -9,9 +9,15 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 filterwarnings = [
     "ignore::urllib3.exceptions.InsecureRequestWarning",
 ]
 markers = [
-    "liqo: Liqo multi-cluster federation tests",
+    "vk: Virtual Kubelet cross-cluster GPU dispatch tests",
+    "rhoai: RHOAI workload dispatch via Virtual Kubelet",
+    "networking: Cross-cluster networking via Submariner (Service/Route to remote GPU pod)",
+    "kueue: Kueue admission control and cross-tenant preemption via VK",
+    "rhoai3: RHOAI 3.x single-tenant e2e workload tests via VK",
+    "rhoai3_mt: RHOAI 3.x multi-tenant concurrent access and Kueue tests via VK",
 ]
