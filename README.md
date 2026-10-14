@@ -229,6 +229,70 @@ memory, GPU, pods) only when values change.
 For full implementation details, see
 [docs/vk-architecture.md](docs/vk-architecture.md).
 
+### PVC handling (Catapult storage)
+
+Cross-cluster storage is opt-in. Users declare a PVC with `storageClassName:
+catapult` on the tenant — a no-provisioner class that stays Pending. When a
+pod references it, VK creates a real execution PVC on the worker with actual
+storage. Non-catapult PVCs are rejected.
+
+```mermaid
+graph TD
+    subgraph tenant["Tenant Cluster"]
+        user["User creates PVC\nstorageClass: catapult"]
+        ctrl_pvc["Control PVC\nstatus: Pending\n(no provisioner)"]
+        pod_t["Pod references PVC\nnodeName: gpu-worker"]
+        user --> ctrl_pvc
+        ctrl_pvc --> pod_t
+    end
+
+    subgraph vk_sync["VK Provider"]
+        validate{"storageClass\n== catapult?"}
+        reject["Pod Failed\nInvalidPVCStorageClass"]
+        create_exec["Create execution PVC\n{ns}--{name}\nstorageClass: lvms-vg1"]
+        remap["transformPod()\nremap claimName\ncheckpoint → ns--checkpoint"]
+
+        validate -->|No| reject
+        validate -->|Yes| create_exec
+        create_exec --> remap
+    end
+
+    subgraph worker["Worker Cluster"]
+        exec_pvc["Execution PVC\nstatus: Bound\n(real storage)"]
+        pod_w["Worker pod mounts\nexecution PVC"]
+        exec_pvc --> pod_w
+    end
+
+    pod_t --> validate
+    remap --> pod_w
+
+    subgraph lifecycle["PVC Lifecycle"]
+        direction LR
+        pod_del["Pod deleted →\nexecution PVC persists"]
+        pod_restart["Pod restarts →\nsame execution PVC reused"]
+        pvc_del["Control PVC deleted →\nPVC informer deletes\nexecution PVC"]
+    end
+
+    style tenant fill:#0f3460,stroke:#16213e,color:#fff
+    style worker fill:#1a1a2e,stroke:#e94560,color:#fff
+    style vk_sync fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style lifecycle fill:#2b2d42,stroke:#444,color:#fff
+    style reject fill:#e94560,stroke:#1a1a2e,color:#fff
+```
+
+Key difference from secrets/configmaps: **PVC lifecycle is independent of pod
+lifecycle.** Secrets and configmaps are synced per-pod and garbage-collected
+by the reconciler. PVCs persist across pod restarts — a training job can
+checkpoint, complete, and a new job can mount the same PVC. Only deleting the
+control PVC on the tenant triggers cleanup of the execution PVC (via the PVC
+deletion informer).
+
+The remote StorageClass defaults to `lvms-vg1` but can be overridden per-PVC
+via the `catapult.redhat.com/remote-storage-class` annotation.
+
+For the full PVC design (failure modes, namespace collision handling, future
+proxy PV provisioner), see [docs/pvc-architecture.md](docs/pvc-architecture.md).
+
 ## Lab setup
 
 ### Prerequisites
