@@ -287,6 +287,13 @@ checkpoint, complete, and a new job can mount the same PVC. Only deleting the
 control PVC on the tenant triggers cleanup of the execution PVC (via the PVC
 deletion informer).
 
+The control PVC on the tenant **stays Pending forever** — this is by design.
+The `catapult` StorageClass uses `kubernetes.io/no-provisioner`, so no storage
+is provisioned on the tenant. This works because VK is the kubelet for the
+virtual node: it never does volume mounts, it creates the execution PVC on the
+worker instead. Training operators (PyTorchJob, KServe, etc.) don't check PVC
+binding state — they watch pod status, which VK controls directly.
+
 The remote StorageClass defaults to `lvms-vg1` but can be overridden per-PVC
 via the `catapult.redhat.com/remote-storage-class` annotation.
 
