@@ -188,6 +188,18 @@ The worker pod informer fires on every Add/Update of managed pods.
 tenant pod and calls the `NotifyPods` callback. The VK library then calls
 `GetPodStatus` and patches the tenant pod via its own status sync loop.
 
+**DeletionTimestamp guard:** If the worker pod has `DeletionTimestamp` set,
+the handler skips the status update entirely. This prevents race conditions
+where a pod being deleted gets stale status written back. When syncing
+status, `DeletionTimestamp` and `DeletionGracePeriodSeconds` are explicitly
+cleared on the cached tenant pod to avoid the VK library's `UpdateStatus`
+failing with `field is immutable`.
+
+**Graceful degradation:** If the tenant pod cannot be read from the API
+(e.g., cache miss after restart), the handler constructs a minimal tenant
+pod object with just name and namespace, then copies the worker status
+onto it. This ensures status sync continues even during partial failures.
+
 The cached tenant pod preserves the original tenant pod metadata (labels,
 annotations, UID, etc.) while replacing status with the worker pod's status,
 which includes:
@@ -199,15 +211,23 @@ which includes:
 - **PodIP, PodIPs** — the worker pod's real IP, which makes Services/Routes
   on the tenant work via Submariner (see submariner-architecture.md §3.1)
 
+**Worker pod deletion (preemption):** When a worker pod is deleted externally
+(e.g., by Kueue preemption), `handleWorkerPodDelete` sets the tenant pod to
+`Phase: Failed`, `Reason: WorkerPodPreempted` with a message identifying the
+deleted worker pod. This surfaces the preemption clearly on the tenant side.
+
 ## Deletion and Cleanup
 
-When a tenant pod is deleted (`handleTenantPodDeleted`):
+When a tenant pod is deleted (`DeletePod`):
 
-1. Remove entry from `managedPods` map
-2. Delete the worker pod
-3. `CleanupResources`: list secrets, configmaps, service accounts, and
-   headless services on worker matching the management labels for this
-   source namespace + pod name, delete each one
+1. Remove entry from `managedPods` and `podCache` maps
+2. Delete the worker pod from the worker cluster
+3. Enqueue the namespace for reconciliation
+
+The reconciler then computes the desired state for the namespace (union of
+all resource references from remaining pods) and garbage-collects any
+worker-side resources no longer referenced by any pod. This is a
+namespace-level operation, not per-pod cleanup.
 
 Execution PVCs are **not** deleted on pod deletion — they persist across pod
 restarts. They are only deleted when the control PVC itself is deleted (handled
@@ -253,12 +273,37 @@ If the VK pod restarts, it loses its in-memory `managedPods` map. Recovery:
 3. By the time the tenant pod informer starts, the map is populated.
    Existing pods are recognized as already managed → skipped (no re-dispatch).
 
-## Informer Resync
+## Informers and Reconciler
 
-Both informers use a 30-second resync period. The control PVC informer uses
-5 minutes (PVC deletion is less time-sensitive). All event handlers are
-idempotent — repeated events for the same pod produce no additional API calls
-if state hasn't changed.
+The provider starts five informers and a reconciler:
+
+| Informer | Cluster | Resync | Purpose |
+|----------|---------|--------|---------|
+| Worker pod informer | Worker | 30s | Status sync back to tenant; rebuilds `managedPods` on restart |
+| Control PVC informer | Tenant | 5 min | Deletes execution PVC when control PVC deleted |
+| Secret informer | Tenant | 30s | Enqueues namespace when secrets change (cert-manager, etc.) |
+| ConfigMap informer | Tenant | 5 min | Enqueues namespace when configmaps change |
+| Service informer | Tenant | 5 min | Enqueues namespace when services change |
+
+The **DepReconciler** runs a rate-limited workqueue with periodic resync
+every 2 minutes. It is triggered by:
+
+- `CreatePod` — enqueues namespace for deferred resource sync
+- `DeletePod` — enqueues namespace for garbage collection
+- Tenant informers — secret/configmap/service changes enqueue namespace
+  (only if namespace has managed pods)
+- Periodic resync — re-enqueues all active namespaces every 2 minutes
+
+**Reconciliation cycle:**
+1. Snapshot `podCache`, filter pods in the target namespace
+2. Compute desired state: union of all resource references across pods
+3. Sync missing resources (secrets, configmaps, SAs, headless services)
+4. Garbage-collect orphaned resources (actual minus desired)
+5. On failure: rate-limited re-enqueue (exponential backoff up to ~16 min)
+6. On success: forget from queue (reset backoff)
+
+All event handlers are idempotent — repeated events for the same pod
+produce no additional API calls if state hasn't changed.
 
 ## Per-Tenant Worker Namespaces
 
@@ -512,9 +557,15 @@ Stream response back to kubectl
 - Port 10350 (must differ from real kubelet on 10250)
 - Privileged SCC for the VK service account (OpenShift)
 
-**Supported operations:** `GetContainerLogs` (full logs, follow, tail,
-since, timestamps, limit-bytes). `RunInContainer`, `AttachToContainer`,
-and `PortForward` return "not supported".
+**Supported operations:**
+- `GetContainerLogs` — full logs, follow, tail, since, timestamps, limit-bytes
+- `RunInContainer` — exec proxy via SPDY. Looks up the worker pod, builds
+  an exec request to the worker API server using `remotecommand.NewSPDYExecutor`,
+  and streams stdin/stdout/stderr/resize between the caller and the worker pod.
+  This enables operators like TrustyAI to exec into VK-dispatched pods
+  transparently (`kubectl exec` on the tenant is proxied to the worker).
+
+`AttachToContainer` and `PortForward` return "not supported".
 
 ## CLI Flags
 
