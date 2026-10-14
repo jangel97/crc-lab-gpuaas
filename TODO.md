@@ -12,16 +12,22 @@
 
 ## Upstream contributions
 
-- [ ] **Contribute `status.podIP`/`hostIP`/`podIPs` fieldRef support to
+- [x] **Contribute `status.podIP`/`hostIP`/`podIPs` fieldRef support to
   virtual-kubelet.** Fix `internal/podutils/env.go` →
-  `podFieldSelectorRuntimeValue`. Once merged, delete `clientwrap.go`.
+  `podFieldSelectorRuntimeValue`. **Merged:**
+  [virtual-kubelet#1451](https://github.com/virtual-kubelet/virtual-kubelet/pull/1451).
+  TODO: delete `clientwrap.go` once we bump to a VK release that includes this.
 
 - [ ] **Contribute `tolerations`/`nodeName` fields to LMEvalJob CRD.**
   Currently only `spec.pod.affinity` is exposed. Remove Kyverno workaround
-  once available.
+  once available. **Open:**
+  [trustyai-service-operator#1005](https://github.com/trustyai-explainability/trustyai-service-operator/pull/1005),
+  [docs#85](https://github.com/trustyai-explainability/trustyai-explainability.github.io/pull/85).
 
 - [ ] **Contribute `routeAgentNodeSelector` to Submariner CR.** Allows
   excluding virtual nodes from routeagent DaemonSet without a webhook.
+  **Open:**
+  [submariner-operator#4301](https://github.com/submariner-io/submariner-operator/pull/4301).
 
 ## Production readiness
 
