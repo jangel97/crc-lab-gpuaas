@@ -808,7 +808,7 @@ tests/rhoai_3/e2e/test_workloads.py::test_kserve_raw_inference_via_vk         PA
 tests/rhoai_3/e2e/test_workloads.py::test_notebook_cr_via_vk                  SKIPPED (workbenches Removed)
 tests/rhoai_3/e2e/test_workloads.py::test_pytorchjob_checkpoint_with_pvc      PASSED
 tests/rhoai_3/e2e/test_workloads.py::test_rayjob_via_vk                       SKIPPED (KubeRay not running)
-tests/rhoai_3/e2e/test_tfjob_via_vk                                           SKIPPED (TF 2.19 no sm_120)
+tests/rhoai_3/e2e/test_workloads.py::test_tfjob_via_vk                        SKIPPED (TF 2.19 no sm_120)
 tests/rhoai_3/e2e/test_workloads.py::test_xgboostjob_via_vk                   PASSED
 tests/rhoai_3/e2e/test_workloads.py::test_raycluster_via_vk                   SKIPPED (KubeRay not running)
 tests/rhoai_3/e2e/test_workloads.py::test_dsp_pipeline_via_vk                 SKIPPED (No StorageClass)
