@@ -293,6 +293,29 @@ via the `catapult.redhat.com/remote-storage-class` annotation.
 For the full PVC design (failure modes, namespace collision handling, future
 proxy PV provisioner), see [docs/pvc-architecture.md](docs/pvc-architecture.md).
 
+### What is NOT synced
+
+**Roles and RoleBindings** are not synced to the worker. VK syncs the
+ServiceAccount itself (so the pod can start), but not the RBAC policy
+attached to it. This only matters for pods that make in-cluster Kubernetes
+API calls using their SA token — the token authenticates against the worker
+API server where the Role/RoleBinding don't exist, so the request is denied.
+
+Pure compute workloads (training, inference, evaluation) never call the
+Kubernetes API, so this has no impact on them. It would only affect
+workloads like sidecar controllers or pipeline runners that query pod
+status. This is by design — syncing RBAC across clusters would open
+privilege escalation risks.
+
+**SecurityContext is passed through as-is.** On OpenShift, the SCC admission
+controller mutates SecurityContext fields (runAsUser, seLinuxOptions,
+fsGroup) before VK sees the pod. VK cannot distinguish user-set fields
+from SCC-injected ones, so it passes everything through unchanged. If the
+tenant's SCC-assigned values are incompatible with the worker's security
+policy, the pod fails visibly on the worker. In practice this works because
+both clusters run OpenShift with similar SCC configurations. See
+[docs/security-context-handling.md](docs/security-context-handling.md).
+
 ## Lab setup
 
 ### Prerequisites
