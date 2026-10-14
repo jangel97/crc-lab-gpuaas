@@ -1379,6 +1379,23 @@ to the VK service account.
 
 ---
 
+## Production Readiness Gaps
+
+| # | Gap | Current state | What to do | Priority |
+|---|-----|---------------|------------|----------|
+| 1 | **Worker RBAC is cluster-wide** | `vk-remote-sa` has a ClusterRoleBinding granting CRUD on secrets/configmaps/PVCs/services/SAs across all worker namespaces. | Extend `ensureNamespace` to create a namespaced RoleBinding in each new per-tenant namespace. Reduce the ClusterRole to namespace creation + node reads only. | High |
+| 2 | **SecurityContext pass-through** | SCC-mutated fields from the tenant (e.g., MCS labels, UID ranges) are passed unchanged to the worker. If the worker's SCC policy is incompatible, the pod fails. | Strip SCC-injected fields (`runAsUser`, `seLinuxOptions`, `fsGroup`) from the pod spec before creating the worker pod. Let the worker's SCC admission controller re-assign values. Requires distinguishing user-set fields from SCC-injected ones — see [security-context-handling.md](security-context-handling.md). | High |
+| 3 | **Worker namespace garbage collection** | Per-tenant worker namespaces are created on demand but never deleted. Over time, orphaned namespaces accumulate if tenants are decommissioned. | Add a periodic reconciler that deletes worker namespaces with no active pods and no recent activity (e.g., no pods created in the last 24h). | Medium |
+| 4 | **LMEvalJob CRD lacks tolerations/nodeName** | Kyverno MutatingPolicy injects VK tolerations as a workaround. | Contribute upstream CRD enhancement to expose `tolerations` and `nodeName` in `LMEvalPodSpec`. Remove Kyverno workaround once available. | Medium |
+| 5 | **Submariner routeagent cosmetic pod** | VK skips DaemonSet pods, but the routeagent pod stays `Pending` on the virtual node. No functional impact but may trigger monitoring alerts. | Contribute upstream `routeAgentNodeSelector` field to Submariner CR, or deploy a mutating webhook that injects a nodeAffinity anti-rule for `type=virtual-kubelet` on routeagent pods. | Low |
+| 6 | **RBAC resources not synced** | Roles/RoleBindings are not synced to the worker. Pods making in-cluster API calls with a synced SA get denied. | By design — syncing RBAC risks privilege escalation. Document as a known constraint. If needed, implement an opt-in annotation (`vk.gpuaas.io/sync-rbac: "true"`) that syncs Roles/RoleBindings for explicitly opted-in namespaces. | Low |
+| 7 | **KServe with Istio sidecar** | Istio sidecar injection adds a Multus annotation that fails on the worker (no OSSM). Pod stuck in `ContainerCreating`. | Requires Istio multi-cluster mesh (primary-remote) — a separate effort. Not needed for RHOAI 3.x (dropped OSSM). For 2.x, disable sidecar injection on VK-targeted pods. | Low |
+| 8 | **Single-GPU lab** | Multi-pod distributed training DNS mechanism validated (S13), but actual multi-worker PyTorchJob not tested. Kueue fair-sharing untested. | Test in a multi-GPU environment. Validate multi-worker PyTorchJob with NCCL/Gloo backends. Test Kueue `borrowWithinCohort` and multi-ClusterQueue policies. | Medium |
+| 9 | **No HA validation** | All clusters are single-node. VK runs as a single-replica Deployment. | Test VK with multiple replicas behind leader election. Test Submariner with multi-node clusters. Validate Kueue behavior during VK failover. | Medium |
+| 10 | **Kubelet API requires privileged SCC** | VK Deployment needs `hostNetwork: true` + `hostPath` for kubelet TLS cert. Requires `privileged` SCC on OpenShift. | Investigate alternatives: dedicated TLS cert via cert-manager (no hostPath), node port service (no hostNetwork). May not be fully avoidable if kubelet API must bind on the node IP. | Low |
+
+---
+
 ## Architecture Reference
 
 | Document | What it covers |
