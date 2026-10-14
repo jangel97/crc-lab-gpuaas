@@ -6,20 +6,50 @@
 CRDs, dashboards) stays on each tenant. Only bare compute pods land on the
 shared GPU worker — no RHOAI installed there, just GPU Operator + Kueue.
 
-```
-Tenant clusters (any RHOAI version)          Shared GPU cluster
-┌──────────────────────┐                     ┌──────────────────────┐
-│  RHOAI 2.x (OCP 4.22)│──── VK ──────────>│                      │
-│  operators, CRDs,     │                    │  GPU Operator        │
-│  dashboard            │                    │  Kueue (quota)       │
-└──────────────────────┘                     │  Kyverno (policy)    │
-┌──────────────────────┐                     │                      │
-│  RHOAI 3.x (OCP 4.19)│──── VK ──────────>│  No RHOAI installed  │
-│  operators, CRDs,     │                    │  Just runs GPU pods  │
-│  dashboard            │                    │                      │
-└──────────────────────┘                     └──────────────────────┘
-  Each tenant has its own VK instance          Per-tenant namespaces
-  pointing to the same GPU cluster             prevent cross-talk
+```mermaid
+graph LR
+    subgraph tenant1["Tenant 1 — RHOAI 2.x (OCP 4.22)"]
+        rhoai2[RHOAI Operators<br/>Training, KServe,<br/>Notebooks, DSP]
+        vk1[Virtual Kubelet]
+        rhoai2 -->|creates pods| vk1
+    end
+
+    subgraph tenant2["Tenant 2 — RHOAI 3.x (OCP 4.19)"]
+        rhoai3[RHOAI Operators<br/>Training, KServe,<br/>LMEval]
+        vk2[Virtual Kubelet]
+        rhoai3 -->|creates pods| vk2
+    end
+
+    subgraph worker["Shared GPU Cluster (no RHOAI)"]
+        gpu[GPU Operator<br/>RTX 5090]
+        kueue[Kueue<br/>quota + preemption]
+        kyverno[Kyverno<br/>priority labels]
+        ns1[vk-prefix1-ns<br/>Tenant 1 pods]
+        ns2[vk-prefix2-ns<br/>Tenant 2 pods]
+        kueue -.->|admits| ns1
+        kueue -.->|admits| ns2
+    end
+
+    vk1 -->|sync resources<br/>+ create pod| ns1
+    vk2 -->|sync resources<br/>+ create pod| ns2
+    ns1 -.->|status sync| vk1
+    ns2 -.->|status sync| vk2
+
+    subgraph submariner["Submariner IPsec Tunnel"]
+        tunnel[L3 connectivity]
+    end
+
+    tenant1 <-->|Services, Routes,<br/>inference endpoints| tunnel
+    tenant2 <-->|Services, Routes,<br/>inference endpoints| tunnel
+    tunnel <--> worker
+
+    style worker fill:#1a1a2e,stroke:#e94560,color:#fff
+    style tenant1 fill:#0f3460,stroke:#16213e,color:#fff
+    style tenant2 fill:#0f3460,stroke:#16213e,color:#fff
+    style submariner fill:#533483,stroke:#2b2d42,color:#fff
+    style gpu fill:#e94560,stroke:#1a1a2e,color:#fff
+    style kueue fill:#2b2d42,stroke:#e94560,color:#fff
+    style kyverno fill:#2b2d42,stroke:#e94560,color:#fff
 ```
 
 ### What the spike proves
@@ -61,19 +91,30 @@ Users and operators don't know the pod ran elsewhere. The training operator
 creates a PyTorchJob, the pod runs on a remote GPU, status comes back —
 the operator marks the job Succeeded.
 
-```
-Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
-+----- sno-tenant VM --------+    +----- sno-worker VM --------+
-|  12 vCPU, 16 GB RAM        |    |  8 vCPU, 24 GB RAM         |
-|                            |    |  GPU Operator (RTX 5090)   |
-|  VK Deployment             |    |  Kueue + Kyverno (quota)  |
-|    registers virtual node  |    |  LVMS (local storage)      |
-|    "gpu-worker" (1 GPU)    |    |                             |
-|                            |    |  per-tenant namespaces     |
-|  scheduler ──> virtual node +-->|    {prefix}{tenant-ns}      |
-|                            |    |    synced secrets/cms/sas   |
-|  status synced back <───── ─+<--|    real pods running here   |
-+-----------------------------+    +-----------------------------+
+```mermaid
+sequenceDiagram
+    participant User as User / Operator
+    participant Tenant as Tenant API Server
+    participant VK as Virtual Kubelet
+    participant Worker as Worker API Server
+    participant GPU as GPU (RTX 5090)
+
+    User->>Tenant: Create PyTorchJob / InferenceService / Notebook
+    Tenant->>Tenant: Operator creates pod<br/>(nodeName: gpu-worker)
+    Tenant->>VK: Pod assigned to virtual node
+
+    VK->>Worker: Create namespace {prefix}{tenant-ns}
+    VK->>Worker: Sync secrets, configmaps, SAs, services
+    VK->>Worker: Create pod (scheduling fields cleared)
+
+    Worker->>Worker: Kyverno adds queue + priority labels
+    Worker->>Worker: Kueue gates → admits pod
+    Worker->>GPU: Pod runs on GPU
+
+    GPU-->>Worker: Container completes
+    Worker-->>VK: Status sync (informer)
+    VK-->>Tenant: Update pod status (Succeeded)
+    Tenant-->>User: Operator sees job Succeeded
 ```
 
 ## Lab setup
