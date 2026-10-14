@@ -37,7 +37,7 @@ Tenant clusters (any RHOAI version)          Shared GPU cluster
 ### What it doesn't prove (yet)
 
 - Full multi-GPU distributed training (mechanism works, need >1 GPU to test end-to-end)
-- Knative-managed KServe (no Serverless operator in test environment)
+- Knative-managed KServe — RHOAI 2.x only. RHOAI 3.x dropped Knative/OSSM and uses RawDeployment exclusively (already validated). On 2.x, Knative injects a queue-proxy sidecar that talks back to the tenant's activator/autoscaler — unclear if that works when the pod runs on the worker via Submariner.
 - RBAC sync across clusters (by design — avoids privilege escalation)
 - Production HA (single-node clusters in lab)
 
