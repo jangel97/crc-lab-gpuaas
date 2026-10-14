@@ -12,41 +12,22 @@ enables Services and Routes to reach remote GPU pods.
 
 ```mermaid
 graph TD
-    subgraph host["Gaming PC · Intel Ultra 9 285K · 62 GB RAM · Ubuntu 24.04"]
-        direction TB
-        subgraph tenants["Tenant Clusters"]
-            direction LR
-            subgraph t1["sno-tenant"]
-                t1_spec["12 vCPU · 14 GB RAM\nOCP 4.22 · RHOAI 2.x\nVK → gpu-worker (1 GPU)"]
-            end
-            subgraph t2["sno-tenant2"]
-                t2_spec["10 vCPU · 16 GB RAM\nOCP 4.18 · RHOAI 2.x\nVK → gpu-worker (1 GPU)"]
-            end
-            subgraph t3["sno-tenant-rhoai3"]
-                t3_spec["12 vCPU · 16 GB RAM\nOCP 4.19 · RHOAI 3.x\nVK → gpu-worker (1 GPU)"]
-            end
-        end
+    subgraph host["Gaming PC · Intel Ultra 9 285K · 62 GB · Ubuntu 24.04"]
+        t1["**sno-tenant**\n12 vCPU · 14 GB\nOCP 4.22 · RHOAI 2.x\nVK → gpu-worker"]
+        t2["**sno-tenant2**\n10 vCPU · 16 GB\nOCP 4.18 · RHOAI 2.x\nVK → gpu-worker"]
+        t3["**sno-tenant-rhoai3**\n12 vCPU · 16 GB\nOCP 4.19 · RHOAI 3.x\nVK → gpu-worker"]
+        w["**sno-worker**\n8 vCPU · 24 GB\nOCP 4.22 · RTX 5090\nGPU Operator · Kueue\nKyverno · LVMS"]
 
-        subgraph w["sno-worker"]
-            w_spec["8 vCPU · 24 GB RAM\nOCP 4.22\nGPU Operator (RTX 5090)\nKueue · Kyverno · LVMS"]
-        end
-
-        t1 <-->|"IPsec tunnel"| w
-        t2 <-->|"IPsec tunnel"| w
-        t3 <-->|"IPsec tunnel"| w
+        t1 <-->|"Submariner IPsec"| w
+        t2 <-->|"Submariner IPsec"| w
+        t3 <-->|"Submariner IPsec"| w
     end
 
-    subm["Submariner v0.24\nLibreswan IPsec · UDP 4500"]
-    t1 ~~~ subm
-    subm ~~~ w
-
     style host fill:#0f3460,stroke:#16213e,color:#fff
-    style tenants fill:#1a3a6b,stroke:#2a5298,color:#fff
-    style t1 fill:#2b2d42,stroke:#444,color:#fff
-    style t2 fill:#2b2d42,stroke:#444,color:#fff
-    style t3 fill:#2b2d42,stroke:#444,color:#fff
+    style t1 fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style t2 fill:#1a3a6b,stroke:#2a5298,color:#fff
+    style t3 fill:#1a3a6b,stroke:#2a5298,color:#fff
     style w fill:#1a1a2e,stroke:#e94560,color:#fff
-    style subm fill:#533483,stroke:#7b5ea7,color:#fff
 ```
 
 | Component | Tenant (sno-tenant) | Tenant 2 (sno-tenant2) | Tenant RHOAI3 (sno-tenant-rhoai3) | Worker (sno-worker) |
