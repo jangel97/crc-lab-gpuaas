@@ -13,16 +13,13 @@ graph TD
         subgraph t1["RHOAI 2.x · OCP 4.22"]
             ops1["Training · KServe\nNotebooks · DSP"]
             vk1["Virtual Kubelet"]
+            sm1["Submariner\ngateway + routeagent"]
         end
         subgraph t2["RHOAI 3.x · OCP 4.19"]
             ops2["Training · KServe\nLMEval · Ray"]
             vk2["Virtual Kubelet"]
+            sm2["Submariner\ngateway + routeagent"]
         end
-    end
-
-    subgraph sub["Submariner · IPsec tunnel"]
-        direction LR
-        net["L3 cross-cluster networking\nServices · Routes · Inference endpoints"]
     end
 
     subgraph gpu_cluster["Shared GPU Cluster (no RHOAI)"]
@@ -32,6 +29,7 @@ graph TD
             gpu_op["GPU Operator\nRTX 5090"]
             kueue["Kueue\nquota · preemption"]
             kyverno["Kyverno\npriority labels"]
+            sm3["Submariner\ngateway + routeagent"]
         end
         subgraph namespaces["Per-tenant namespaces"]
             direction LR
@@ -48,16 +46,18 @@ graph TD
     vk2 -->|"sync + dispatch"| ns2
     ns1 -.->|status| vk1
     ns2 -.->|status| vk2
-    tenants <--> sub
-    sub <--> gpu_cluster
+    sm1 <-->|"IPsec tunnel\nServices · Routes · inference"| sm3
+    sm2 <-->|"IPsec tunnel\nServices · Routes · inference"| sm3
 
     style tenants fill:#0f3460,stroke:#16213e,color:#fff
     style t1 fill:#1a3a6b,stroke:#2a5298,color:#fff
     style t2 fill:#1a3a6b,stroke:#2a5298,color:#fff
-    style sub fill:#533483,stroke:#2b2d42,color:#fff
     style gpu_cluster fill:#1a1a2e,stroke:#e94560,color:#fff
     style infra fill:#2b2d42,stroke:#444,color:#fff
     style namespaces fill:#2b2d42,stroke:#444,color:#fff
+    style sm1 fill:#533483,stroke:#7b5ea7,color:#fff
+    style sm2 fill:#533483,stroke:#7b5ea7,color:#fff
+    style sm3 fill:#533483,stroke:#7b5ea7,color:#fff
 ```
 
 ### What the spike proves
