@@ -21,6 +21,30 @@ Gaming PC (Intel Ultra 9 285K, 62 GB RAM, Ubuntu 24.04)
 +-----------------------------+    +-----------------------------+
 ```
 
+## The Question
+
+**Can we use Virtual Kubelet to decouple GPU execution from the RHOAI control
+plane, so multiple tenants (RHOAI 2.x and 3.x) share a single GPU cluster
+governed by Kueue?**
+
+### Yes.
+
+This spike proves it end-to-end. The RHOAI control plane (operators, CRDs,
+dashboards) stays on each tenant cluster. Only bare compute pods land on the
+shared GPU worker — no RHOAI installed there, just GPU Operator + Kueue.
+
+| What works | Evidence |
+|------------|----------|
+| **Version decoupling** | RHOAI 2.x (OCP 4.22) and RHOAI 3.x (OCP 4.19) both dispatch GPU workloads to the same worker. Each tenant's VK instance operates independently via its own worker namespace prefix. |
+| **Parallel execution** | Both test suites run simultaneously against the same GPU. PyTorchJob, KServe inference, XGBoostJob from different RHOAI versions execute concurrently — no coordination or mutual awareness between tenants. |
+| **Operator transparency** | Training operators (PyTorchJob, XGBoostJob, TFJob), KServe, Notebooks, LMEval, DSP — all work without modification. Operators create pods on the tenant, VK dispatches them, status syncs back, operators see success. |
+| **Kueue quota enforcement** | Kueue on the worker gates, admits, and preempts GPU workloads across tenants. Priority is admin-controlled via namespace labels — tenants cannot escalate. |
+| **Cross-cluster networking** | Submariner provides L3 connectivity. Services, Routes, and inference endpoints on the tenant reach GPU pods on the worker transparently. Tunnel self-heals after gateway failure. |
+| **Multi-pod distributed training** | Headless Service sync + DNS field passthrough enables inter-pod DNS resolution on the worker. Training operators use short hostnames that resolve via the synced headless Service in the worker namespace. Mechanism validated; full multi-GPU end-to-end deferred to a multi-GPU environment (lab has 1 GPU). |
+
+For the full spike assessment with all 22 validated scenarios, gaps, and design
+considerations, see [docs/spike-assessment.md](docs/spike-assessment.md).
+
 ## How It Works
 
 1. VK registers a virtual node `gpu-worker` on the tenant with `nvidia.com/gpu: 1`
