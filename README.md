@@ -75,7 +75,6 @@ graph TD
 ### What it doesn't prove (yet)
 
 - Full multi-GPU distributed training (mechanism works, need >1 GPU to test end-to-end)
-- KServe with full Istio service mesh — Knative dispatch works (S20, RHOAI 2.x), but Istio sidecar injection must be disabled (no Istio control plane on worker). RHOAI 3.x dropped Knative/OSSM entirely and uses RawDeployment exclusively (already validated).
 - RBAC sync across clusters (by design — avoids privilege escalation)
 - Production HA (single-node clusters in lab)
 
