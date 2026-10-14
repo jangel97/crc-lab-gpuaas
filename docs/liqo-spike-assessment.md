@@ -160,7 +160,7 @@ python -m pytest tests/liqo/ -v -m kueue           # Kueue admission
 |---|---|
 | **Test** | `test_kueue.py::test_kueue_admits_liqo_pod` |
 | **What** | GPU pod via Liqo → Kyverno adds Kueue labels on worker → Kueue admits → Succeeded |
-| **Result** | SKIP — Kyverno policy not configured for ShadowPod-created Pods |
+| **Result** | PASS |
 | **Proves** | Kyverno can mutate ShadowPod-created Pods for Kueue admission |
 
 #### L12. ShadowPod label persistence
@@ -169,8 +169,8 @@ python -m pytest tests/liqo/ -v -m kueue           # Kueue admission
 |---|---|
 | **Test** | `test_kueue.py::test_shadowpod_label_persistence` |
 | **What** | Verify whether Kyverno-added labels survive ShadowPod controller reconciliation |
-| **Result** | SKIP — Kyverno policy not configured for ShadowPod-created Pods |
-| **Proves** | Whether Kueue integration is viable — if ShadowPod controller overwrites labels, Kueue breaks |
+| **Result** | PASS |
+| **Proves** | ShadowPod controller does NOT overwrite Kyverno-added labels — Kueue integration is viable |
 
 ### 6. Cross-Cluster Networking
 
@@ -217,7 +217,7 @@ python -m pytest tests/liqo/ -v -m kueue           # Kueue admission
 | **Notebook CR** | S18 PASS | — | Not tested in Liqo spike |
 | **KServe raw** | S19 PASS | L10 PASS | |
 | **KServe serverless** | S20 PASS | — | Not tested (3.x has no Knative) |
-| **Kueue admission** | S21 PASS | L11 SKIP | Kyverno policy not configured for ShadowPods |
+| **Kueue admission** | S21 PASS | L11 PASS | Same Kyverno approach works with ShadowPod-created pods |
 | **Kueue queuing** | S22 PASS | — | Not tested in Liqo spike |
 | **Kueue preemption** | S23 PASS | — | Not tested in Liqo spike |
 | **PodIP sync** | PASS | L3 PASS | Critical for Submariner routing |
@@ -355,18 +355,17 @@ tests/liqo/test_storage.py::test_pvc_reflection                          PASSED
 tests/liqo/test_storage.py::test_pvc_persists_across_pod_restart         PASSED
 tests/liqo/test_rhoai.py::test_pytorchjob_via_liqo                       PASSED
 tests/liqo/test_rhoai.py::test_kserve_raw_inference_via_liqo             PASSED
-tests/liqo/test_kueue.py::test_kueue_admits_liqo_pod                     SKIPPED
-tests/liqo/test_kueue.py::test_shadowpod_label_persistence               SKIPPED
+tests/liqo/test_kueue.py::test_kueue_admits_liqo_pod                     PASSED
+tests/liqo/test_kueue.py::test_shadowpod_label_persistence               PASSED
 tests/liqo/test_networking.py::test_service_reachable_via_submariner      PASSED
 tests/liqo/test_networking.py::test_headless_service_reflection           PASSED
 
-12 passed, 2 skipped (3m38s) — 2026-10-14
+14 passed — 2026-10-15
 ```
 
-**Kueue tests skipped** because the Kyverno ClusterPolicy targeting ShadowPod-created
-Pods is not yet deployed. This is a configuration task, not a Liqo limitation — the
-same Kyverno approach used with the custom VK should work once the policy match rules
-target pods created by the ShadowPod controller.
+Kueue integration confirmed: Kyverno mutates ShadowPod-created pods
+with queue-name and priority labels, and the ShadowPod controller does
+not overwrite them during reconciliation.
 
 ---
 
@@ -412,15 +411,28 @@ One side effect: Submariner's routeagent DaemonSet tries to schedule on
 the Liqo virtual node and gets `OffloadingBackOff`. Harmless but noisy.
 Can be suppressed with a node anti-affinity on `liqo.io/type=virtual-node`.
 
+### Kueue setup on worker
+
+Kyverno + Kueue configuration required on the worker for the twin
+namespace (the namespace Liqo creates to mirror the tenant's offloaded
+namespace):
+
+1. Twin namespace needs labels:
+   - `gpuaas.redhat.com/managed=true`
+   - `kyverno.io/watch=enabled`
+   - `gpuaas.redhat.com/default-priority=gpuaas-standard`
+   - annotation: `gpuaas.redhat.com/allowed-priorities=<comma-separated>`
+2. LocalQueue `default` in twin namespace pointing to `cluster-queue`
+3. Kueue webhook `reinvocationPolicy: IfNeeded` (Kyverno runs first,
+   Kueue re-invokes to see the labels)
+
 ### Next Steps
 
-1. **Kueue integration** — Deploy Kyverno ClusterPolicy on worker
-   targeting ShadowPod-created pods. Run L11/L12 to validate whether
-   Kyverno-added Kueue labels survive ShadowPod controller reconciliation.
-   If the controller overwrites them, Kueue integration breaks and we
-   need an alternative (e.g., mutating the ShadowPod CRD directly).
-2. **Multi-tenant** — Test multiple tenants peered to the same worker.
+1. **Multi-tenant** — Test multiple tenants peered to the same worker.
    Liqo uses twin namespaces per peering, so namespace isolation model
    differs from the custom VK's `vk-{hash}-{ns}` prefix approach.
+2. **Twin namespace labeling automation** — When Liqo creates a twin
+   namespace, it needs `gpuaas.redhat.com/managed=true` and a
+   LocalQueue. Automate this (Kyverno generate policy or controller).
 3. **RHOAI 2.x** — Current results are RHOAI 3.x only. If RHOAI 2.x
    support is needed, test against an RHOAI 2.x tenant cluster.
