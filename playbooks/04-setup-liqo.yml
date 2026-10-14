@@ -1,0 +1,144 @@
+---
+- name: Set up Liqo for cross-cluster GPU dispatch (networking disabled, Submariner)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  environment:
+    PATH: "{{ local_bin }}:{{ lookup('env', 'PATH') }}"
+
+  vars:
+    liqo_version: "v1.2.0"
+    liqo_tenant_kubeconfig: "{{ kubeconfig_dir }}/tenant-rhoai3"
+    liqo_worker_kubeconfig: "{{ kubeconfig_dir }}/worker"
+    liqo_test_namespace: "{{ vk_test_namespace }}"
+
+  tasks:
+  # Step 1: Install liqoctl
+  - name: Install liqoctl
+    include_tasks: tasks/install-liqoctl.yml
+
+  # Step 2: Install Liqo on worker (provider)
+  - name: Install Liqo on worker (provider)
+    command: >
+      liqoctl install openshift
+      --kubeconfig={{ liqo_worker_kubeconfig }}
+      --set networking.enabled=false
+      --set storage.enabled=true
+      --set telemetry.enabled=false
+      --set offloading.disableNetworkCheck=true
+      --set discovery.config.clusterID=gpu-worker
+    register: liqo_worker_install
+    changed_when: "'installed' in liqo_worker_install.stdout or 'upgraded' in liqo_worker_install.stdout"
+
+  - name: Print worker install output
+    debug:
+      msg: "{{ liqo_worker_install.stdout_lines[-5:] }}"
+
+  # Step 3: Install Liqo on tenant (consumer)
+  - name: Install Liqo on tenant (consumer)
+    command: >
+      liqoctl install openshift
+      --kubeconfig={{ liqo_tenant_kubeconfig }}
+      --set networking.enabled=false
+      --set storage.enabled=true
+      --set telemetry.enabled=false
+      --set offloading.disableNetworkCheck=true
+      --set discovery.config.clusterID=tenant-rhoai3
+    register: liqo_tenant_install
+    changed_when: "'installed' in liqo_tenant_install.stdout or 'upgraded' in liqo_tenant_install.stdout"
+
+  - name: Print tenant install output
+    debug:
+      msg: "{{ liqo_tenant_install.stdout_lines[-5:] }}"
+
+  # Step 4: Peer clusters
+  - name: Peer tenant → worker (networking disabled)
+    command: >
+      liqoctl peer
+      --kubeconfig={{ liqo_tenant_kubeconfig }}
+      --remote-kubeconfig={{ liqo_worker_kubeconfig }}
+      --networking-disabled
+      --resource nvidia.com/gpu=1
+      --timeout 5m
+    register: liqo_peer
+    changed_when: "'established' in liqo_peer.stdout or 'Peering' in liqo_peer.stdout"
+
+  - name: Print peering output
+    debug:
+      msg: "{{ liqo_peer.stdout_lines[-5:] }}"
+
+  # Step 5: Verify virtual node
+  - name: Get virtual node on tenant
+    command: >
+      oc get nodes -l liqo.io/type=virtual-node
+      -o jsonpath='{.items[0].metadata.name}'
+      --kubeconfig={{ liqo_tenant_kubeconfig }}
+    register: liqo_virtual_node
+    retries: 12
+    delay: 10
+    until: liqo_virtual_node.rc == 0 and liqo_virtual_node.stdout | length > 0
+    changed_when: false
+
+  - name: Print virtual node
+    debug:
+      msg: "Liqo virtual node: {{ liqo_virtual_node.stdout }}"
+
+  - name: Verify GPU in virtual node allocatable
+    shell: >
+      oc get node {{ liqo_virtual_node.stdout }}
+      -o jsonpath='{.status.allocatable.nvidia\.com/gpu}'
+      --kubeconfig={{ liqo_tenant_kubeconfig }}
+    register: liqo_gpu_count
+    changed_when: false
+    failed_when: liqo_gpu_count.stdout | int < 1
+
+  - name: Print GPU capacity
+    debug:
+      msg: "Virtual node {{ liqo_virtual_node.stdout }} has {{ liqo_gpu_count.stdout }} GPU(s)"
+
+  # Step 6: Create and offload test namespace
+  - name: Create test namespace
+    command: >
+      oc create namespace {{ liqo_test_namespace }}
+      --kubeconfig={{ liqo_tenant_kubeconfig }}
+    register: ns_result
+    failed_when: ns_result.rc != 0 and 'already exists' not in (ns_result.stderr | default(''))
+    changed_when: ns_result.rc == 0
+
+  - name: Offload test namespace with Remote strategy
+    command: >
+      liqoctl offload namespace {{ liqo_test_namespace }}
+      --kubeconfig={{ liqo_tenant_kubeconfig }}
+      --pod-offloading-strategy Remote
+      --namespace-mapping-strategy EnforceSameName
+    register: offload_result
+    changed_when: "'offloaded' in offload_result.stdout or 'patched' in offload_result.stdout"
+
+  - name: Wait for twin namespace on worker
+    command: >
+      oc get namespace {{ liqo_test_namespace }}
+      --kubeconfig={{ liqo_worker_kubeconfig }}
+    retries: 12
+    delay: 5
+    register: twin_ns
+    until: twin_ns.rc == 0
+    changed_when: false
+
+  # Step 7: Summary
+  - name: Print setup summary
+    debug:
+      msg: |
+        Liqo {{ liqo_version }} deployed successfully.
+
+        Provider (worker):  gpu-worker
+        Consumer (tenant):  tenant-rhoai3
+        Virtual node:       {{ liqo_virtual_node.stdout }}
+        GPU count:          {{ liqo_gpu_count.stdout }}
+        Test namespace:     {{ liqo_test_namespace }} (offloaded, Remote strategy)
+        Twin namespace:     {{ liqo_test_namespace }} (on worker, EnforceSameName)
+        Networking:         Disabled (using Submariner)
+
+        Run tests:
+          RHOAI3_KUBECONFIG=~/.kube/tenant-rhoai3 WORKER_KUBECONFIG=~/.kube/worker \
+            python -m pytest tests/liqo/ -v
