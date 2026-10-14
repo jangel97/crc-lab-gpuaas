@@ -75,7 +75,7 @@ graph TD
 ### Known limitations and remaining validation
 
 **Workload compatibility**
-- **LMEvalJob:** The CRD lacks scheduling fields (tolerations, nodeSelector). Requires a Kyverno workaround until addressed upstream.
+- **LMEvalJob:** The CRD lacks scheduling fields (tolerations, nodeSelector). Requires a Kyverno workaround until addressed upstream. https://github.com/trustyai-explainability/trustyai-service-operator/pull/1005
 - **KServe with Istio:** Sidecar injection is incompatible with the current offloading mechanism. Affects RHOAI 2.x; RHOAI 3.x no longer uses OSSM.
 - **In-cluster API access:** Roles and RoleBindings are intentionally not synchronized, limiting workloads that need Kubernetes API permissions.
 
